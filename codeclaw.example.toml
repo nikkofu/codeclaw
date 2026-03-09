@@ -1,0 +1,47 @@
+[master]
+mode = "app-server"
+model = "gpt-5-codex"
+sandbox = "workspace-write"
+approval = "on-request"
+
+[workers]
+default_mode = "exec-json"
+attach_mode = "resume"
+max_parallel = 4
+inherit_model = true
+
+[git]
+main_branch = "main"
+integration_branch = "integration/current"
+worktree_root = ".codeclaw/worktrees"
+task_branch_prefix = "agent"
+
+[ui]
+sidebar_width = 28
+show_branch = true
+show_cwd = true
+show_locks = true
+theme = "termius-like"
+
+[coordination]
+root = ".codeclaw"
+task_dir = ".codeclaw/tasks"
+status_dir = ".codeclaw/status"
+lock_file = ".codeclaw/locks/paths.json"
+decision_dir = ".codeclaw/decisions"
+log_dir = ".codeclaw/logs"
+
+[[groups]]
+id = "backend"
+label = "Backend"
+lease_paths = ["src/api/**", "src/domain/**", "db/**"]
+
+[[groups]]
+id = "frontend"
+label = "Frontend"
+lease_paths = ["src/web/**", "src/ui/**"]
+
+[[groups]]
+id = "infra"
+label = "Infra"
+lease_paths = ["deploy/**", ".github/**", "scripts/**"]
