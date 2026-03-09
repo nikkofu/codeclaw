@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.3.1 - 2026-03-09
+
+- scoped CLI quiescence waiting to the active orchestration batch instead of every session globally
+- propagated orchestration batch ids across master prompts, worker bootstrap turns, worker follow-ups, and runtime feedback loops
+- kept the new timeline supervision model intact while removing false waits from unrelated sessions
+
 ## 0.3.0 - 2026-03-09
 
 - added a structured timeline panel to the right side of the TUI

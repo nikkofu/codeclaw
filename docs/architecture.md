@@ -12,6 +12,7 @@ Implemented now:
 - queued turns for busy sessions
 - automatic worker completion/failure updates routed back into the master session
 - a structured right-pane timeline for session supervision
+- batch-scoped CLI waiting for the orchestration chain initiated by the active prompt
 - session recovery using `thread/resume`
 
 Not implemented yet:

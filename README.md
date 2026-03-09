@@ -20,6 +20,7 @@ This repository now includes a working Rust control-plane prototype with:
 - automatic worker completion and failure updates routed back to the master session
 - a structured orchestration timeline in the right pane
 - source-tagged session events for user, bootstrap, orchestrator, runtime, command, status, and error activity
+- batch-scoped CLI waiting so `send --to master` only waits for the orchestration it triggered
 - persisted master summary and last-message status across restarts
 
 ## Commands

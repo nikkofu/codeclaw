@@ -17,9 +17,9 @@ CodeClaw now has a functioning master-worker control loop:
 The next engineering target is to harden supervision into long-running operator workflows:
 
 - persist timeline/history across `codeclaw up` restarts
-- scope CLI quiescence waits to the active orchestration subtree instead of every session globally
 - add right-pane filtering/folding so command and output noise can be focused on demand
 - expose more explicit worker lifecycle milestones such as spawn requested, bootstrapped, blocked, and handed back
+- carry orchestration history across processes so CLI and TUI can inspect the same active batch
 
 ## After That
 

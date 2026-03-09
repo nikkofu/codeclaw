@@ -30,6 +30,8 @@ pub struct Controller {
     state: Arc<Mutex<AppState>>,
     sessions: Arc<Mutex<BTreeMap<String, SessionView>>>,
     pending_turns: Arc<Mutex<BTreeMap<String, VecDeque<QueuedTurn>>>>,
+    active_turn_batches: Arc<Mutex<BTreeMap<String, u64>>>,
+    next_batch_id: Arc<Mutex<u64>>,
     client: Arc<AppServerClient>,
 }
 
@@ -226,6 +228,7 @@ impl TurnSource {
 }
 
 struct QueuedTurn {
+    batch_id: u64,
     session_id: String,
     thread_id: String,
     log_label: String,
@@ -258,6 +261,8 @@ impl Controller {
             state: Arc::new(Mutex::new(state)),
             sessions: Arc::new(Mutex::new(sessions)),
             pending_turns: Arc::new(Mutex::new(BTreeMap::new())),
+            active_turn_batches: Arc::new(Mutex::new(BTreeMap::new())),
+            next_batch_id: Arc::new(Mutex::new(1)),
             client,
         })
     }
@@ -373,7 +378,9 @@ impl Controller {
 
     pub async fn submit_prompt(&self, target: PromptTarget, prompt: &str) -> Result<()> {
         let (session_id, thread_id, log_label, role) = self.resolve_prompt_target(target).await?;
+        let batch_id = self.allocate_batch_id();
         self.enqueue_turn(
+            batch_id,
             session_id,
             thread_id,
             log_label,
@@ -386,7 +393,9 @@ impl Controller {
 
     pub async fn submit_prompt_and_wait(&self, target: PromptTarget, prompt: &str) -> Result<()> {
         let (session_id, thread_id, log_label, role) = self.resolve_prompt_target(target).await?;
+        let batch_id = self.allocate_batch_id();
         self.enqueue_turn_and_wait(
+            batch_id,
             session_id,
             thread_id,
             log_label,
@@ -396,11 +405,19 @@ impl Controller {
             TurnSource::User,
         )
         .await?;
-        self.wait_for_quiescence().await
+        self.wait_for_batch_quiescence(batch_id).await
+    }
+
+    fn allocate_batch_id(&self) -> u64 {
+        let mut next = self.next_batch_id.lock().expect("batch id lock poisoned");
+        let batch_id = *next;
+        *next += 1;
+        batch_id
     }
 
     fn enqueue_turn(
         &self,
+        batch_id: u64,
         session_id: String,
         thread_id: String,
         log_label: String,
@@ -410,6 +427,7 @@ impl Controller {
         source: TurnSource,
     ) -> Result<()> {
         self.enqueue_turn_with_completion(
+            batch_id,
             session_id,
             thread_id,
             log_label,
@@ -423,6 +441,7 @@ impl Controller {
 
     async fn enqueue_turn_and_wait(
         &self,
+        batch_id: u64,
         session_id: String,
         thread_id: String,
         log_label: String,
@@ -432,6 +451,7 @@ impl Controller {
         source: TurnSource,
     ) -> Result<()> {
         let done = self.enqueue_turn_with_completion(
+            batch_id,
             session_id,
             thread_id,
             log_label,
@@ -445,6 +465,7 @@ impl Controller {
 
     fn enqueue_turn_with_completion(
         &self,
+        batch_id: u64,
         session_id: String,
         thread_id: String,
         log_label: String,
@@ -455,6 +476,7 @@ impl Controller {
     ) -> Result<oneshot::Receiver<Result<()>>> {
         let (tx, rx) = oneshot::channel();
         let turn = QueuedTurn {
+            batch_id,
             session_id: session_id.clone(),
             thread_id,
             log_label,
@@ -495,12 +517,12 @@ impl Controller {
     }
 
     pub async fn spawn_worker(&self, group: &str, task: &str) -> Result<WorkerRecord> {
-        self.spawn_worker_with_options(group, task, None, None, false)
+        self.spawn_worker_with_options(group, task, None, None, false, self.allocate_batch_id())
             .await
     }
 
     pub async fn spawn_worker_and_wait(&self, group: &str, task: &str) -> Result<WorkerRecord> {
-        self.spawn_worker_with_options(group, task, None, None, true)
+        self.spawn_worker_with_options(group, task, None, None, true, self.allocate_batch_id())
             .await
     }
 
@@ -534,6 +556,7 @@ impl Controller {
         summary: Option<String>,
         prompt: Option<String>,
         wait_for_bootstrap: bool,
+        batch_id: u64,
     ) -> Result<WorkerRecord> {
         let group_config = self
             .config
@@ -614,6 +637,7 @@ impl Controller {
         let bootstrap_prompt = prompt.unwrap_or_else(|| worker_bootstrap_prompt(&record));
         if wait_for_bootstrap {
             self.enqueue_turn_and_wait(
+                batch_id,
                 record.id.clone(),
                 record.thread_id.clone(),
                 record.id.clone(),
@@ -625,6 +649,7 @@ impl Controller {
             .await?;
         } else {
             self.enqueue_turn(
+                batch_id,
                 record.id.clone(),
                 record.thread_id.clone(),
                 record.id.clone(),
@@ -679,6 +704,7 @@ impl Controller {
 
     async fn process_turn(
         &self,
+        batch_id: u64,
         session_id: String,
         thread_id: String,
         log_label: String,
@@ -844,7 +870,7 @@ impl Controller {
                                 Some(error.message.clone()),
                             )?;
                             if let SessionRole::Worker(worker_id) = &role {
-                                self.publish_worker_runtime_update(worker_id, "failed")
+                                self.publish_worker_runtime_update(worker_id, "failed", batch_id)
                                     .await?;
                             }
                             return Err(anyhow!(error.message));
@@ -867,7 +893,12 @@ impl Controller {
 
                         if let Some(parsed) = parsed_master {
                             if let Some(visible) = self
-                                .apply_master_response(&session_id, &parsed, wait_for_follow_on)
+                                .apply_master_response(
+                                    &session_id,
+                                    &parsed,
+                                    wait_for_follow_on,
+                                    batch_id,
+                                )
                                 .await?
                             {
                                 last_message = Some(compact_message(&visible));
@@ -881,7 +912,7 @@ impl Controller {
                             last_message,
                         )?;
                         if let SessionRole::Worker(worker_id) = &role {
-                            self.publish_worker_runtime_update(worker_id, "completed")
+                            self.publish_worker_runtime_update(worker_id, "completed", batch_id)
                                 .await?;
                         }
                         return Ok(());
@@ -1053,11 +1084,13 @@ impl Controller {
             turn.source.timeline_text(&turn.prompt, false, 0),
         )?;
         self.set_session_status(&turn.session_id, "queued")?;
+        self.set_active_turn_batch(&turn.session_id, turn.batch_id)?;
 
         let controller = self.clone();
         tokio::spawn(async move {
             let result = controller
                 .process_turn(
+                    turn.batch_id,
                     turn.session_id.clone(),
                     turn.thread_id,
                     turn.log_label,
@@ -1071,6 +1104,7 @@ impl Controller {
                 let _ = controller.set_session_status(&turn.session_id, "failed");
             }
             let _ = turn.completion.send(result);
+            let _ = controller.clear_active_turn_batch(&turn.session_id, turn.batch_id);
             let _ = controller.schedule_next_turn(&turn.session_id);
         });
 
@@ -1121,24 +1155,46 @@ impl Controller {
         Ok(())
     }
 
-    fn has_pending_turns(&self) -> bool {
+    fn set_active_turn_batch(&self, session_id: &str, batch_id: u64) -> Result<()> {
+        let mut active = self
+            .active_turn_batches
+            .lock()
+            .expect("active turn lock poisoned");
+        active.insert(session_id.to_owned(), batch_id);
+        Ok(())
+    }
+
+    fn clear_active_turn_batch(&self, session_id: &str, batch_id: u64) -> Result<()> {
+        let mut active = self
+            .active_turn_batches
+            .lock()
+            .expect("active turn lock poisoned");
+        if active.get(session_id).copied() == Some(batch_id) {
+            active.remove(session_id);
+        }
+        Ok(())
+    }
+
+    fn batch_has_pending_turns(&self, batch_id: u64) -> bool {
         let pending = self.pending_turns.lock().expect("pending lock poisoned");
-        pending.values().any(|queue| !queue.is_empty())
+        pending
+            .values()
+            .any(|queue| queue.iter().any(|turn| turn.batch_id == batch_id))
     }
 
-    fn has_active_sessions(&self) -> bool {
-        let sessions = self.sessions.lock().expect("sessions lock poisoned");
-        sessions.values().any(|session| {
-            matches!(
-                session.snapshot().status.as_str(),
-                "queued" | "running" | "active" | "inProgress"
-            )
-        })
+    fn batch_has_active_turns(&self, batch_id: u64) -> bool {
+        let active = self
+            .active_turn_batches
+            .lock()
+            .expect("active turn lock poisoned");
+        active
+            .values()
+            .any(|current_batch| *current_batch == batch_id)
     }
 
-    async fn wait_for_quiescence(&self) -> Result<()> {
+    async fn wait_for_batch_quiescence(&self, batch_id: u64) -> Result<()> {
         loop {
-            if !self.has_active_sessions() && !self.has_pending_turns() {
+            if !self.batch_has_active_turns(batch_id) && !self.batch_has_pending_turns(batch_id) {
                 return Ok(());
             }
             tokio::time::sleep(Duration::from_millis(120)).await;
@@ -1371,6 +1427,7 @@ impl Controller {
         &self,
         worker_id: &str,
         worker_state: &str,
+        batch_id: u64,
     ) -> Result<()> {
         let worker = {
             let state = self.state.lock().expect("state lock poisoned");
@@ -1402,6 +1459,7 @@ impl Controller {
         );
 
         self.enqueue_turn(
+            batch_id,
             MASTER_SESSION_ID.to_owned(),
             master_thread_id,
             MASTER_SESSION_ID.to_owned(),
@@ -1433,6 +1491,7 @@ impl Controller {
         session_id: &str,
         parsed: &ParsedMasterResponse,
         wait_for_follow_on: bool,
+        batch_id: u64,
     ) -> Result<Option<String>> {
         let visible = parsed.visible_response.trim();
         if !visible.is_empty() {
@@ -1473,6 +1532,7 @@ impl Controller {
                             summary.clone(),
                             prompt.clone(),
                             wait_for_follow_on,
+                            batch_id,
                         )
                         .await
                     {
@@ -1517,6 +1577,7 @@ impl Controller {
                         Ok((target_session_id, thread_id, log_label, role)) => {
                             let result = if wait_for_follow_on {
                                 self.enqueue_turn_and_wait(
+                                    batch_id,
                                     target_session_id,
                                     thread_id,
                                     log_label,
@@ -1528,6 +1589,7 @@ impl Controller {
                                 .await
                             } else {
                                 self.enqueue_turn(
+                                    batch_id,
                                     target_session_id,
                                     thread_id,
                                     log_label,
