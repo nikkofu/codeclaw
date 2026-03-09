@@ -13,7 +13,8 @@ This repository now includes a working Rust MVP with:
 - a `codex app-server` client over JSON-RPC stdio
 - master thread bootstrapping
 - worker task registration and tracking
-- interactive `up` mode for sending prompts to master or workers
+- a left/right TUI for session navigation and live output
+- terminal window title updates based on the selected Codex session
 
 ## Commands
 
@@ -23,18 +24,25 @@ cargo run -- doctor
 cargo run -- up
 cargo run -- spawn --group backend --task "Payment API refactor"
 cargo run -- list
-cargo run -- send --to master "Plan the next integration step"
 ```
 
-`up` opens a simple interactive controller. Plain text goes to the master thread. Slash commands are available for worker orchestration:
+`up` opens the current TUI shell:
 
 ```text
-/help
-/workers
-/spawn <group> <task>
-/send <worker-id> <prompt>
-/master <prompt>
-/quit
+left: session list
+right: selected session live output
+bottom: status + input area
+```
+
+Current TUI keybindings:
+
+```text
+↑ / ↓   switch sessions
+i       send a prompt to master
+e       send a prompt to the selected worker
+n       spawn a worker using "group: task"
+g       focus master
+q       quit
 ```
 
 ## Requirements

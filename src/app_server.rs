@@ -23,7 +23,7 @@ pub struct Notification {
 type PendingMap = Arc<Mutex<HashMap<u64, oneshot::Sender<Result<Value>>>>>;
 
 pub struct AppServerClient {
-    child: Child,
+    child: Arc<Mutex<Child>>,
     stdin: Arc<Mutex<ChildStdin>>,
     pending: PendingMap,
     notifications: broadcast::Sender<Notification>,
@@ -63,7 +63,7 @@ impl AppServerClient {
         spawn_stderr_reader(stderr);
 
         let client = Self {
-            child,
+            child: Arc::new(Mutex::new(child)),
             stdin: Arc::new(Mutex::new(stdin)),
             pending,
             notifications,
@@ -132,8 +132,9 @@ impl AppServerClient {
             .with_context(|| format!("failed to decode response for `{method}`"))
     }
 
-    pub async fn is_running(&mut self) -> Result<bool> {
-        Ok(self.child.try_wait()?.is_none())
+    pub async fn is_running(&self) -> Result<bool> {
+        let mut child = self.child.lock().await;
+        Ok(child.try_wait()?.is_none())
     }
 }
 

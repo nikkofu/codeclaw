@@ -1,24 +1,31 @@
 use crate::{
     app_server::{AppServerClient, Notification},
-    config::{Config, CoordinationPaths},
+    config::{Config, CoordinationPaths, GroupConfig},
+    session::{SessionSnapshot, SessionView},
     state::{now_unix_ts, AppState, SessionStatus, WorkerRecord, WorkerStatus},
 };
 use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
+    collections::BTreeMap,
     fs::{self, OpenOptions},
-    io::{self, Write},
+    io::Write,
     path::{Path, PathBuf},
+    sync::{Arc, Mutex},
 };
 use tokio::sync::broadcast;
 
+const MASTER_SESSION_ID: &str = "master";
+
+#[derive(Clone)]
 pub struct Controller {
     workspace_root: PathBuf,
     pub config: Config,
     pub paths: CoordinationPaths,
-    pub state: AppState,
-    client: AppServerClient,
+    state: Arc<Mutex<AppState>>,
+    sessions: Arc<Mutex<BTreeMap<String, SessionView>>>,
+    client: Arc<AppServerClient>,
 }
 
 #[derive(Debug, Clone)]
@@ -35,13 +42,13 @@ struct ThreadStartResponse {
 }
 
 #[derive(Debug, Deserialize)]
-struct TurnStartResponse {
-    turn: TurnSummary,
+struct ThreadReadResponse {
+    thread: ThreadSummary,
 }
 
 #[derive(Debug, Deserialize)]
-struct ThreadReadResponse {
-    thread: ThreadSummary,
+struct TurnStartResponse {
+    turn: TurnSummary,
 }
 
 #[derive(Debug, Deserialize)]
@@ -137,33 +144,42 @@ pub enum PromptTarget {
     Worker(String),
 }
 
+#[derive(Debug, Clone)]
+enum SessionRole {
+    Master,
+    Worker(String),
+}
+
 impl Controller {
     pub async fn start(workspace_root: PathBuf) -> Result<Self> {
         let config = Config::load(&workspace_root)?;
         let paths = config.coordination_paths(&workspace_root);
         let state = AppState::load(&paths.state_file)?;
-        let client =
-            AppServerClient::spawn(env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION")).await?;
+        let sessions = build_sessions(&state, &workspace_root);
+        let client = Arc::new(
+            AppServerClient::spawn(env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION")).await?,
+        );
 
         Ok(Self {
             workspace_root,
             config,
             paths,
-            state,
+            state: Arc::new(Mutex::new(state)),
+            sessions: Arc::new(Mutex::new(sessions)),
             client,
         })
     }
 
-    pub fn init_workspace(&mut self) -> Result<Option<PathBuf>> {
+    pub fn init_workspace(&self) -> Result<Option<PathBuf>> {
         let config_path = Config::write_default_config_if_missing(&self.workspace_root)?;
         self.paths.ensure_layout()?;
-        self.state.save(&self.paths.state_file)?;
+        self.save_state()?;
         self.write_master_status("idle", None, None)?;
         Ok(config_path)
     }
 
     pub async fn doctor(&self) -> Result<DoctorReport> {
-        let mut client =
+        let client =
             AppServerClient::spawn(env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION")).await?;
         let response: ThreadStartResponse = client
             .request(
@@ -178,8 +194,7 @@ impl Controller {
             )
             .await
             .context("app-server thread/start probe failed")?;
-        let thread_ok = !response.thread.id.is_empty();
-        let app_server_ok = client.is_running().await.unwrap_or(false);
+
         Ok(DoctorReport {
             config_source: self
                 .workspace_root
@@ -187,17 +202,41 @@ impl Controller {
                 .display()
                 .to_string(),
             coordination_root: self.paths.root.clone(),
-            codex_app_server_ok: app_server_ok,
-            thread_start_ok: thread_ok,
+            codex_app_server_ok: client.is_running().await.unwrap_or(false),
+            thread_start_ok: !response.thread.id.is_empty(),
         })
     }
 
-    pub async fn ensure_master_thread(&mut self) -> Result<String> {
+    pub fn groups(&self) -> Vec<GroupConfig> {
+        self.config.groups.clone()
+    }
+
+    pub fn sessions_snapshot(&self) -> Vec<SessionSnapshot> {
+        let sessions = self.sessions.lock().expect("sessions lock poisoned");
+        let mut snapshots = sessions
+            .values()
+            .map(SessionView::snapshot)
+            .collect::<Vec<_>>();
+        snapshots.sort_by(|left, right| {
+            session_sort_key(&left.id)
+                .cmp(&session_sort_key(&right.id))
+                .then_with(|| left.title.cmp(&right.title))
+        });
+        snapshots
+    }
+
+    pub fn list_workers(&self) -> Vec<WorkerRecord> {
+        let state = self.state.lock().expect("state lock poisoned");
+        state.workers.values().cloned().collect()
+    }
+
+    pub async fn ensure_master_thread(&self) -> Result<String> {
         self.paths.ensure_layout()?;
 
-        if let Some(thread_id) = self.state.master_thread_id.clone() {
+        if let Some(thread_id) = self.master_thread_id() {
             if self.thread_exists(&thread_id).await {
-                self.write_master_status("idle", self.state.master_last_turn_id.clone(), None)?;
+                self.ensure_master_session(thread_id.clone());
+                self.write_master_status("idle", self.master_last_turn_id(), None)?;
                 return Ok(thread_id);
             }
         }
@@ -211,50 +250,44 @@ impl Controller {
             )
             .await?;
         let thread_id = response.thread.id;
-        self.state.master_thread_id = Some(thread_id.clone());
-        self.state.master_last_turn_id = None;
+
+        {
+            let mut state = self.state.lock().expect("state lock poisoned");
+            state.master_thread_id = Some(thread_id.clone());
+            state.master_last_turn_id = None;
+        }
         self.save_state()?;
+        self.ensure_master_session(thread_id.clone());
         self.write_master_status("idle", None, None)?;
         Ok(thread_id)
     }
 
-    pub async fn send_prompt(&mut self, target: PromptTarget, prompt: &str) -> Result<()> {
-        match target {
-            PromptTarget::Master => {
-                let thread_id = self.ensure_master_thread().await?;
-                let turn_id = self
-                    .run_turn(&thread_id, "master", prompt, SessionRole::Master)
-                    .await?;
-                self.state.master_last_turn_id = Some(turn_id);
-                self.save_state()?;
-            }
-            PromptTarget::Worker(worker_id) => {
-                let worker = self
-                    .state
-                    .workers
-                    .get(&worker_id)
-                    .cloned()
-                    .with_context(|| format!("unknown worker `{worker_id}`"))?;
-                let turn_id = self
-                    .run_turn(
-                        &worker.thread_id,
-                        &worker.id,
-                        prompt,
-                        SessionRole::Worker(worker.id.clone()),
-                    )
-                    .await?;
-                self.update_worker_after_turn(
-                    &worker.id,
-                    WorkerStatus::Completed,
-                    Some(turn_id),
-                    None,
-                )?;
-            }
+    pub async fn submit_prompt(&self, target: PromptTarget, prompt: &str) -> Result<()> {
+        let (session_id, thread_id, log_label, role) = self.resolve_prompt_target(target).await?;
+
+        if self.session_is_busy(&session_id) {
+            return Err(anyhow!("session `{session_id}` is already running"));
         }
+
+        self.append_log_line(&session_id, format!("user> {prompt}"))?;
+        self.set_session_status(&session_id, "queued")?;
+
+        let controller = self.clone();
+        let prompt = prompt.to_owned();
+        tokio::spawn(async move {
+            if let Err(error) = controller
+                .process_turn(session_id.clone(), thread_id, log_label, prompt, role)
+                .await
+            {
+                let _ = controller.append_log_line(&session_id, format!("error> {error}"));
+                let _ = controller.set_session_status(&session_id, "failed");
+            }
+        });
+
         Ok(())
     }
 
-    pub async fn spawn_worker(&mut self, group: &str, task: &str) -> Result<WorkerRecord> {
+    pub async fn spawn_worker(&self, group: &str, task: &str) -> Result<WorkerRecord> {
         let group_config = self
             .config
             .group(group)
@@ -262,7 +295,14 @@ impl Controller {
             .clone();
         self.paths.ensure_layout()?;
 
-        let task_number = self.state.next_task_number;
+        let task_number = {
+            let mut state = self.state.lock().expect("state lock poisoned");
+            let current = state.next_task_number;
+            state.next_task_number += 1;
+            current
+        };
+        self.save_state()?;
+
         let task_file_name = format!("TASK-{task_number:03}.md");
         let task_file = self.paths.task_dir.join(task_file_name);
         let worker_id = format!("{group}-{task_number:03}-{}", slug(task));
@@ -284,7 +324,7 @@ impl Controller {
             .await?;
 
         let now = now_unix_ts();
-        let mut record = WorkerRecord {
+        let record = WorkerRecord {
             id: worker_id.clone(),
             group: group.to_owned(),
             task: task.to_owned(),
@@ -297,51 +337,207 @@ impl Controller {
             last_message: None,
         };
 
-        self.state.next_task_number += 1;
-        self.state.workers.insert(worker_id.clone(), record.clone());
+        {
+            let mut state = self.state.lock().expect("state lock poisoned");
+            state.workers.insert(worker_id.clone(), record.clone());
+        }
         self.save_state()?;
         self.write_worker_status(&record)?;
+        self.upsert_worker_session(&record);
+        self.append_log_line(
+            &record.id,
+            format!("system> worker created from {}", record.task_file),
+        )?;
 
-        match self
-            .run_turn(
-                &record.thread_id,
-                &record.id,
-                &worker_bootstrap_prompt(&record),
-                SessionRole::Worker(record.id.clone()),
-            )
-            .await
-        {
-            Ok(turn_id) => {
-                self.update_worker_after_turn(
-                    &record.id,
-                    WorkerStatus::Completed,
-                    Some(turn_id),
-                    None,
-                )?;
-            }
-            Err(error) => {
-                let message = error.to_string();
-                self.update_worker_after_turn(
-                    &record.id,
-                    WorkerStatus::Failed,
-                    None,
-                    Some(message.clone()),
-                )?;
-                return Err(error);
-            }
-        }
+        self.submit_prompt(
+            PromptTarget::Worker(record.id.clone()),
+            &worker_bootstrap_prompt(&record),
+        )
+        .await?;
 
-        record = self
-            .state
-            .workers
-            .get(&worker_id)
-            .cloned()
-            .with_context(|| format!("worker `{worker_id}` disappeared from state"))?;
         Ok(record)
     }
 
-    pub fn list_workers(&self) -> Vec<&WorkerRecord> {
-        self.state.workers.values().collect()
+    async fn resolve_prompt_target(
+        &self,
+        target: PromptTarget,
+    ) -> Result<(String, String, String, SessionRole)> {
+        match target {
+            PromptTarget::Master => {
+                let thread_id = self.ensure_master_thread().await?;
+                Ok((
+                    MASTER_SESSION_ID.to_owned(),
+                    thread_id,
+                    MASTER_SESSION_ID.to_owned(),
+                    SessionRole::Master,
+                ))
+            }
+            PromptTarget::Worker(worker_id) => {
+                let state = self.state.lock().expect("state lock poisoned");
+                let worker = state
+                    .workers
+                    .get(&worker_id)
+                    .cloned()
+                    .with_context(|| format!("unknown worker `{worker_id}`"))?;
+                Ok((
+                    worker.id.clone(),
+                    worker.thread_id.clone(),
+                    worker.id.clone(),
+                    SessionRole::Worker(worker.id),
+                ))
+            }
+        }
+    }
+
+    async fn process_turn(
+        &self,
+        session_id: String,
+        thread_id: String,
+        log_label: String,
+        prompt: String,
+        role: SessionRole,
+    ) -> Result<()> {
+        let mut receiver = self.client.subscribe();
+        self.write_role_status(&role, "running", None, None)?;
+
+        let response: TurnStartResponse = self
+            .client
+            .request(
+                "turn/start",
+                json!({
+                    "threadId": thread_id,
+                    "input": [
+                        {
+                            "type": "text",
+                            "text": prompt,
+                            "text_elements": [],
+                        }
+                    ]
+                }),
+            )
+            .await?;
+
+        let turn_id = response.turn.id.clone();
+        self.set_session_last_turn_id(&session_id, Some(turn_id.clone()))?;
+        self.write_role_status(&role, "running", Some(turn_id.clone()), None)?;
+
+        let mut streamed_delta = false;
+        let mut assistant_text = String::new();
+        let mut final_error: Option<TurnError> = None;
+
+        loop {
+            let notification = receiver.recv().await.map_err(map_broadcast_error)?;
+            self.log_notification(&log_label, &notification)?;
+
+            match notification.method.as_str() {
+                "item/agentMessage/delta" => {
+                    let event: AgentMessageDeltaNotification =
+                        serde_json::from_value(notification.params)?;
+                    if event.thread_id == thread_id && event.turn_id == turn_id {
+                        self.append_live_chunk(&session_id, &event.delta)?;
+                        assistant_text.push_str(&event.delta);
+                        streamed_delta = true;
+                    }
+                }
+                "item/completed" => {
+                    let event: ItemLifecycleNotification =
+                        serde_json::from_value(notification.params)?;
+                    if event.thread_id == thread_id && event.turn_id == turn_id {
+                        match event.item {
+                            ThreadItem::AgentMessage { text } if !streamed_delta => {
+                                assistant_text.push_str(&text);
+                                self.append_log_line(&session_id, format!("assistant> {text}"))?;
+                            }
+                            ThreadItem::CommandExecution {
+                                command,
+                                status,
+                                exit_code,
+                                aggregated_output,
+                            } => {
+                                self.append_log_line(
+                                    &session_id,
+                                    format!("command> [{status}] {:?} :: {}", exit_code, command),
+                                )?;
+                                if let Some(output) = aggregated_output {
+                                    let trimmed = output.trim();
+                                    if !trimmed.is_empty() {
+                                        self.append_log_line(
+                                            &session_id,
+                                            format!("output> {trimmed}"),
+                                        )?;
+                                    }
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                "thread/status/changed" => {
+                    let event: ThreadStatusChangedNotification =
+                        serde_json::from_value(notification.params)?;
+                    if event.thread_id == thread_id {
+                        let status = thread_state_text(&event.status);
+                        self.set_session_status(&session_id, &status)?;
+                    }
+                }
+                "turn/started" => {
+                    let event: TurnStartedNotification =
+                        serde_json::from_value(notification.params)?;
+                    if event.thread_id == thread_id && event.turn.id == turn_id {
+                        self.set_session_status(&session_id, &event.turn.status)?;
+                    }
+                }
+                "error" => {
+                    let event: ErrorNotification = serde_json::from_value(notification.params)?;
+                    if event.thread_id == thread_id && event.turn_id == turn_id {
+                        self.append_log_line(
+                            &session_id,
+                            format!("error> {}", event.error.message),
+                        )?;
+                        if let Some(details) = &event.error.additional_details {
+                            self.append_log_line(&session_id, format!("error> {details}"))?;
+                        }
+                        if !event.will_retry {
+                            final_error = Some(event.error);
+                        }
+                    }
+                }
+                "turn/completed" => {
+                    let event: TurnCompletedNotification =
+                        serde_json::from_value(notification.params)?;
+                    if event.thread_id == thread_id && event.turn.id == turn_id {
+                        if streamed_delta {
+                            let _ = self.commit_live_buffer(&session_id)?;
+                        }
+
+                        if let Some(error) = event.turn.error.or(final_error) {
+                            self.write_role_status(
+                                &role,
+                                "failed",
+                                Some(turn_id.clone()),
+                                Some(error.message.clone()),
+                            )?;
+                            return Err(anyhow!(error.message));
+                        }
+
+                        let last_message = if assistant_text.trim().is_empty() {
+                            None
+                        } else {
+                            Some(compact_message(&assistant_text))
+                        };
+
+                        self.write_role_status(
+                            &role,
+                            "completed",
+                            Some(turn_id.clone()),
+                            last_message,
+                        )?;
+                        return Ok(());
+                    }
+                }
+                _ => {}
+            }
+        }
     }
 
     async fn start_thread(
@@ -403,165 +599,97 @@ impl Controller {
         }
     }
 
-    async fn run_turn(
-        &mut self,
-        thread_id: &str,
-        log_label: &str,
-        prompt: &str,
-        role: SessionRole,
-    ) -> Result<String> {
-        let mut receiver = self.client.subscribe();
-        self.write_role_status(&role, "running", None, None)?;
+    fn ensure_master_session(&self, thread_id: String) {
+        let mut sessions = self.sessions.lock().expect("sessions lock poisoned");
+        sessions
+            .entry(MASTER_SESSION_ID.to_owned())
+            .and_modify(|session| session.set_thread_id(thread_id.clone()))
+            .or_insert_with(|| {
+                SessionView::master(thread_id, self.workspace_root.display().to_string())
+            });
+    }
 
-        let response: TurnStartResponse = self
-            .client
-            .request(
-                "turn/start",
-                json!({
-                    "threadId": thread_id,
-                    "input": [
-                        {
-                            "type": "text",
-                            "text": prompt,
-                            "text_elements": [],
-                        }
-                    ]
-                }),
-            )
-            .await?;
-        let turn_id = response.turn.id.clone();
-        self.write_role_status(&role, "running", Some(turn_id.clone()), None)?;
+    fn upsert_worker_session(&self, worker: &WorkerRecord) {
+        let mut sessions = self.sessions.lock().expect("sessions lock poisoned");
+        sessions.insert(
+            worker.id.clone(),
+            SessionView::from_worker(worker, self.workspace_root.display().to_string()),
+        );
+    }
 
-        let mut printed_text = String::new();
-        let mut streamed_delta = false;
-        let mut final_error: Option<TurnError> = None;
+    fn session_is_busy(&self, session_id: &str) -> bool {
+        let sessions = self.sessions.lock().expect("sessions lock poisoned");
+        sessions
+            .get(session_id)
+            .map(|session| {
+                matches!(
+                    session.snapshot().status.as_str(),
+                    "queued" | "running" | "active" | "inProgress"
+                )
+            })
+            .unwrap_or(false)
+    }
 
-        loop {
-            let notification = receiver.recv().await.map_err(map_broadcast_error)?;
-            self.log_notification(log_label, &notification)?;
-
-            match notification.method.as_str() {
-                "item/agentMessage/delta" => {
-                    let event: AgentMessageDeltaNotification =
-                        serde_json::from_value(notification.params)?;
-                    if event.thread_id == thread_id && event.turn_id == turn_id {
-                        print!("{}", event.delta);
-                        io::stdout().flush().ok();
-                        printed_text.push_str(&event.delta);
-                        streamed_delta = true;
-                    }
-                }
-                "item/completed" => {
-                    let event: ItemLifecycleNotification =
-                        serde_json::from_value(notification.params)?;
-                    if event.thread_id == thread_id && event.turn_id == turn_id {
-                        match event.item {
-                            ThreadItem::AgentMessage { text } if !streamed_delta => {
-                                print!("{text}");
-                                io::stdout().flush().ok();
-                                printed_text.push_str(&text);
-                            }
-                            ThreadItem::CommandExecution {
-                                command,
-                                status,
-                                exit_code,
-                                aggregated_output,
-                            } => {
-                                eprintln!(
-                                    "\n[codeclaw][cmd][{log_label}] status={status} exit={:?} :: {}",
-                                    exit_code, command
-                                );
-                                if let Some(output) = aggregated_output {
-                                    let trimmed = output.trim();
-                                    if !trimmed.is_empty() {
-                                        eprintln!("{trimmed}");
-                                    }
-                                }
-                            }
-                            _ => {}
-                        }
-                    }
-                }
-                "thread/status/changed" => {
-                    let event: ThreadStatusChangedNotification =
-                        serde_json::from_value(notification.params)?;
-                    if event.thread_id == thread_id {
-                        self.write_role_status(
-                            &role,
-                            &thread_state_text(&event.status),
-                            Some(turn_id.clone()),
-                            None,
-                        )?;
-                    }
-                }
-                "turn/started" => {
-                    let event: TurnStartedNotification =
-                        serde_json::from_value(notification.params)?;
-                    if event.thread_id == thread_id && event.turn.id == turn_id {
-                        self.write_role_status(
-                            &role,
-                            &event.turn.status,
-                            Some(turn_id.clone()),
-                            None,
-                        )?;
-                    }
-                }
-                "error" => {
-                    let event: ErrorNotification = serde_json::from_value(notification.params)?;
-                    if event.thread_id == thread_id && event.turn_id == turn_id {
-                        eprintln!("\n[codeclaw][error][{log_label}] {}", event.error.message);
-                        if let Some(details) = &event.error.additional_details {
-                            eprintln!("{details}");
-                        }
-                        if !event.will_retry {
-                            final_error = Some(event.error);
-                        }
-                    }
-                }
-                "turn/completed" => {
-                    let event: TurnCompletedNotification =
-                        serde_json::from_value(notification.params)?;
-                    if event.thread_id == thread_id && event.turn.id == turn_id {
-                        if !printed_text.is_empty() {
-                            println!();
-                        }
-
-                        if let Some(error) = event.turn.error {
-                            self.write_role_status(
-                                &role,
-                                &event.turn.status,
-                                Some(turn_id.clone()),
-                                Some(error.message.clone()),
-                            )?;
-                            return Err(anyhow!(error.message));
-                        }
-
-                        if let Some(error) = final_error {
-                            self.write_role_status(
-                                &role,
-                                &event.turn.status,
-                                Some(turn_id.clone()),
-                                Some(error.message.clone()),
-                            )?;
-                            return Err(anyhow!(error.message));
-                        }
-
-                        self.write_role_status(
-                            &role,
-                            &event.turn.status,
-                            Some(turn_id.clone()),
-                            if printed_text.is_empty() {
-                                None
-                            } else {
-                                Some(compact_message(&printed_text))
-                            },
-                        )?;
-                        return Ok(turn_id);
-                    }
-                }
-                _ => {}
-            }
+    fn append_log_line(&self, session_id: &str, line: impl Into<String>) -> Result<()> {
+        let mut sessions = self.sessions.lock().expect("sessions lock poisoned");
+        if let Some(session) = sessions.get_mut(session_id) {
+            session.push_line(line);
         }
+        Ok(())
+    }
+
+    fn append_live_chunk(&self, session_id: &str, chunk: &str) -> Result<()> {
+        let mut sessions = self.sessions.lock().expect("sessions lock poisoned");
+        if let Some(session) = sessions.get_mut(session_id) {
+            session.append_live_chunk(chunk);
+        }
+        Ok(())
+    }
+
+    fn commit_live_buffer(&self, session_id: &str) -> Result<Option<String>> {
+        let mut sessions = self.sessions.lock().expect("sessions lock poisoned");
+        Ok(sessions
+            .get_mut(session_id)
+            .and_then(SessionView::commit_live_buffer))
+    }
+
+    fn set_session_status(&self, session_id: &str, status: &str) -> Result<()> {
+        let mut sessions = self.sessions.lock().expect("sessions lock poisoned");
+        if let Some(session) = sessions.get_mut(session_id) {
+            session.set_status(status.to_owned());
+        }
+        Ok(())
+    }
+
+    fn set_session_last_turn_id(&self, session_id: &str, turn_id: Option<String>) -> Result<()> {
+        let mut sessions = self.sessions.lock().expect("sessions lock poisoned");
+        if let Some(session) = sessions.get_mut(session_id) {
+            session.set_last_turn_id(turn_id);
+        }
+        Ok(())
+    }
+
+    fn set_session_last_message(&self, session_id: &str, message: Option<String>) -> Result<()> {
+        let mut sessions = self.sessions.lock().expect("sessions lock poisoned");
+        if let Some(session) = sessions.get_mut(session_id) {
+            session.set_last_message(message);
+        }
+        Ok(())
+    }
+
+    fn master_thread_id(&self) -> Option<String> {
+        let state = self.state.lock().expect("state lock poisoned");
+        state.master_thread_id.clone()
+    }
+
+    fn master_last_turn_id(&self) -> Option<String> {
+        let state = self.state.lock().expect("state lock poisoned");
+        state.master_last_turn_id.clone()
+    }
+
+    fn save_state(&self) -> Result<()> {
+        let state = self.state.lock().expect("state lock poisoned");
+        state.save(&self.paths.state_file)
     }
 
     fn log_notification(&self, log_label: &str, notification: &Notification) -> Result<()> {
@@ -580,33 +708,49 @@ impl Controller {
         writeln!(file, "{line}").with_context(|| format!("failed to append {}", log_path.display()))
     }
 
-    fn update_worker_after_turn(
-        &mut self,
-        worker_id: &str,
-        status: WorkerStatus,
+    fn write_role_status(
+        &self,
+        role: &SessionRole,
+        state: &str,
         last_turn_id: Option<String>,
         last_message: Option<String>,
     ) -> Result<()> {
-        let worker = self
-            .state
-            .workers
-            .get_mut(worker_id)
-            .with_context(|| format!("unknown worker `{worker_id}`"))?;
-        worker.status = status;
-        worker.updated_at = now_unix_ts();
-        if last_turn_id.is_some() {
-            worker.last_turn_id = last_turn_id;
+        match role {
+            SessionRole::Master => {
+                if let Some(turn_id) = &last_turn_id {
+                    let mut persisted = self.state.lock().expect("state lock poisoned");
+                    persisted.master_last_turn_id = Some(turn_id.clone());
+                }
+                self.save_state()?;
+                self.set_session_status(MASTER_SESSION_ID, state)?;
+                self.set_session_last_turn_id(MASTER_SESSION_ID, last_turn_id.clone())?;
+                self.set_session_last_message(MASTER_SESSION_ID, last_message.clone())?;
+                self.write_master_status(state, last_turn_id, last_message)
+            }
+            SessionRole::Worker(worker_id) => {
+                let worker = {
+                    let mut persisted = self.state.lock().expect("state lock poisoned");
+                    let worker = persisted
+                        .workers
+                        .get_mut(worker_id)
+                        .with_context(|| format!("unknown worker `{worker_id}`"))?;
+                    worker.status = worker_status_for(state);
+                    worker.updated_at = now_unix_ts();
+                    if last_turn_id.is_some() {
+                        worker.last_turn_id = last_turn_id.clone();
+                    }
+                    if last_message.is_some() {
+                        worker.last_message = last_message.clone();
+                    }
+                    worker.clone()
+                };
+                self.save_state()?;
+                self.set_session_status(worker_id, state)?;
+                self.set_session_last_turn_id(worker_id, last_turn_id)?;
+                self.set_session_last_message(worker_id, last_message)?;
+                self.write_worker_status(&worker)
+            }
         }
-        if last_message.is_some() {
-            worker.last_message = last_message;
-        }
-        let snapshot = worker.clone();
-        self.save_state()?;
-        self.write_worker_status(&snapshot)
-    }
-
-    fn save_state(&self) -> Result<()> {
-        self.state.save(&self.paths.state_file)
     }
 
     fn write_master_status(
@@ -615,7 +759,7 @@ impl Controller {
         last_turn_id: Option<String>,
         last_message: Option<String>,
     ) -> Result<()> {
-        let thread_id = self.state.master_thread_id.clone().unwrap_or_default();
+        let thread_id = self.master_thread_id().unwrap_or_default();
         let status = SessionStatus {
             role: "master".to_owned(),
             thread_id,
@@ -639,27 +783,6 @@ impl Controller {
         status.write(&worker.status_path(&self.paths.status_dir))
     }
 
-    fn write_role_status(
-        &mut self,
-        role: &SessionRole,
-        state: &str,
-        last_turn_id: Option<String>,
-        last_message: Option<String>,
-    ) -> Result<()> {
-        match role {
-            SessionRole::Master => self.write_master_status(state, last_turn_id, last_message),
-            SessionRole::Worker(worker_id) => {
-                let status = match state {
-                    "completed" => WorkerStatus::Completed,
-                    "failed" => WorkerStatus::Failed,
-                    "running" | "inProgress" | "active" => WorkerStatus::Running,
-                    _ => WorkerStatus::Idle,
-                };
-                self.update_worker_after_turn(worker_id, status, last_turn_id, last_message)
-            }
-        }
-    }
-
     fn master_instructions(&self) -> String {
         format!(
             "You are the master controller for CodeClaw in {}. Coordinate work across workers, keep plans concise, and prefer actionable task splits.",
@@ -668,10 +791,46 @@ impl Controller {
     }
 }
 
-#[derive(Debug, Clone)]
-enum SessionRole {
-    Master,
-    Worker(String),
+fn build_sessions(state: &AppState, workspace_root: &Path) -> BTreeMap<String, SessionView> {
+    let mut sessions = BTreeMap::new();
+    if let Some(thread_id) = state.master_thread_id.clone() {
+        sessions.insert(
+            MASTER_SESSION_ID.to_owned(),
+            SessionView::master(thread_id, workspace_root.display().to_string()),
+        );
+    }
+    for worker in state.workers.values() {
+        sessions.insert(
+            worker.id.clone(),
+            SessionView::from_worker(worker, workspace_root.display().to_string()),
+        );
+    }
+    sessions
+}
+
+fn session_sort_key(id: &str) -> (u8, &str) {
+    if id == MASTER_SESSION_ID {
+        (0, id)
+    } else {
+        (1, id)
+    }
+}
+
+fn thread_state_text(value: &Value) -> String {
+    if let Some(kind) = value.get("type").and_then(Value::as_str) {
+        kind.to_owned()
+    } else {
+        value.to_string()
+    }
+}
+
+fn worker_status_for(state: &str) -> WorkerStatus {
+    match state {
+        "completed" => WorkerStatus::Completed,
+        "failed" => WorkerStatus::Failed,
+        "running" | "queued" | "active" | "inProgress" => WorkerStatus::Running,
+        _ => WorkerStatus::Idle,
+    }
 }
 
 fn render_task_file(task_number: u64, task: &str, lease_paths: &[String]) -> String {
@@ -727,14 +886,6 @@ fn compact_message(text: &str) -> String {
         trimmed.to_owned()
     } else {
         format!("{}...", &trimmed[..200])
-    }
-}
-
-fn thread_state_text(value: &Value) -> String {
-    if let Some(kind) = value.get("type").and_then(Value::as_str) {
-        kind.to_owned()
-    } else {
-        value.to_string()
     }
 }
 

@@ -1,8 +1,9 @@
 mod app_server;
 mod config;
 mod controller;
-mod repl;
+mod session;
 mod state;
+mod ui;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
@@ -59,7 +60,7 @@ async fn run() -> Result<()> {
 }
 
 async fn run_init(workspace_root: PathBuf) -> Result<()> {
-    let mut controller = Controller::start(workspace_root).await?;
+    let controller = Controller::start(workspace_root).await?;
     let config_path = controller.init_workspace()?;
 
     if let Some(path) = config_path {
@@ -83,13 +84,13 @@ async fn run_doctor(workspace_root: PathBuf) -> Result<()> {
 }
 
 async fn run_up(workspace_root: PathBuf) -> Result<()> {
-    let mut controller = Controller::start(workspace_root).await?;
+    let controller = Controller::start(workspace_root).await?;
     controller.init_workspace()?;
-    repl::run(&mut controller).await
+    ui::run(controller).await
 }
 
 async fn run_spawn(workspace_root: PathBuf, group: &str, task: &str) -> Result<()> {
-    let mut controller = Controller::start(workspace_root).await?;
+    let controller = Controller::start(workspace_root).await?;
     controller.init_workspace()?;
     let worker = controller.spawn_worker(group, task).await?;
     println!("worker: {}", worker.id);
@@ -100,14 +101,16 @@ async fn run_spawn(workspace_root: PathBuf, group: &str, task: &str) -> Result<(
 }
 
 async fn run_send(workspace_root: PathBuf, to: &str, prompt: &str) -> Result<()> {
-    let mut controller = Controller::start(workspace_root).await?;
+    let controller = Controller::start(workspace_root).await?;
     controller.init_workspace()?;
     let target = if to == "master" {
         PromptTarget::Master
     } else {
         PromptTarget::Worker(to.to_owned())
     };
-    controller.send_prompt(target, prompt).await
+    controller.submit_prompt(target, prompt).await?;
+    println!("submitted");
+    Ok(())
 }
 
 async fn run_list(workspace_root: PathBuf) -> Result<()> {
