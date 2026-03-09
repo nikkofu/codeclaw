@@ -21,6 +21,8 @@ pub struct WorkerRecord {
     pub id: String,
     pub group: String,
     pub task: String,
+    #[serde(default)]
+    pub summary: Option<String>,
     pub task_file: String,
     pub thread_id: String,
     pub status: WorkerStatus,
@@ -45,6 +47,8 @@ pub struct SessionStatus {
     pub thread_id: String,
     pub state: String,
     pub updated_at: u64,
+    #[serde(default)]
+    pub summary: Option<String>,
     pub last_turn_id: Option<String>,
     pub last_message: Option<String>,
 }

@@ -1,6 +1,7 @@
 use crate::{
     app_server::{AppServerClient, Notification},
     config::{Config, CoordinationPaths, GroupConfig},
+    orchestration::{parse_master_response, MasterAction, ParsedMasterResponse},
     session::{SessionSnapshot, SessionView},
     state::{now_unix_ts, AppState, SessionStatus, WorkerRecord, WorkerStatus},
 };
@@ -264,7 +265,17 @@ impl Controller {
 
     pub async fn submit_prompt(&self, target: PromptTarget, prompt: &str) -> Result<()> {
         let (session_id, thread_id, log_label, role) = self.resolve_prompt_target(target).await?;
+        self.enqueue_turn(session_id, thread_id, log_label, role, prompt)
+    }
 
+    fn enqueue_turn(
+        &self,
+        session_id: String,
+        thread_id: String,
+        log_label: String,
+        role: SessionRole,
+        prompt: &str,
+    ) -> Result<()> {
         if self.session_is_busy(&session_id) {
             return Err(anyhow!("session `{session_id}` is already running"));
         }
@@ -288,6 +299,35 @@ impl Controller {
     }
 
     pub async fn spawn_worker(&self, group: &str, task: &str) -> Result<WorkerRecord> {
+        self.spawn_worker_with_options(group, task, None, None)
+            .await
+    }
+
+    pub async fn update_worker_summary(&self, worker_id: &str, summary: &str) -> Result<()> {
+        let worker = {
+            let mut state = self.state.lock().expect("state lock poisoned");
+            let worker = state
+                .workers
+                .get_mut(worker_id)
+                .with_context(|| format!("unknown worker `{worker_id}`"))?;
+            worker.summary = Some(summary.to_owned());
+            worker.updated_at = now_unix_ts();
+            worker.clone()
+        };
+        self.save_state()?;
+        self.set_session_summary(worker_id, Some(summary.to_owned()))?;
+        self.write_worker_status(&worker)?;
+        self.append_log_line(worker_id, format!("system> summary updated: {summary}"))?;
+        Ok(())
+    }
+
+    async fn spawn_worker_with_options(
+        &self,
+        group: &str,
+        task: &str,
+        summary: Option<String>,
+        prompt: Option<String>,
+    ) -> Result<WorkerRecord> {
         let group_config = self
             .config
             .group(group)
@@ -328,6 +368,7 @@ impl Controller {
             id: worker_id.clone(),
             group: group.to_owned(),
             task: task.to_owned(),
+            summary: summary.clone(),
             task_file: task_file.display().to_string(),
             thread_id: response.thread.id,
             status: WorkerStatus::Idle,
@@ -348,12 +389,18 @@ impl Controller {
             &record.id,
             format!("system> worker created from {}", record.task_file),
         )?;
+        if let Some(summary) = summary {
+            self.set_session_summary(&record.id, Some(summary.clone()))?;
+            self.append_log_line(&record.id, format!("system> summary: {summary}"))?;
+        }
 
-        self.submit_prompt(
-            PromptTarget::Worker(record.id.clone()),
-            &worker_bootstrap_prompt(&record),
-        )
-        .await?;
+        self.enqueue_turn(
+            record.id.clone(),
+            record.thread_id.clone(),
+            record.id.clone(),
+            SessionRole::Worker(record.id.clone()),
+            &prompt.unwrap_or_else(|| worker_bootstrap_prompt(&record)),
+        )?;
 
         Ok(record)
     }
@@ -389,6 +436,24 @@ impl Controller {
         }
     }
 
+    fn resolve_worker_target(
+        &self,
+        worker_id: &str,
+    ) -> Result<(String, String, String, SessionRole)> {
+        let state = self.state.lock().expect("state lock poisoned");
+        let worker = state
+            .workers
+            .get(worker_id)
+            .cloned()
+            .with_context(|| format!("unknown worker `{worker_id}`"))?;
+        Ok((
+            worker.id.clone(),
+            worker.thread_id.clone(),
+            worker.id.clone(),
+            SessionRole::Worker(worker.id),
+        ))
+    }
+
     async fn process_turn(
         &self,
         session_id: String,
@@ -399,6 +464,7 @@ impl Controller {
     ) -> Result<()> {
         let mut receiver = self.client.subscribe();
         self.write_role_status(&role, "running", None, None)?;
+        let model_prompt = self.prepare_prompt_for_role(&prompt, &role);
 
         let response: TurnStartResponse = self
             .client
@@ -409,7 +475,7 @@ impl Controller {
                     "input": [
                         {
                             "type": "text",
-                            "text": prompt,
+                            "text": model_prompt,
                             "text_elements": [],
                         }
                     ]
@@ -520,11 +586,28 @@ impl Controller {
                             return Err(anyhow!(error.message));
                         }
 
-                        let last_message = if assistant_text.trim().is_empty() {
+                        let parsed_master =
+                            if matches!(role, SessionRole::Master) {
+                                Some(parse_master_response(&assistant_text).with_context(|| {
+                                    "failed to decode master orchestration block"
+                                })?)
+                            } else {
+                                None
+                            };
+
+                        let mut last_message = if assistant_text.trim().is_empty() {
                             None
                         } else {
                             Some(compact_message(&assistant_text))
                         };
+
+                        if let Some(parsed) = parsed_master {
+                            if let Some(visible) =
+                                self.apply_master_response(&session_id, &parsed).await?
+                            {
+                                last_message = Some(compact_message(&visible));
+                            }
+                        }
 
                         self.write_role_status(
                             &role,
@@ -653,6 +736,14 @@ impl Controller {
             .and_then(SessionView::commit_live_buffer))
     }
 
+    fn replace_last_assistant_line(&self, session_id: &str, text: &str) -> Result<()> {
+        let mut sessions = self.sessions.lock().expect("sessions lock poisoned");
+        if let Some(session) = sessions.get_mut(session_id) {
+            session.replace_last_assistant_line(text);
+        }
+        Ok(())
+    }
+
     fn set_session_status(&self, session_id: &str, status: &str) -> Result<()> {
         let mut sessions = self.sessions.lock().expect("sessions lock poisoned");
         if let Some(session) = sessions.get_mut(session_id) {
@@ -673,6 +764,14 @@ impl Controller {
         let mut sessions = self.sessions.lock().expect("sessions lock poisoned");
         if let Some(session) = sessions.get_mut(session_id) {
             session.set_last_message(message);
+        }
+        Ok(())
+    }
+
+    fn set_session_summary(&self, session_id: &str, summary: Option<String>) -> Result<()> {
+        let mut sessions = self.sessions.lock().expect("sessions lock poisoned");
+        if let Some(session) = sessions.get_mut(session_id) {
+            session.set_summary(summary);
         }
         Ok(())
     }
@@ -748,6 +847,7 @@ impl Controller {
                 self.set_session_status(worker_id, state)?;
                 self.set_session_last_turn_id(worker_id, last_turn_id)?;
                 self.set_session_last_message(worker_id, last_message)?;
+                self.set_session_summary(worker_id, worker.summary.clone())?;
                 self.write_worker_status(&worker)
             }
         }
@@ -765,6 +865,7 @@ impl Controller {
             thread_id,
             state: state.to_owned(),
             updated_at: now_unix_ts(),
+            summary: Some("Primary planner and dispatcher".to_owned()),
             last_turn_id,
             last_message,
         };
@@ -777,6 +878,7 @@ impl Controller {
             thread_id: worker.thread_id.clone(),
             state: worker.status.to_string(),
             updated_at: worker.updated_at,
+            summary: worker.summary.clone(),
             last_turn_id: worker.last_turn_id.clone(),
             last_message: worker.last_message.clone(),
         };
@@ -785,9 +887,115 @@ impl Controller {
 
     fn master_instructions(&self) -> String {
         format!(
-            "You are the master controller for CodeClaw in {}. Coordinate work across workers, keep plans concise, and prefer actionable task splits.",
+            "You are the master controller for CodeClaw in {}. Coordinate work across workers, keep plans concise, and prefer actionable task splits.\n\nWhen you respond to the user, append exactly one machine-readable block at the end using this format:\n<codeclaw-actions>\n{{\"summary\":\"short orchestration summary\",\"actions\":[...]}}\n</codeclaw-actions>\n\nAllowed actions:\n- {{\"type\":\"spawn_worker\",\"group\":\"backend|frontend|infra\",\"task\":\"short task title\",\"summary\":\"optional short sidebar summary\",\"prompt\":\"optional initial worker prompt\"}}\n- {{\"type\":\"send_worker_prompt\",\"worker_id\":\"existing-worker-id\",\"prompt\":\"follow-up instructions\"}}\n- {{\"type\":\"update_worker_summary\",\"worker_id\":\"existing-worker-id\",\"summary\":\"new short summary\"}}\n\nRules:\n- Always include the block, even when no actions are needed.\n- Keep `summary` short enough to fit a sidebar.\n- Use worker ids exactly as shown in the UI when referencing existing workers.",
             self.workspace_root.display()
         )
+    }
+
+    fn prepare_prompt_for_role(&self, prompt: &str, role: &SessionRole) -> String {
+        match role {
+            SessionRole::Master => format!(
+                "{prompt}\n\nCodeClaw runtime reminder: finish with the required <codeclaw-actions> JSON block."
+            ),
+            SessionRole::Worker(_) => prompt.to_owned(),
+        }
+    }
+
+    async fn apply_master_response(
+        &self,
+        session_id: &str,
+        parsed: &ParsedMasterResponse,
+    ) -> Result<Option<String>> {
+        let visible = parsed.visible_response.trim();
+        if !visible.is_empty() {
+            self.replace_last_assistant_line(session_id, visible)?;
+        }
+
+        if let Some(summary) = &parsed.envelope.summary {
+            self.append_log_line(session_id, format!("orchestrator> summary: {summary}"))?;
+        }
+
+        for action in &parsed.envelope.actions {
+            match action {
+                MasterAction::SpawnWorker {
+                    group,
+                    task,
+                    summary,
+                    prompt,
+                } => {
+                    self.append_log_line(
+                        session_id,
+                        format!("orchestrator> spawn_worker group={group} task={task}"),
+                    )?;
+                    match self
+                        .spawn_worker_with_options(group, task, summary.clone(), prompt.clone())
+                        .await
+                    {
+                        Ok(worker) => {
+                            self.append_log_line(
+                                session_id,
+                                format!(
+                                    "orchestrator> worker created: {} ({})",
+                                    worker.id, worker.thread_id
+                                ),
+                            )?;
+                        }
+                        Err(error) => {
+                            self.append_log_line(
+                                session_id,
+                                format!("orchestrator> spawn_worker failed: {error}"),
+                            )?;
+                        }
+                    }
+                }
+                MasterAction::SendWorkerPrompt { worker_id, prompt } => {
+                    self.append_log_line(
+                        session_id,
+                        format!("orchestrator> send_worker_prompt worker={worker_id}"),
+                    )?;
+                    match self.resolve_worker_target(worker_id) {
+                        Ok((target_session_id, thread_id, log_label, role)) => {
+                            if let Err(error) = self.enqueue_turn(
+                                target_session_id,
+                                thread_id,
+                                log_label,
+                                role,
+                                prompt,
+                            ) {
+                                self.append_log_line(
+                                    session_id,
+                                    format!("orchestrator> send_worker_prompt failed: {error}"),
+                                )?;
+                            }
+                        }
+                        Err(error) => {
+                            self.append_log_line(
+                                session_id,
+                                format!("orchestrator> send_worker_prompt failed: {error}"),
+                            )?;
+                        }
+                    }
+                }
+                MasterAction::UpdateWorkerSummary { worker_id, summary } => {
+                    self.append_log_line(
+                        session_id,
+                        format!("orchestrator> update_worker_summary worker={worker_id}"),
+                    )?;
+                    if let Err(error) = self.update_worker_summary(worker_id, summary).await {
+                        self.append_log_line(
+                            session_id,
+                            format!("orchestrator> update_worker_summary failed: {error}"),
+                        )?;
+                    }
+                }
+            }
+        }
+
+        Ok(if visible.is_empty() {
+            parsed.envelope.summary.clone()
+        } else {
+            Some(visible.to_owned())
+        })
     }
 }
 

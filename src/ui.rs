@@ -531,8 +531,9 @@ fn session_detail_line(session: &SessionSnapshot) -> String {
         SessionKind::Master => format!(
             "role: master | summary: {}",
             session
-                .last_message
+                .summary
                 .clone()
+                .or_else(|| session.last_message.clone())
                 .unwrap_or_else(|| "Primary planner and dispatcher".to_owned())
         ),
         SessionKind::Worker {
@@ -540,8 +541,14 @@ fn session_detail_line(session: &SessionSnapshot) -> String {
             task,
             task_file,
         } => format!(
-            "group: {} | task: {} | task file: {}",
-            group, task, task_file
+            "group: {} | task: {} | summary: {} | task file: {}",
+            group,
+            task,
+            session
+                .summary
+                .clone()
+                .unwrap_or_else(|| "not set".to_owned()),
+            task_file
         ),
     }
 }

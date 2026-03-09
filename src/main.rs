@@ -1,6 +1,7 @@
 mod app_server;
 mod config;
 mod controller;
+mod orchestration;
 mod session;
 mod state;
 mod ui;

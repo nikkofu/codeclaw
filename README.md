@@ -15,6 +15,7 @@ This repository now includes a working Rust MVP with:
 - worker task registration and tracking
 - a left/right TUI for session navigation and live output
 - terminal window title updates based on the selected Codex session
+- a structured orchestration protocol so the master can spawn workers and send follow-up prompts
 
 ## Commands
 
@@ -44,6 +45,12 @@ n       spawn a worker using "group: task"
 g       focus master
 q       quit
 ```
+
+The master session is now instructed to append a machine-readable orchestration block at the end of its replies. CodeClaw parses that block and can automatically:
+
+- spawn a worker
+- update a worker summary for the sidebar
+- send follow-up prompts to an existing worker
 
 ## Requirements
 

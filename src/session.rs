@@ -19,6 +19,7 @@ pub struct SessionSnapshot {
     pub thread_id: String,
     pub title: String,
     pub subtitle: String,
+    pub summary: Option<String>,
     pub kind: SessionKind,
     pub status: String,
     pub cwd: String,
@@ -32,7 +33,7 @@ pub struct SessionView {
     id: String,
     thread_id: String,
     title: String,
-    subtitle: String,
+    summary: Option<String>,
     kind: SessionKind,
     status: String,
     cwd: String,
@@ -48,7 +49,7 @@ impl SessionView {
             id: "master".to_owned(),
             thread_id,
             title: "master".to_owned(),
-            subtitle: "Primary planner and dispatcher".to_owned(),
+            summary: Some("Primary planner and dispatcher".to_owned()),
             kind: SessionKind::Master,
             status: "idle".to_owned(),
             cwd,
@@ -60,15 +61,11 @@ impl SessionView {
     }
 
     pub fn from_worker(worker: &WorkerRecord, cwd: String) -> Self {
-        let subtitle = worker
-            .last_message
-            .clone()
-            .unwrap_or_else(|| worker.task.clone());
         Self {
             id: worker.id.clone(),
             thread_id: worker.thread_id.clone(),
             title: format!("[{}] {}", worker.group, worker.task),
-            subtitle,
+            summary: worker.summary.clone(),
             kind: SessionKind::Worker {
                 group: worker.group.clone(),
                 task: worker.task.clone(),
@@ -97,8 +94,13 @@ impl SessionView {
 
     pub fn set_last_message(&mut self, message: Option<String>) {
         if let Some(message) = message {
-            self.subtitle = message.clone();
             self.last_message = Some(message);
+        }
+    }
+
+    pub fn set_summary(&mut self, summary: Option<String>) {
+        if summary.is_some() {
+            self.summary = summary;
         }
     }
 
@@ -122,17 +124,33 @@ impl SessionView {
         Some(committed)
     }
 
+    pub fn replace_last_assistant_line(&mut self, text: &str) {
+        let replacement = format!("assistant> {text}");
+        if let Some(last) = self.lines.back_mut() {
+            if last.starts_with("assistant> ") {
+                *last = replacement;
+            }
+        }
+    }
+
     pub fn snapshot(&self) -> SessionSnapshot {
         let mut log_lines = self.lines.iter().cloned().collect::<Vec<_>>();
         if !self.live_buffer.is_empty() {
             log_lines.push(format!("assistant> {}", self.live_buffer));
         }
 
+        let subtitle = self
+            .summary
+            .clone()
+            .or_else(|| self.last_message.clone())
+            .unwrap_or_else(|| self.title.clone());
+
         SessionSnapshot {
             id: self.id.clone(),
             thread_id: self.thread_id.clone(),
             title: self.title.clone(),
-            subtitle: self.subtitle.clone(),
+            subtitle,
+            summary: self.summary.clone(),
             kind: self.kind.clone(),
             status: self.status.clone(),
             cwd: self.cwd.clone(),
