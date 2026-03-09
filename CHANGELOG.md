@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.3.0 - 2026-03-09
+
+- added a structured timeline panel to the right side of the TUI
+- tagged timeline events by source so user, bootstrap, orchestrator, runtime, command, status, and error activity are visually distinct
+- surfaced worker runtime acknowledgements and master orchestration actions in the session timeline
+- separated session metadata/timeline supervision from rolling live output
+- added unit coverage for timeline retention and trimming
+
 ## 0.2.0 - 2026-03-09
 
 - added a master orchestration protocol based on `<codeclaw-actions>` JSON blocks

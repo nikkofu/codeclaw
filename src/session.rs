@@ -2,6 +2,7 @@ use crate::state::WorkerRecord;
 use std::collections::VecDeque;
 
 const MAX_LOG_LINES: usize = 512;
+const MAX_TIMELINE_EVENTS: usize = 128;
 const DEFAULT_MASTER_SUMMARY: &str = "Primary planner and dispatcher";
 
 #[derive(Debug, Clone)]
@@ -27,7 +28,26 @@ pub struct SessionSnapshot {
     pub cwd: String,
     pub last_turn_id: Option<String>,
     pub last_message: Option<String>,
+    pub timeline_events: Vec<SessionEvent>,
     pub log_lines: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SessionEventKind {
+    User,
+    Bootstrap,
+    Orchestrator,
+    Runtime,
+    System,
+    Command,
+    Status,
+    Error,
+}
+
+#[derive(Debug, Clone)]
+pub struct SessionEvent {
+    pub kind: SessionEventKind,
+    pub text: String,
 }
 
 #[derive(Debug, Clone)]
@@ -42,6 +62,7 @@ pub struct SessionView {
     cwd: String,
     last_turn_id: Option<String>,
     last_message: Option<String>,
+    timeline_events: VecDeque<SessionEvent>,
     lines: VecDeque<String>,
     live_buffer: String,
 }
@@ -64,6 +85,7 @@ impl SessionView {
             cwd,
             last_turn_id: None,
             last_message,
+            timeline_events: VecDeque::new(),
             lines: VecDeque::new(),
             live_buffer: String::new(),
         }
@@ -85,6 +107,7 @@ impl SessionView {
             cwd,
             last_turn_id: worker.last_turn_id.clone(),
             last_message: worker.last_message.clone(),
+            timeline_events: VecDeque::new(),
             lines: VecDeque::new(),
             live_buffer: String::new(),
         }
@@ -94,8 +117,13 @@ impl SessionView {
         self.thread_id = thread_id;
     }
 
-    pub fn set_status(&mut self, status: impl Into<String>) {
-        self.status = status.into();
+    pub fn set_status(&mut self, status: impl Into<String>) -> bool {
+        let next_status = status.into();
+        if self.status == next_status {
+            return false;
+        }
+        self.status = next_status;
+        true
     }
 
     pub fn set_pending_turns(&mut self, pending_turns: usize) {
@@ -116,6 +144,14 @@ impl SessionView {
         if summary.is_some() {
             self.summary = summary;
         }
+    }
+
+    pub fn push_timeline_event(&mut self, kind: SessionEventKind, text: impl Into<String>) {
+        self.timeline_events.push_back(SessionEvent {
+            kind,
+            text: text.into(),
+        });
+        trim_timeline(&mut self.timeline_events);
     }
 
     pub fn push_line(&mut self, line: impl Into<String>) {
@@ -176,6 +212,7 @@ impl SessionView {
             cwd: self.cwd.clone(),
             last_turn_id: self.last_turn_id.clone(),
             last_message: self.last_message.clone(),
+            timeline_events: self.timeline_events.iter().cloned().collect(),
             log_lines,
         }
     }
@@ -184,5 +221,31 @@ impl SessionView {
 fn trim_lines(lines: &mut VecDeque<String>) {
     while lines.len() > MAX_LOG_LINES {
         lines.pop_front();
+    }
+}
+
+fn trim_timeline(events: &mut VecDeque<SessionEvent>) {
+    while events.len() > MAX_TIMELINE_EVENTS {
+        events.pop_front();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{SessionEventKind, SessionKind, SessionView};
+
+    #[test]
+    fn timeline_is_trimmed_to_recent_events() {
+        let mut session = SessionView::master("thread-1".to_owned(), "/tmp".to_owned(), None, None);
+
+        for index in 0..140 {
+            session.push_timeline_event(SessionEventKind::System, format!("event-{index}"));
+        }
+
+        let snapshot = session.snapshot();
+        assert_eq!(snapshot.timeline_events.len(), 128);
+        assert_eq!(snapshot.timeline_events[0].text, "event-12");
+        assert_eq!(snapshot.timeline_events[127].text, "event-139");
+        assert!(matches!(snapshot.kind, SessionKind::Master));
     }
 }

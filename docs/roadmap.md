@@ -9,20 +9,21 @@ CodeClaw now has a functioning master-worker control loop:
 - worker creation from master actions
 - queued follow-up turns for busy sessions
 - automatic worker completion updates routed back to master
+- a structured right-pane timeline for orchestration and execution state
 - status files and session monitoring under `.codeclaw/`
 
 ## Next Phase
 
-The next engineering target is to make orchestration easier to supervise:
+The next engineering target is to harden supervision into long-running operator workflows:
 
-- richer right-pane execution view with clearer command/output grouping
-- explicit orchestration timeline for master -> worker dispatch, wait, complete, fail
-- stronger queue visibility in the sidebar and detail panel
-- better distinction between direct user prompts and internal runtime prompts
+- persist timeline/history across `codeclaw up` restarts
+- scope CLI quiescence waits to the active orchestration subtree instead of every session globally
+- add right-pane filtering/folding so command and output noise can be focused on demand
+- expose more explicit worker lifecycle milestones such as spawn requested, bootstrapped, blocked, and handed back
 
 ## After That
 
-Once orchestration visibility is solid, CodeClaw should move into workspace isolation:
+Once supervision history is stable, CodeClaw should move deeper into workspace isolation:
 
 - per-worker `git worktree` creation
 - branch lifecycle management

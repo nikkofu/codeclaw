@@ -11,6 +11,7 @@ Implemented now:
 - master orchestration actions for spawning workers, sending worker prompts, and updating summaries
 - queued turns for busy sessions
 - automatic worker completion/failure updates routed back into the master session
+- a structured right-pane timeline for session supervision
 - session recovery using `thread/resume`
 
 Not implemented yet:
@@ -120,9 +121,9 @@ Rust is the best fit because it gives:
    - receives structured turn, plan, and collaboration events
 
 3. `worker runtime`
-   - starts workers as `codex exec --json`
-   - captures event streams
-   - upgrades a worker into interactive attach mode on demand
+   - starts workers as additional `codex app-server` threads in the current prototype
+   - captures turn, command, output, and error events
+   - can evolve into interactive attach mode later when PTY support is added
 
 4. `workspace manager`
    - creates and deletes `git worktree` directories
@@ -152,21 +153,26 @@ user
           -> codex app-server
               -> master thread decides task split
                   -> worker runtime starts worker sessions
-                      -> each worker runs in its own git worktree
-                          -> status and artifacts written into .codeclaw/
-                              -> merge controller validates and integrates
+                      -> status, logs, and timeline updates flow through .codeclaw/ and in-memory session views
+                          -> planned worktree isolation and merge control land in later phases
 ```
 
 ## 6. Session and Workspace Model
 
-Each worker gets:
+Each worker gets today:
 
 - a stable worker id
 - a group name
 - a short task title
+- a dedicated task file
+- a dedicated status file
+- a dedicated Codex thread
+- an in-memory timeline and rolling log in the active TUI process
+
+Planned later:
+
 - a dedicated worktree
 - a dedicated branch
-- a dedicated status file
 - an optional attachable interactive session
 
 Suggested branch naming:
@@ -204,7 +210,7 @@ Important rule:
 
 - master owns shared planning files
 - each worker owns only its own status/log files in `.codeclaw/`
-- code changes happen inside the worker worktree, not the control directory
+- once worktree isolation lands, code changes should happen inside the worker worktree, not the control directory
 
 This keeps coordination files from turning into a conflict hotspot.
 
@@ -380,7 +386,7 @@ Recommended behavior:
 
 - `init`: create `.codeclaw/` config and local folders
 - `up`: start the TUI and the master adapter
-- `spawn`: create worktree, branch, task file, and worker runtime
+- `spawn`: create the task file and worker runtime today, then add worktree/branch setup in a later phase
 - `focus`: move selection in the sidebar
 - `attach`: upgrade the selected worker into interactive PTY view
 - `merge`: run the merge gate
@@ -395,8 +401,8 @@ Ship only:
 
 - Rust TUI shell
 - one master session via `codex app-server`
-- worker spawning via `codex exec --json`
-- `git worktree` isolation
+- worker spawning via additional `codex app-server` threads
+- queued orchestration and runtime feedback
 - local status files under `.codeclaw/`
 - sidebar + selected-session view
 
@@ -448,8 +454,8 @@ Build the first version as:
 
 - a Rust TUI application
 - `codex app-server` for the master control plane
-- `codex exec --json` for autonomous worker execution
-- `git worktree` for hard workspace isolation
+- `codex app-server` threads for autonomous worker execution in the first release
+- `git worktree` for hard workspace isolation in the next phase
 - `.codeclaw/` files for shared plan, status, and locks
 
 Only add raw embedded interactive Codex sessions after the control plane is stable.

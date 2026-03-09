@@ -4,7 +4,7 @@ use crate::{
     orchestration::{
         parse_master_response, visible_stream_text, MasterAction, ParsedMasterResponse,
     },
-    session::{SessionSnapshot, SessionView},
+    session::{SessionEventKind, SessionSnapshot, SessionView},
     state::{now_unix_ts, AppState, SessionStatus, WorkerRecord, WorkerStatus},
 };
 use anyhow::{anyhow, Context, Result};
@@ -172,6 +172,55 @@ impl TurnSource {
         match self {
             Self::User => prompt.to_owned(),
             Self::Bootstrap | Self::Orchestrator | Self::Runtime => compact_message(prompt),
+        }
+    }
+
+    fn event_kind(&self) -> SessionEventKind {
+        match self {
+            Self::User => SessionEventKind::User,
+            Self::Bootstrap => SessionEventKind::Bootstrap,
+            Self::Orchestrator => SessionEventKind::Orchestrator,
+            Self::Runtime => SessionEventKind::Runtime,
+        }
+    }
+
+    fn timeline_text(&self, prompt: &str, queued: bool, pending_count: usize) -> String {
+        let verb = if queued { "queued" } else { "started" };
+        match self {
+            Self::User => {
+                if queued {
+                    format!(
+                        "{verb} prompt ({pending_count} waiting): {}",
+                        compact_message(prompt)
+                    )
+                } else {
+                    format!("{verb} prompt: {}", compact_message(prompt))
+                }
+            }
+            Self::Bootstrap => {
+                if queued {
+                    format!("{verb} bootstrap task ({pending_count} waiting)")
+                } else {
+                    "started bootstrap task".to_owned()
+                }
+            }
+            Self::Orchestrator => {
+                if queued {
+                    format!(
+                        "{verb} follow-up ({pending_count} waiting): {}",
+                        compact_message(prompt)
+                    )
+                } else {
+                    format!("{verb} follow-up: {}", compact_message(prompt))
+                }
+            }
+            Self::Runtime => {
+                if queued {
+                    format!("{verb} internal runtime update ({pending_count} waiting)")
+                } else {
+                    "started internal runtime update".to_owned()
+                }
+            }
         }
     }
 }
@@ -432,6 +481,11 @@ impl Controller {
                     source.format_prompt(prompt)
                 ),
             )?;
+            self.append_session_event(
+                &session_id,
+                source.event_kind(),
+                source.timeline_text(prompt, true, pending_count),
+            )?;
             return Ok(rx);
         }
 
@@ -465,6 +519,11 @@ impl Controller {
         self.set_session_summary(worker_id, Some(summary.to_owned()))?;
         self.write_worker_status(&worker)?;
         self.append_log_line(worker_id, format!("system> summary updated: {summary}"))?;
+        self.append_session_event(
+            worker_id,
+            SessionEventKind::System,
+            format!("summary updated: {summary}"),
+        )?;
         Ok(())
     }
 
@@ -537,9 +596,19 @@ impl Controller {
             &record.id,
             format!("system> worker created from {}", record.task_file),
         )?;
+        self.append_session_event(
+            &record.id,
+            SessionEventKind::System,
+            format!("worker registered from {}", record.task_file),
+        )?;
         if let Some(summary) = summary {
             self.set_session_summary(&record.id, Some(summary.clone()))?;
             self.append_log_line(&record.id, format!("system> summary: {summary}"))?;
+            self.append_session_event(
+                &record.id,
+                SessionEventKind::System,
+                format!("initial summary: {summary}"),
+            )?;
         }
 
         let bootstrap_prompt = prompt.unwrap_or_else(|| worker_bootstrap_prompt(&record));
@@ -700,6 +769,11 @@ impl Controller {
                                     &session_id,
                                     format!("command> [{status}] {:?} :: {}", exit_code, command),
                                 )?;
+                                self.append_session_event(
+                                    &session_id,
+                                    SessionEventKind::Command,
+                                    format!("[{status}] {command}"),
+                                )?;
                                 if let Some(output) = aggregated_output {
                                     let trimmed = output.trim();
                                     if !trimmed.is_empty() {
@@ -736,6 +810,11 @@ impl Controller {
                             &session_id,
                             format!("error> {}", event.error.message),
                         )?;
+                        self.append_session_event(
+                            &session_id,
+                            SessionEventKind::Error,
+                            event.error.message.clone(),
+                        )?;
                         if let Some(details) = &event.error.additional_details {
                             self.append_log_line(&session_id, format!("error> {details}"))?;
                         }
@@ -753,6 +832,11 @@ impl Controller {
                         }
 
                         if let Some(error) = event.turn.error.or(final_error) {
+                            self.append_session_event(
+                                &session_id,
+                                SessionEventKind::Error,
+                                format!("turn failed: {}", error.message),
+                            )?;
                             self.write_role_status(
                                 &role,
                                 "failed",
@@ -895,6 +979,11 @@ impl Controller {
                 updated_worker.thread_id
             ),
         )?;
+        self.append_session_event(
+            worker_id,
+            SessionEventKind::System,
+            format!("resumed with fresh thread {}", updated_worker.thread_id),
+        )?;
         Ok(updated_worker)
     }
 
@@ -957,6 +1046,11 @@ impl Controller {
                 turn.source.log_prefix(),
                 turn.source.format_prompt(&turn.prompt)
             ),
+        )?;
+        self.append_session_event(
+            &turn.session_id,
+            turn.source.event_kind(),
+            turn.source.timeline_text(&turn.prompt, false, 0),
         )?;
         self.set_session_status(&turn.session_id, "queued")?;
 
@@ -1059,6 +1153,19 @@ impl Controller {
         Ok(())
     }
 
+    fn append_session_event(
+        &self,
+        session_id: &str,
+        kind: SessionEventKind,
+        text: impl Into<String>,
+    ) -> Result<()> {
+        let mut sessions = self.sessions.lock().expect("sessions lock poisoned");
+        if let Some(session) = sessions.get_mut(session_id) {
+            session.push_timeline_event(kind, text);
+        }
+        Ok(())
+    }
+
     fn append_live_chunk(&self, session_id: &str, chunk: &str) -> Result<()> {
         let mut sessions = self.sessions.lock().expect("sessions lock poisoned");
         if let Some(session) = sessions.get_mut(session_id) {
@@ -1093,7 +1200,9 @@ impl Controller {
     fn set_session_status(&self, session_id: &str, status: &str) -> Result<()> {
         let mut sessions = self.sessions.lock().expect("sessions lock poisoned");
         if let Some(session) = sessions.get_mut(session_id) {
-            session.set_status(status.to_owned());
+            if session.set_status(status.to_owned()) {
+                session.push_timeline_event(SessionEventKind::Status, format!("state -> {status}"));
+            }
         }
         Ok(())
     }
@@ -1273,6 +1382,11 @@ impl Controller {
         };
 
         let master_thread_id = self.ensure_master_thread().await?;
+        self.append_session_event(
+            MASTER_SESSION_ID,
+            SessionEventKind::Runtime,
+            format!("worker {worker_id} reported {worker_state}"),
+        )?;
         let prompt = format!(
             "CodeClaw runtime update. This is an internal worker status event, not a direct human message.\n\nWorker id: {worker_id}\nState: {worker_state}\nGroup: {}\nTask: {}\nSidebar summary: {}\nLast worker message: {}\n\nUpdate the operator with a concise coordination response and include the required <codeclaw-actions> block. If no follow-up is needed, return an empty actions list.",
             worker.group,
@@ -1328,6 +1442,11 @@ impl Controller {
         if let Some(summary) = &parsed.envelope.summary {
             self.update_master_summary(summary)?;
             self.append_log_line(session_id, format!("orchestrator> summary: {summary}"))?;
+            self.append_session_event(
+                session_id,
+                SessionEventKind::Orchestrator,
+                format!("master summary -> {summary}"),
+            )?;
         }
 
         for action in &parsed.envelope.actions {
@@ -1341,6 +1460,11 @@ impl Controller {
                     self.append_log_line(
                         session_id,
                         format!("orchestrator> spawn_worker group={group} task={task}"),
+                    )?;
+                    self.append_session_event(
+                        session_id,
+                        SessionEventKind::Orchestrator,
+                        format!("spawn worker [{group}] {task}"),
                     )?;
                     match self
                         .spawn_worker_with_options(
@@ -1360,11 +1484,21 @@ impl Controller {
                                     worker.id, worker.thread_id
                                 ),
                             )?;
+                            self.append_session_event(
+                                session_id,
+                                SessionEventKind::Orchestrator,
+                                format!("worker ready: {}", worker.id),
+                            )?;
                         }
                         Err(error) => {
                             self.append_log_line(
                                 session_id,
                                 format!("orchestrator> spawn_worker failed: {error}"),
+                            )?;
+                            self.append_session_event(
+                                session_id,
+                                SessionEventKind::Error,
+                                format!("spawn worker failed: {error}"),
                             )?;
                         }
                     }
@@ -1373,6 +1507,11 @@ impl Controller {
                     self.append_log_line(
                         session_id,
                         format!("orchestrator> send_worker_prompt worker={worker_id}"),
+                    )?;
+                    self.append_session_event(
+                        session_id,
+                        SessionEventKind::Orchestrator,
+                        format!("dispatch follow-up to {worker_id}"),
                     )?;
                     match self.resolve_worker_target(worker_id).await {
                         Ok((target_session_id, thread_id, log_label, role)) => {
@@ -1403,12 +1542,22 @@ impl Controller {
                                     session_id,
                                     format!("orchestrator> send_worker_prompt failed: {error}"),
                                 )?;
+                                self.append_session_event(
+                                    session_id,
+                                    SessionEventKind::Error,
+                                    format!("follow-up dispatch failed: {error}"),
+                                )?;
                             }
                         }
                         Err(error) => {
                             self.append_log_line(
                                 session_id,
                                 format!("orchestrator> send_worker_prompt failed: {error}"),
+                            )?;
+                            self.append_session_event(
+                                session_id,
+                                SessionEventKind::Error,
+                                format!("follow-up dispatch failed: {error}"),
                             )?;
                         }
                     }
@@ -1418,10 +1567,20 @@ impl Controller {
                         session_id,
                         format!("orchestrator> update_worker_summary worker={worker_id}"),
                     )?;
+                    self.append_session_event(
+                        session_id,
+                        SessionEventKind::Orchestrator,
+                        format!("update summary for {worker_id}"),
+                    )?;
                     if let Err(error) = self.update_worker_summary(worker_id, summary).await {
                         self.append_log_line(
                             session_id,
                             format!("orchestrator> update_worker_summary failed: {error}"),
+                        )?;
+                        self.append_session_event(
+                            session_id,
+                            SessionEventKind::Error,
+                            format!("summary update failed: {error}"),
                         )?;
                     }
                 }

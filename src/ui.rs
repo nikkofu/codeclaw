@@ -1,6 +1,6 @@
 use crate::{
     controller::{Controller, PromptTarget},
-    session::{SessionKind, SessionSnapshot},
+    session::{SessionEvent, SessionEventKind, SessionKind, SessionSnapshot},
 };
 use anyhow::{Context, Result};
 use crossterm::{
@@ -164,7 +164,11 @@ impl App {
 
         let sections = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([Constraint::Length(9), Constraint::Min(8)])
+            .constraints([
+                Constraint::Length(10),
+                Constraint::Length(9),
+                Constraint::Min(7),
+            ])
             .split(area);
 
         let meta = Paragraph::new(Text::from(vec![
@@ -195,9 +199,19 @@ impl App {
         .wrap(Wrap { trim: false });
         frame.render_widget(meta, sections[0]);
 
+        let timeline = timeline_text(
+            &session.timeline_events,
+            sections[1].width.saturating_sub(4) as usize,
+            sections[1].height.saturating_sub(2) as usize,
+        );
+        let timeline = Paragraph::new(timeline)
+            .block(Block::default().title("Timeline").borders(Borders::ALL))
+            .wrap(Wrap { trim: false });
+        frame.render_widget(timeline, sections[1]);
+
         let lines = tail_lines(
             &session.log_lines,
-            sections[1].height.saturating_sub(2) as usize,
+            sections[2].height.saturating_sub(2) as usize,
         );
         let body = if lines.is_empty() {
             "No output yet.".to_owned()
@@ -208,7 +222,7 @@ impl App {
         let detail = Paragraph::new(body)
             .block(Block::default().title("Live Output").borders(Borders::ALL))
             .wrap(Wrap { trim: false });
-        frame.render_widget(detail, sections[1]);
+        frame.render_widget(detail, sections[2]);
     }
 
     fn draw_status_bar(&self, frame: &mut Frame<'_>, area: Rect, sessions: &[SessionSnapshot]) {
@@ -518,6 +532,37 @@ fn tail_lines(lines: &[String], max_lines: usize) -> Vec<String> {
     lines[start..].to_vec()
 }
 
+fn tail_events(events: &[SessionEvent], max_events: usize) -> Vec<SessionEvent> {
+    if max_events == 0 {
+        return Vec::new();
+    }
+    let start = events.len().saturating_sub(max_events);
+    events[start..].to_vec()
+}
+
+fn timeline_text(events: &[SessionEvent], width: usize, max_lines: usize) -> Text<'static> {
+    if events.is_empty() || max_lines == 0 {
+        return Text::from(Line::from("No orchestration events yet."));
+    }
+
+    let max_body = width.saturating_sub(7).max(12);
+    let lines = tail_events(events, max_lines)
+        .into_iter()
+        .map(|event| {
+            Line::from(vec![
+                Span::styled(
+                    format!("[{}]", event_kind_label(&event.kind)),
+                    event_kind_style(&event.kind),
+                ),
+                Span::raw(" "),
+                Span::raw(truncate(&event.text, max_body)),
+            ])
+        })
+        .collect::<Vec<_>>();
+
+    Text::from(lines)
+}
+
 fn input_target_label(mode: &InputMode, session: &SessionSnapshot) -> String {
     match mode {
         InputMode::MasterPrompt => "master".to_owned(),
@@ -583,5 +628,31 @@ fn session_location_line(session: &SessionSnapshot) -> String {
         SessionKind::Worker { task_file, .. } => {
             format!("task file: {}", truncate(task_file, 39))
         }
+    }
+}
+
+fn event_kind_label(kind: &SessionEventKind) -> &'static str {
+    match kind {
+        SessionEventKind::User => "USR",
+        SessionEventKind::Bootstrap => "BOT",
+        SessionEventKind::Orchestrator => "ORC",
+        SessionEventKind::Runtime => "RUN",
+        SessionEventKind::System => "SYS",
+        SessionEventKind::Command => "CMD",
+        SessionEventKind::Status => "STS",
+        SessionEventKind::Error => "ERR",
+    }
+}
+
+fn event_kind_style(kind: &SessionEventKind) -> Style {
+    match kind {
+        SessionEventKind::User => Style::default().fg(Color::Cyan),
+        SessionEventKind::Bootstrap => Style::default().fg(Color::LightBlue),
+        SessionEventKind::Orchestrator => Style::default().fg(Color::Yellow),
+        SessionEventKind::Runtime => Style::default().fg(Color::LightMagenta),
+        SessionEventKind::System => Style::default().fg(Color::Gray),
+        SessionEventKind::Command => Style::default().fg(Color::LightGreen),
+        SessionEventKind::Status => Style::default().fg(Color::Green),
+        SessionEventKind::Error => Style::default().fg(Color::Red),
     }
 }

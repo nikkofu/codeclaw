@@ -18,6 +18,8 @@ This repository now includes a working Rust control-plane prototype with:
 - a structured orchestration protocol so the master can spawn workers and send follow-up prompts
 - queued turns for busy sessions
 - automatic worker completion and failure updates routed back to the master session
+- a structured orchestration timeline in the right pane
+- source-tagged session events for user, bootstrap, orchestrator, runtime, command, status, and error activity
 - persisted master summary and last-message status across restarts
 
 ## Commands
@@ -35,7 +37,7 @@ cargo run -- list
 
 ```text
 left: session list
-right: selected session live output
+right: selected session overview + timeline + live output
 bottom: status + input area
 ```
 
@@ -51,6 +53,12 @@ q       quit
 ```
 
 The sidebar now also reflects per-session queue depth with `qN` prefixes when a session has pending turns.
+
+The right pane now separates supervision metadata from execution noise:
+
+- `Selected Session` shows title, queue depth, summary, last message, thread id, and task file/workspace
+- `Timeline` shows recent structured events such as user prompts, orchestrator dispatches, runtime acknowledgements, status changes, and command completions
+- `Live Output` remains the rolling text stream for assistant output and command/output lines
 
 The master session is now instructed to append a machine-readable orchestration block at the end of its replies. CodeClaw parses that block and can automatically:
 
@@ -76,6 +84,7 @@ When a worker finishes or fails, CodeClaw also pushes a runtime update back into
 ## Known Gaps
 
 - the right pane is still a structured log view, not a full PTY terminal emulator
+- timeline history is currently live/in-memory and not yet replayed after a process restart
 - worker sessions do not yet run in dedicated `git worktree` directories
 - path leases are documented but not yet hard-enforced at dispatch time
 - merge gating and integration-branch automation are still ahead
