@@ -1,8 +1,9 @@
-use crate::state::WorkerRecord;
+use crate::state::{now_unix_ts, WorkerRecord};
+use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 
 const MAX_LOG_LINES: usize = 512;
-const MAX_TIMELINE_EVENTS: usize = 128;
+pub const MAX_TIMELINE_EVENTS: usize = 128;
 const DEFAULT_MASTER_SUMMARY: &str = "Primary planner and dispatcher";
 
 #[derive(Debug, Clone)]
@@ -22,6 +23,7 @@ pub struct SessionSnapshot {
     pub title: String,
     pub subtitle: String,
     pub pending_turns: usize,
+    pub latest_batch_id: Option<u64>,
     pub summary: Option<String>,
     pub kind: SessionKind,
     pub status: String,
@@ -32,7 +34,8 @@ pub struct SessionSnapshot {
     pub log_lines: Vec<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum SessionEventKind {
     User,
     Bootstrap,
@@ -44,8 +47,11 @@ pub enum SessionEventKind {
     Error,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionEvent {
+    pub ts: u64,
+    #[serde(default)]
+    pub batch_id: Option<u64>,
     pub kind: SessionEventKind,
     pub text: String,
 }
@@ -146,11 +152,15 @@ impl SessionView {
         }
     }
 
-    pub fn push_timeline_event(&mut self, kind: SessionEventKind, text: impl Into<String>) {
-        self.timeline_events.push_back(SessionEvent {
-            kind,
-            text: text.into(),
-        });
+    pub fn restore_timeline(&mut self, events: &[SessionEvent]) {
+        self.timeline_events.clear();
+        for event in events.iter().cloned() {
+            self.push_timeline_event(event);
+        }
+    }
+
+    pub fn push_timeline_event(&mut self, event: SessionEvent) {
+        self.timeline_events.push_back(event);
         trim_timeline(&mut self.timeline_events);
     }
 
@@ -188,6 +198,13 @@ impl SessionView {
         }
     }
 
+    pub fn latest_batch_id(&self) -> Option<u64> {
+        self.timeline_events
+            .iter()
+            .rev()
+            .find_map(|event| event.batch_id)
+    }
+
     pub fn snapshot(&self) -> SessionSnapshot {
         let mut log_lines = self.lines.iter().cloned().collect::<Vec<_>>();
         if !self.live_buffer.is_empty() {
@@ -206,6 +223,7 @@ impl SessionView {
             title: self.title.clone(),
             subtitle,
             pending_turns: self.pending_turns,
+            latest_batch_id: self.latest_batch_id(),
             summary: self.summary.clone(),
             kind: self.kind.clone(),
             status: self.status.clone(),
@@ -214,6 +232,17 @@ impl SessionView {
             last_message: self.last_message.clone(),
             timeline_events: self.timeline_events.iter().cloned().collect(),
             log_lines,
+        }
+    }
+}
+
+impl SessionEvent {
+    pub fn new(kind: SessionEventKind, text: impl Into<String>, batch_id: Option<u64>) -> Self {
+        Self {
+            ts: now_unix_ts(),
+            batch_id,
+            kind,
+            text: text.into(),
         }
     }
 }
@@ -232,14 +261,19 @@ fn trim_timeline(events: &mut VecDeque<SessionEvent>) {
 
 #[cfg(test)]
 mod tests {
-    use super::{SessionEventKind, SessionKind, SessionView};
+    use super::{SessionEvent, SessionEventKind, SessionKind, SessionView};
 
     #[test]
     fn timeline_is_trimmed_to_recent_events() {
         let mut session = SessionView::master("thread-1".to_owned(), "/tmp".to_owned(), None, None);
 
         for index in 0..140 {
-            session.push_timeline_event(SessionEventKind::System, format!("event-{index}"));
+            session.push_timeline_event(SessionEvent {
+                ts: index,
+                batch_id: None,
+                kind: SessionEventKind::System,
+                text: format!("event-{index}"),
+            });
         }
 
         let snapshot = session.snapshot();
@@ -247,5 +281,14 @@ mod tests {
         assert_eq!(snapshot.timeline_events[0].text, "event-12");
         assert_eq!(snapshot.timeline_events[127].text, "event-139");
         assert!(matches!(snapshot.kind, SessionKind::Master));
+    }
+
+    #[test]
+    fn latest_batch_id_tracks_most_recent_batch_event() {
+        let mut session = SessionView::master("thread-1".to_owned(), "/tmp".to_owned(), None, None);
+        session.push_timeline_event(SessionEvent::new(SessionEventKind::System, "seed", None));
+        session.push_timeline_event(SessionEvent::new(SessionEventKind::User, "batch", Some(42)));
+
+        assert_eq!(session.latest_batch_id(), Some(42));
     }
 }

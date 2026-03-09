@@ -4,8 +4,11 @@ use crate::{
     orchestration::{
         parse_master_response, visible_stream_text, MasterAction, ParsedMasterResponse,
     },
-    session::{SessionEventKind, SessionSnapshot, SessionView},
-    state::{now_unix_ts, AppState, SessionStatus, WorkerRecord, WorkerStatus},
+    session::{SessionEvent, SessionEventKind, SessionSnapshot, SessionView, MAX_TIMELINE_EVENTS},
+    state::{
+        now_unix_ts, AppState, BatchStatus, OrchestrationBatchRecord, SessionStatus, WorkerRecord,
+        WorkerStatus,
+    },
 };
 use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
@@ -31,7 +34,6 @@ pub struct Controller {
     sessions: Arc<Mutex<BTreeMap<String, SessionView>>>,
     pending_turns: Arc<Mutex<BTreeMap<String, VecDeque<QueuedTurn>>>>,
     active_turn_batches: Arc<Mutex<BTreeMap<String, u64>>>,
-    next_batch_id: Arc<Mutex<u64>>,
     client: Arc<AppServerClient>,
 }
 
@@ -262,7 +264,6 @@ impl Controller {
             sessions: Arc::new(Mutex::new(sessions)),
             pending_turns: Arc::new(Mutex::new(BTreeMap::new())),
             active_turn_batches: Arc::new(Mutex::new(BTreeMap::new())),
-            next_batch_id: Arc::new(Mutex::new(1)),
             client,
         })
     }
@@ -378,7 +379,8 @@ impl Controller {
 
     pub async fn submit_prompt(&self, target: PromptTarget, prompt: &str) -> Result<()> {
         let (session_id, thread_id, log_label, role) = self.resolve_prompt_target(target).await?;
-        let batch_id = self.allocate_batch_id();
+        let batch_id = self.allocate_batch_id()?;
+        self.register_batch(&session_id, batch_id, prompt)?;
         self.enqueue_turn(
             batch_id,
             session_id,
@@ -393,7 +395,8 @@ impl Controller {
 
     pub async fn submit_prompt_and_wait(&self, target: PromptTarget, prompt: &str) -> Result<()> {
         let (session_id, thread_id, log_label, role) = self.resolve_prompt_target(target).await?;
-        let batch_id = self.allocate_batch_id();
+        let batch_id = self.allocate_batch_id()?;
+        self.register_batch(&session_id, batch_id, prompt)?;
         self.enqueue_turn_and_wait(
             batch_id,
             session_id,
@@ -408,11 +411,35 @@ impl Controller {
         self.wait_for_batch_quiescence(batch_id).await
     }
 
-    fn allocate_batch_id(&self) -> u64 {
-        let mut next = self.next_batch_id.lock().expect("batch id lock poisoned");
-        let batch_id = *next;
-        *next += 1;
-        batch_id
+    fn allocate_batch_id(&self) -> Result<u64> {
+        let batch_id = {
+            let mut state = self.state.lock().expect("state lock poisoned");
+            let batch_id = state.next_batch_id;
+            state.next_batch_id += 1;
+            batch_id
+        };
+        self.save_state()?;
+        Ok(batch_id)
+    }
+
+    fn register_batch(&self, session_id: &str, batch_id: u64, prompt: &str) -> Result<()> {
+        {
+            let mut state = self.state.lock().expect("state lock poisoned");
+            state
+                .batches
+                .entry(batch_id)
+                .or_insert(OrchestrationBatchRecord {
+                    id: batch_id,
+                    root_session_id: session_id.to_owned(),
+                    root_prompt: compact_message(prompt),
+                    status: BatchStatus::Running,
+                    created_at: now_unix_ts(),
+                    updated_at: now_unix_ts(),
+                    sessions: vec![session_id.to_owned()],
+                    last_event: Some("batch registered".to_owned()),
+                });
+        }
+        self.save_state()
     }
 
     fn enqueue_turn(
@@ -507,6 +534,7 @@ impl Controller {
                 &session_id,
                 source.event_kind(),
                 source.timeline_text(prompt, true, pending_count),
+                Some(batch_id),
             )?;
             return Ok(rx);
         }
@@ -517,12 +545,24 @@ impl Controller {
     }
 
     pub async fn spawn_worker(&self, group: &str, task: &str) -> Result<WorkerRecord> {
-        self.spawn_worker_with_options(group, task, None, None, false, self.allocate_batch_id())
+        let batch_id = self.allocate_batch_id()?;
+        self.register_batch(
+            MASTER_SESSION_ID,
+            batch_id,
+            &format!("spawn worker [{group}] {task}"),
+        )?;
+        self.spawn_worker_with_options(group, task, None, None, false, batch_id)
             .await
     }
 
     pub async fn spawn_worker_and_wait(&self, group: &str, task: &str) -> Result<WorkerRecord> {
-        self.spawn_worker_with_options(group, task, None, None, true, self.allocate_batch_id())
+        let batch_id = self.allocate_batch_id()?;
+        self.register_batch(
+            MASTER_SESSION_ID,
+            batch_id,
+            &format!("spawn worker [{group}] {task}"),
+        )?;
+        self.spawn_worker_with_options(group, task, None, None, true, batch_id)
             .await
     }
 
@@ -545,6 +585,7 @@ impl Controller {
             worker_id,
             SessionEventKind::System,
             format!("summary updated: {summary}"),
+            self.current_active_batch_id(worker_id),
         )?;
         Ok(())
     }
@@ -623,6 +664,7 @@ impl Controller {
             &record.id,
             SessionEventKind::System,
             format!("worker registered from {}", record.task_file),
+            Some(batch_id),
         )?;
         if let Some(summary) = summary {
             self.set_session_summary(&record.id, Some(summary.clone()))?;
@@ -631,6 +673,7 @@ impl Controller {
                 &record.id,
                 SessionEventKind::System,
                 format!("initial summary: {summary}"),
+                Some(batch_id),
             )?;
         }
 
@@ -799,6 +842,7 @@ impl Controller {
                                     &session_id,
                                     SessionEventKind::Command,
                                     format!("[{status}] {command}"),
+                                    Some(batch_id),
                                 )?;
                                 if let Some(output) = aggregated_output {
                                     let trimmed = output.trim();
@@ -840,6 +884,7 @@ impl Controller {
                             &session_id,
                             SessionEventKind::Error,
                             event.error.message.clone(),
+                            Some(batch_id),
                         )?;
                         if let Some(details) = &event.error.additional_details {
                             self.append_log_line(&session_id, format!("error> {details}"))?;
@@ -862,7 +907,9 @@ impl Controller {
                                 &session_id,
                                 SessionEventKind::Error,
                                 format!("turn failed: {}", error.message),
+                                Some(batch_id),
                             )?;
+                            self.set_batch_status(batch_id, BatchStatus::Failed)?;
                             self.write_role_status(
                                 &role,
                                 "failed",
@@ -1014,6 +1061,7 @@ impl Controller {
             worker_id,
             SessionEventKind::System,
             format!("resumed with fresh thread {}", updated_worker.thread_id),
+            None,
         )?;
         Ok(updated_worker)
     }
@@ -1043,30 +1091,44 @@ impl Controller {
     fn ensure_master_session(&self, thread_id: String) {
         let summary = self.master_summary();
         let last_message = self.master_last_message();
+        let history = {
+            let state = self.state.lock().expect("state lock poisoned");
+            state.session_history.get(MASTER_SESSION_ID).cloned()
+        };
         let mut sessions = self.sessions.lock().expect("sessions lock poisoned");
-        sessions
-            .entry(MASTER_SESSION_ID.to_owned())
-            .and_modify(|session| {
-                session.set_thread_id(thread_id.clone());
-                session.set_summary(summary.clone());
-                session.set_last_message(last_message.clone());
-            })
-            .or_insert_with(|| {
-                SessionView::master(
-                    thread_id,
-                    self.workspace_root.display().to_string(),
-                    summary,
-                    last_message,
-                )
-            });
+        if let Some(session) = sessions.get_mut(MASTER_SESSION_ID) {
+            session.set_thread_id(thread_id);
+            session.set_summary(summary);
+            session.set_last_message(last_message);
+            if let Some(history) = &history {
+                session.restore_timeline(history);
+            }
+        } else {
+            let mut session = SessionView::master(
+                thread_id,
+                self.workspace_root.display().to_string(),
+                summary,
+                last_message,
+            );
+            if let Some(history) = &history {
+                session.restore_timeline(history);
+            }
+            sessions.insert(MASTER_SESSION_ID.to_owned(), session);
+        }
     }
 
     fn upsert_worker_session(&self, worker: &WorkerRecord) {
+        let history = {
+            let state = self.state.lock().expect("state lock poisoned");
+            state.session_history.get(&worker.id).cloned()
+        };
         let mut sessions = self.sessions.lock().expect("sessions lock poisoned");
-        sessions.insert(
-            worker.id.clone(),
-            SessionView::from_worker(worker, self.workspace_root.display().to_string()),
-        );
+        let mut session =
+            SessionView::from_worker(worker, self.workspace_root.display().to_string());
+        if let Some(history) = history {
+            session.restore_timeline(&history);
+        }
+        sessions.insert(worker.id.clone(), session);
     }
 
     fn start_queued_turn(&self, turn: QueuedTurn) -> Result<()> {
@@ -1082,9 +1144,10 @@ impl Controller {
             &turn.session_id,
             turn.source.event_kind(),
             turn.source.timeline_text(&turn.prompt, false, 0),
+            Some(turn.batch_id),
         )?;
-        self.set_session_status(&turn.session_id, "queued")?;
         self.set_active_turn_batch(&turn.session_id, turn.batch_id)?;
+        self.set_session_status(&turn.session_id, "queued")?;
 
         let controller = self.clone();
         tokio::spawn(async move {
@@ -1101,11 +1164,13 @@ impl Controller {
                 .await;
             if let Err(error) = &result {
                 let _ = controller.append_log_line(&turn.session_id, format!("error> {error}"));
+                let _ = controller.set_batch_status(turn.batch_id, BatchStatus::Failed);
                 let _ = controller.set_session_status(&turn.session_id, "failed");
             }
             let _ = turn.completion.send(result);
             let _ = controller.clear_active_turn_batch(&turn.session_id, turn.batch_id);
             let _ = controller.schedule_next_turn(&turn.session_id);
+            let _ = controller.refresh_batch_state(turn.batch_id);
         });
 
         Ok(())
@@ -1161,7 +1226,8 @@ impl Controller {
             .lock()
             .expect("active turn lock poisoned");
         active.insert(session_id.to_owned(), batch_id);
-        Ok(())
+        drop(active);
+        self.touch_batch(batch_id, session_id, None)
     }
 
     fn clear_active_turn_batch(&self, session_id: &str, batch_id: u64) -> Result<()> {
@@ -1173,6 +1239,14 @@ impl Controller {
             active.remove(session_id);
         }
         Ok(())
+    }
+
+    fn current_active_batch_id(&self, session_id: &str) -> Option<u64> {
+        let active = self
+            .active_turn_batches
+            .lock()
+            .expect("active turn lock poisoned");
+        active.get(session_id).copied()
     }
 
     fn batch_has_pending_turns(&self, batch_id: u64) -> bool {
@@ -1195,6 +1269,7 @@ impl Controller {
     async fn wait_for_batch_quiescence(&self, batch_id: u64) -> Result<()> {
         loop {
             if !self.batch_has_active_turns(batch_id) && !self.batch_has_pending_turns(batch_id) {
+                self.refresh_batch_state(batch_id)?;
                 return Ok(());
             }
             tokio::time::sleep(Duration::from_millis(120)).await;
@@ -1214,12 +1289,44 @@ impl Controller {
         session_id: &str,
         kind: SessionEventKind,
         text: impl Into<String>,
+        batch_id: Option<u64>,
     ) -> Result<()> {
+        let text = text.into();
+        let event = SessionEvent::new(kind, text.clone(), batch_id);
         let mut sessions = self.sessions.lock().expect("sessions lock poisoned");
         if let Some(session) = sessions.get_mut(session_id) {
-            session.push_timeline_event(kind, text);
+            session.push_timeline_event(event.clone());
         }
-        Ok(())
+        drop(sessions);
+
+        {
+            let mut state = self.state.lock().expect("state lock poisoned");
+            let history = state
+                .session_history
+                .entry(session_id.to_owned())
+                .or_default();
+            history.push(event);
+            trim_persisted_events(history);
+
+            if let Some(batch_id) = batch_id {
+                let batch =
+                    state
+                        .batches
+                        .entry(batch_id)
+                        .or_insert_with(|| OrchestrationBatchRecord {
+                            id: batch_id,
+                            root_session_id: session_id.to_owned(),
+                            root_prompt: "(implicit batch)".to_owned(),
+                            status: BatchStatus::Running,
+                            created_at: now_unix_ts(),
+                            updated_at: now_unix_ts(),
+                            sessions: Vec::new(),
+                            last_event: None,
+                        });
+                batch.touch(session_id, Some(&text));
+            }
+        }
+        self.save_state()
     }
 
     fn append_live_chunk(&self, session_id: &str, chunk: &str) -> Result<()> {
@@ -1254,11 +1361,75 @@ impl Controller {
     }
 
     fn set_session_status(&self, session_id: &str, status: &str) -> Result<()> {
-        let mut sessions = self.sessions.lock().expect("sessions lock poisoned");
-        if let Some(session) = sessions.get_mut(session_id) {
-            if session.set_status(status.to_owned()) {
-                session.push_timeline_event(SessionEventKind::Status, format!("state -> {status}"));
+        let changed = {
+            let mut sessions = self.sessions.lock().expect("sessions lock poisoned");
+            if let Some(session) = sessions.get_mut(session_id) {
+                session.set_status(status.to_owned())
+            } else {
+                false
             }
+        };
+        if changed {
+            self.append_session_event(
+                session_id,
+                SessionEventKind::Status,
+                format!("state -> {status}"),
+                self.current_active_batch_id(session_id),
+            )?;
+        }
+        Ok(())
+    }
+
+    fn touch_batch(&self, batch_id: u64, session_id: &str, event_text: Option<&str>) -> Result<()> {
+        {
+            let mut state = self.state.lock().expect("state lock poisoned");
+            let batch = state
+                .batches
+                .entry(batch_id)
+                .or_insert_with(|| OrchestrationBatchRecord {
+                    id: batch_id,
+                    root_session_id: session_id.to_owned(),
+                    root_prompt: "(implicit batch)".to_owned(),
+                    status: BatchStatus::Running,
+                    created_at: now_unix_ts(),
+                    updated_at: now_unix_ts(),
+                    sessions: Vec::new(),
+                    last_event: None,
+                });
+            batch.touch(session_id, event_text);
+        }
+        self.save_state()
+    }
+
+    fn set_batch_status(&self, batch_id: u64, status: BatchStatus) -> Result<()> {
+        {
+            let mut state = self.state.lock().expect("state lock poisoned");
+            if let Some(batch) = state.batches.get_mut(&batch_id) {
+                batch.status = status;
+                batch.updated_at = now_unix_ts();
+            }
+        }
+        self.save_state()
+    }
+
+    fn refresh_batch_state(&self, batch_id: u64) -> Result<()> {
+        let has_work =
+            self.batch_has_active_turns(batch_id) || self.batch_has_pending_turns(batch_id);
+        let next_status = {
+            let state = self.state.lock().expect("state lock poisoned");
+            state.batches.get(&batch_id).map(|batch| {
+                if has_work {
+                    batch.status.clone()
+                } else if matches!(batch.status, BatchStatus::Failed) {
+                    BatchStatus::Failed
+                } else {
+                    BatchStatus::Completed
+                }
+            })
+        };
+
+        if let Some(next_status) = next_status {
+            self.set_batch_status(batch_id, next_status)?;
         }
         Ok(())
     }
@@ -1443,6 +1614,7 @@ impl Controller {
             MASTER_SESSION_ID,
             SessionEventKind::Runtime,
             format!("worker {worker_id} reported {worker_state}"),
+            Some(batch_id),
         )?;
         let prompt = format!(
             "CodeClaw runtime update. This is an internal worker status event, not a direct human message.\n\nWorker id: {worker_id}\nState: {worker_state}\nGroup: {}\nTask: {}\nSidebar summary: {}\nLast worker message: {}\n\nUpdate the operator with a concise coordination response and include the required <codeclaw-actions> block. If no follow-up is needed, return an empty actions list.",
@@ -1505,6 +1677,7 @@ impl Controller {
                 session_id,
                 SessionEventKind::Orchestrator,
                 format!("master summary -> {summary}"),
+                Some(batch_id),
             )?;
         }
 
@@ -1524,6 +1697,7 @@ impl Controller {
                         session_id,
                         SessionEventKind::Orchestrator,
                         format!("spawn worker [{group}] {task}"),
+                        Some(batch_id),
                     )?;
                     match self
                         .spawn_worker_with_options(
@@ -1548,6 +1722,7 @@ impl Controller {
                                 session_id,
                                 SessionEventKind::Orchestrator,
                                 format!("worker ready: {}", worker.id),
+                                Some(batch_id),
                             )?;
                         }
                         Err(error) => {
@@ -1559,6 +1734,7 @@ impl Controller {
                                 session_id,
                                 SessionEventKind::Error,
                                 format!("spawn worker failed: {error}"),
+                                Some(batch_id),
                             )?;
                         }
                     }
@@ -1572,6 +1748,7 @@ impl Controller {
                         session_id,
                         SessionEventKind::Orchestrator,
                         format!("dispatch follow-up to {worker_id}"),
+                        Some(batch_id),
                     )?;
                     match self.resolve_worker_target(worker_id).await {
                         Ok((target_session_id, thread_id, log_label, role)) => {
@@ -1608,6 +1785,7 @@ impl Controller {
                                     session_id,
                                     SessionEventKind::Error,
                                     format!("follow-up dispatch failed: {error}"),
+                                    Some(batch_id),
                                 )?;
                             }
                         }
@@ -1620,6 +1798,7 @@ impl Controller {
                                 session_id,
                                 SessionEventKind::Error,
                                 format!("follow-up dispatch failed: {error}"),
+                                Some(batch_id),
                             )?;
                         }
                     }
@@ -1633,6 +1812,7 @@ impl Controller {
                         session_id,
                         SessionEventKind::Orchestrator,
                         format!("update summary for {worker_id}"),
+                        Some(batch_id),
                     )?;
                     if let Err(error) = self.update_worker_summary(worker_id, summary).await {
                         self.append_log_line(
@@ -1643,6 +1823,7 @@ impl Controller {
                             session_id,
                             SessionEventKind::Error,
                             format!("summary update failed: {error}"),
+                            Some(batch_id),
                         )?;
                     }
                 }
@@ -1660,21 +1841,23 @@ impl Controller {
 fn build_sessions(state: &AppState, workspace_root: &Path) -> BTreeMap<String, SessionView> {
     let mut sessions = BTreeMap::new();
     if let Some(thread_id) = state.master_thread_id.clone() {
-        sessions.insert(
-            MASTER_SESSION_ID.to_owned(),
-            SessionView::master(
-                thread_id,
-                workspace_root.display().to_string(),
-                state.master_summary.clone(),
-                state.master_last_message.clone(),
-            ),
+        let mut session = SessionView::master(
+            thread_id,
+            workspace_root.display().to_string(),
+            state.master_summary.clone(),
+            state.master_last_message.clone(),
         );
+        if let Some(events) = state.session_history.get(MASTER_SESSION_ID) {
+            session.restore_timeline(events);
+        }
+        sessions.insert(MASTER_SESSION_ID.to_owned(), session);
     }
     for worker in state.workers.values() {
-        sessions.insert(
-            worker.id.clone(),
-            SessionView::from_worker(worker, workspace_root.display().to_string()),
-        );
+        let mut session = SessionView::from_worker(worker, workspace_root.display().to_string());
+        if let Some(events) = state.session_history.get(&worker.id) {
+            session.restore_timeline(events);
+        }
+        sessions.insert(worker.id.clone(), session);
     }
     sessions
 }
@@ -1757,6 +1940,13 @@ fn compact_message(text: &str) -> String {
         trimmed.to_owned()
     } else {
         format!("{}...", &trimmed[..200])
+    }
+}
+
+fn trim_persisted_events(events: &mut Vec<SessionEvent>) {
+    if events.len() > MAX_TIMELINE_EVENTS {
+        let keep_from = events.len() - MAX_TIMELINE_EVENTS;
+        events.drain(0..keep_from);
     }
 }
 

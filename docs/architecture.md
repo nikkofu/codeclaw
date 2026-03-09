@@ -13,6 +13,7 @@ Implemented now:
 - automatic worker completion/failure updates routed back into the master session
 - a structured right-pane timeline for session supervision
 - batch-scoped CLI waiting for the orchestration chain initiated by the active prompt
+- persisted `session_history` and `batches` metadata inside `.codeclaw/state.json`
 - session recovery using `thread/resume`
 
 Not implemented yet:
@@ -134,6 +135,7 @@ Rust is the best fit because it gives:
 5. `coordination store`
    - stores plan, task, lock, and status files under `.codeclaw/`
    - acts as the shared memory between master and workers
+   - now also persists session timeline history and orchestration batch metadata
 
 6. `merge controller`
    - checks overlap and mergeability
@@ -168,7 +170,8 @@ Each worker gets today:
 - a dedicated task file
 - a dedicated status file
 - a dedicated Codex thread
-- an in-memory timeline and rolling log in the active TUI process
+- a persisted timeline history in `.codeclaw/state.json`
+- an in-memory rolling log in the active TUI process
 
 Planned later:
 

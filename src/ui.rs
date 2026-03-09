@@ -165,7 +165,7 @@ impl App {
         let sections = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Length(10),
+                Constraint::Length(11),
                 Constraint::Length(9),
                 Constraint::Min(7),
             ])
@@ -186,6 +186,7 @@ impl App {
             Line::from(format!("id: {}", session.id)),
             Line::from(session_identity_line(session)),
             Line::from(session_queue_line(session)),
+            Line::from(session_batch_line(session)),
             Line::from(session_summary_line(session)),
             Line::from(session_last_message_line(session)),
             Line::from(format!("thread: {}", session.thread_id)),
@@ -232,10 +233,14 @@ impl App {
         let status = selected
             .map(|session| {
                 format!(
-                    "selected={} | status={} | queued={} | target={} | keys: ↑↓ switch  i master  e worker  n spawn  g master  q quit",
+                    "selected={} | status={} | queued={} | batch={} | target={} | keys: ↑↓ switch  i master  e worker  n spawn  g master  q quit",
                     session.title,
                     session.status,
                     session.pending_turns,
+                    session
+                        .latest_batch_id
+                        .map(|batch_id| format!("b{batch_id}"))
+                        .unwrap_or_else(|| "-".to_owned()),
                     input_target_label(&self.input_mode, session),
                 )
             })
@@ -551,6 +556,13 @@ fn timeline_text(events: &[SessionEvent], width: usize, max_lines: usize) -> Tex
         .map(|event| {
             Line::from(vec![
                 Span::styled(
+                    event
+                        .batch_id
+                        .map(|batch_id| format!("b{batch_id:03} "))
+                        .unwrap_or_else(|| "     ".to_owned()),
+                    Style::default().fg(Color::DarkGray),
+                ),
+                Span::styled(
                     format!("[{}]", event_kind_label(&event.kind)),
                     event_kind_style(&event.kind),
                 ),
@@ -594,6 +606,16 @@ fn session_identity_line(session: &SessionSnapshot) -> String {
 
 fn session_queue_line(session: &SessionSnapshot) -> String {
     format!("queue: {} pending turn(s)", session.pending_turns)
+}
+
+fn session_batch_line(session: &SessionSnapshot) -> String {
+    format!(
+        "batch: {}",
+        session
+            .latest_batch_id
+            .map(|batch_id| format!("b{batch_id}"))
+            .unwrap_or_else(|| "-".to_owned())
+    )
 }
 
 fn session_summary_line(session: &SessionSnapshot) -> String {

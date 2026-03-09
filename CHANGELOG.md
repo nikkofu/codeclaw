@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.4.0 - 2026-03-09
+
+- persisted per-session timeline history into `.codeclaw/state.json` so supervision context survives `codeclaw up` restarts
+- persisted orchestration batch metadata, including root prompt, status, involved sessions, and last event
+- restored saved timeline history when rebuilding session views from disk
+- surfaced batch ids directly in the TUI detail pane and timeline rows
+
 ## 0.3.1 - 2026-03-09
 
 - scoped CLI quiescence waiting to the active orchestration batch instead of every session globally
