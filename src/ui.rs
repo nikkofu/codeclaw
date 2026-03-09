@@ -42,6 +42,7 @@ struct App {
     selected_id: String,
     selected_batch_id: Option<u64>,
     detail_mode: DetailMode,
+    focus_filter: FocusFilter,
     animation_tick: u64,
     input_mode: InputMode,
     input_buffer: String,
@@ -53,6 +54,14 @@ struct App {
 enum DetailMode {
     Session,
     Batch,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FocusFilter {
+    All,
+    Summary,
+    Commands,
+    Errors,
 }
 
 #[derive(Debug, Clone)]
@@ -70,12 +79,12 @@ impl App {
             selected_id: "master".to_owned(),
             selected_batch_id: None,
             detail_mode: DetailMode::Session,
+            focus_filter: FocusFilter::All,
             animation_tick: 0,
             input_mode: InputMode::Normal,
             input_buffer: String::new(),
             status_message:
-                "Press `i` to talk to master, `n` to spawn a worker, `b` to inspect batches."
-                    .to_owned(),
+                "Press `i` to talk to master, `n` to spawn a worker, `f` to focus panels, `b` to inspect batches.".to_owned(),
             last_title: String::new(),
         }
     }
@@ -239,6 +248,16 @@ impl App {
         };
         let accent = session_accent_color(session);
         let border_style = panel_border_style(&session.status, accent, self.animation_tick);
+        let visible_timeline = session
+            .timeline_events
+            .iter()
+            .filter(|event| event_matches_filter(&event.kind, self.focus_filter))
+            .count();
+        let visible_logs = session
+            .log_lines
+            .iter()
+            .filter(|line| log_line_matches_filter(line, self.focus_filter))
+            .count();
 
         let sections = Layout::default()
             .direction(Direction::Vertical)
@@ -296,6 +315,7 @@ impl App {
 
         let timeline = timeline_text(
             &session.timeline_events,
+            self.focus_filter,
             sections[1].width.saturating_sub(4) as usize,
             sections[1].height.saturating_sub(2) as usize,
         );
@@ -309,6 +329,16 @@ impl App {
                                 activity_glyph(&session.status, self.animation_tick)
                             ),
                             Style::default().fg(status_color(&session.status, self.animation_tick)),
+                        ),
+                        Span::raw(" "),
+                        Span::styled(
+                            focus_filter_chip(self.focus_filter),
+                            focus_filter_style(self.focus_filter, accent),
+                        ),
+                        Span::raw(" "),
+                        Span::styled(
+                            format!("{visible_timeline}/{}", session.timeline_events.len()),
+                            Style::default().fg(Color::DarkGray),
                         ),
                         Span::raw(" "),
                         Span::styled(
@@ -326,16 +356,13 @@ impl App {
             .wrap(Wrap { trim: false });
         frame.render_widget(timeline, sections[1]);
 
-        let lines = tail_lines(
+        let body = log_text(
             &session.log_lines,
+            self.focus_filter,
+            sections[2].width.saturating_sub(4) as usize,
             sections[2].height.saturating_sub(2) as usize,
+            accent,
         );
-        let body = if lines.is_empty() {
-            "No output yet.".to_owned()
-        } else {
-            lines.join("\n")
-        };
-
         let detail = Paragraph::new(body)
             .block(
                 Block::default()
@@ -346,6 +373,16 @@ impl App {
                                 activity_glyph(&session.status, self.animation_tick)
                             ),
                             Style::default().fg(accent),
+                        ),
+                        Span::raw(" "),
+                        Span::styled(
+                            focus_filter_chip(self.focus_filter),
+                            focus_filter_style(self.focus_filter, accent),
+                        ),
+                        Span::raw(" "),
+                        Span::styled(
+                            format!("{visible_logs}/{}", session.log_lines.len()),
+                            Style::default().fg(Color::DarkGray),
                         ),
                         Span::raw(" "),
                         Span::styled(
@@ -388,6 +425,11 @@ impl App {
         };
         let accent = session_accent_color(session);
         let border_style = panel_border_style(&batch.status, accent, self.animation_tick);
+        let visible_events = batch
+            .events
+            .iter()
+            .filter(|event| event_matches_filter(&event.kind, self.focus_filter))
+            .count();
 
         let sections = Layout::default()
             .direction(Direction::Vertical)
@@ -482,17 +524,37 @@ impl App {
 
         let timeline = batch_timeline_text(
             &batch,
+            self.focus_filter,
             sections[2].width.saturating_sub(4) as usize,
             sections[2].height.saturating_sub(2) as usize,
         );
         let timeline = Paragraph::new(timeline)
             .block(
                 Block::default()
-                    .title(format!(
-                        "Batch Timeline {} :: {}",
-                        activity_glyph(&batch.status, self.animation_tick),
-                        truncate(&batch.root_prompt, 31)
-                    ))
+                    .title(Line::from(vec![
+                        Span::styled(
+                            format!(
+                                "Batch Timeline {}",
+                                activity_glyph(&batch.status, self.animation_tick)
+                            ),
+                            Style::default().fg(accent),
+                        ),
+                        Span::raw(" "),
+                        Span::styled(
+                            focus_filter_chip(self.focus_filter),
+                            focus_filter_style(self.focus_filter, accent),
+                        ),
+                        Span::raw(" "),
+                        Span::styled(
+                            format!("{visible_events}/{}", batch.events.len()),
+                            Style::default().fg(Color::DarkGray),
+                        ),
+                        Span::raw(" :: "),
+                        Span::styled(
+                            truncate(&batch.root_prompt, 24),
+                            Style::default().fg(Color::DarkGray),
+                        ),
+                    ]))
                     .borders(Borders::ALL)
                     .border_style(secondary_panel_border_style(
                         accent,
@@ -518,7 +580,7 @@ impl App {
                         .unwrap_or_else(|| "batch=-".to_owned()),
                 };
                 format!(
-                    "selected={} | status={} | queued={} | batch={} | view={} | target={} | keys: ↑↓ switch  i master  e worker  n spawn  b batch  [ ] cycle  g master  q quit",
+                    "selected={} | status={} | queued={} | batch={} | view={} | focus={} | target={} | keys: ↑↓ switch  i master  e worker  n spawn  f focus  b batch  [ ] cycle  g master  q quit",
                     session.title,
                     status_caption(&session.status, self.animation_tick),
                     session.pending_turns,
@@ -527,6 +589,7 @@ impl App {
                         .map(|batch_id| format!("b{batch_id}"))
                         .unwrap_or_else(|| "-".to_owned()),
                     detail,
+                    focus_filter_label(self.focus_filter),
                     input_target_label(&self.input_mode, session),
                 )
             })
@@ -636,6 +699,13 @@ impl App {
             KeyCode::Char('g') => {
                 self.focus_session("master".to_owned(), sessions);
                 self.status_message = "focused master".to_owned();
+            }
+            KeyCode::Char('f') => {
+                self.focus_filter = self.focus_filter.next();
+                self.status_message = format!(
+                    "panel focus set to {}",
+                    focus_filter_label(self.focus_filter)
+                );
             }
             KeyCode::Char('b') => self.toggle_batch_view(sessions),
             KeyCode::Char('[') => self.select_previous_batch(sessions),
@@ -937,6 +1007,17 @@ enum PromptMode {
     Spawn,
 }
 
+impl FocusFilter {
+    fn next(self) -> Self {
+        match self {
+            Self::All => Self::Summary,
+            Self::Summary => Self::Commands,
+            Self::Commands => Self::Errors,
+            Self::Errors => Self::All,
+        }
+    }
+}
+
 fn parse_spawn_input(input: &str) -> Result<(String, String)> {
     let Some((group, task)) = input.split_once(':') else {
         anyhow::bail!("spawn input must use `group: task`");
@@ -1185,29 +1266,23 @@ fn live_output_hint(status: &str) -> &'static str {
     }
 }
 
-fn tail_lines(lines: &[String], max_lines: usize) -> Vec<String> {
+fn timeline_text(
+    events: &[SessionEvent],
+    filter: FocusFilter,
+    width: usize,
+    max_lines: usize,
+) -> Text<'static> {
     if max_lines == 0 {
-        return Vec::new();
+        return Text::default();
     }
-    let start = lines.len().saturating_sub(max_lines);
-    lines[start..].to_vec()
-}
 
-fn tail_events(events: &[SessionEvent], max_events: usize) -> Vec<SessionEvent> {
-    if max_events == 0 {
-        return Vec::new();
-    }
-    let start = events.len().saturating_sub(max_events);
-    events[start..].to_vec()
-}
-
-fn timeline_text(events: &[SessionEvent], width: usize, max_lines: usize) -> Text<'static> {
-    if events.is_empty() || max_lines == 0 {
-        return Text::from(Line::from("No orchestration events yet."));
+    let filtered = filtered_session_events(events, filter, max_lines);
+    if filtered.is_empty() {
+        return Text::from(Line::from(empty_timeline_message(filter)));
     }
 
     let max_body = width.saturating_sub(7).max(12);
-    let lines = tail_events(events, max_lines)
+    let lines = filtered
         .into_iter()
         .map(|event| {
             Line::from(vec![
@@ -1223,7 +1298,10 @@ fn timeline_text(events: &[SessionEvent], width: usize, max_lines: usize) -> Tex
                     event_kind_style(&event.kind),
                 ),
                 Span::raw(" "),
-                Span::raw(truncate(&event.text, max_body)),
+                Span::styled(
+                    truncate(&compact_inline(&event.text), max_body),
+                    event_text_style(&event.kind),
+                ),
             ])
         })
         .collect::<Vec<_>>();
@@ -1231,22 +1309,24 @@ fn timeline_text(events: &[SessionEvent], width: usize, max_lines: usize) -> Tex
     Text::from(lines)
 }
 
-fn tail_batch_events(events: &[BatchEventSnapshot], max_events: usize) -> Vec<BatchEventSnapshot> {
-    if max_events == 0 {
-        return Vec::new();
+fn batch_timeline_text(
+    batch: &BatchSnapshot,
+    filter: FocusFilter,
+    width: usize,
+    max_lines: usize,
+) -> Text<'static> {
+    if max_lines == 0 {
+        return Text::default();
     }
-    let start = events.len().saturating_sub(max_events);
-    events[start..].to_vec()
-}
 
-fn batch_timeline_text(batch: &BatchSnapshot, width: usize, max_lines: usize) -> Text<'static> {
-    if batch.events.is_empty() || max_lines == 0 {
-        return Text::from(Line::from("No batch events yet."));
+    let filtered = filtered_batch_events(&batch.events, filter, max_lines);
+    if filtered.is_empty() {
+        return Text::from(Line::from(empty_timeline_message(filter)));
     }
 
     let max_session = width.saturating_sub(18).clamp(10, 18);
     let max_body = width.saturating_sub(max_session + 8).max(12);
-    let lines = tail_batch_events(&batch.events, max_lines)
+    let lines = filtered
         .into_iter()
         .map(|event| {
             Line::from(vec![
@@ -1260,12 +1340,39 @@ fn batch_timeline_text(batch: &BatchSnapshot, width: usize, max_lines: usize) ->
                     event_kind_style(&event.kind),
                 ),
                 Span::raw(" "),
-                Span::raw(truncate(&event.text, max_body)),
+                Span::styled(
+                    truncate(&compact_inline(&event.text), max_body),
+                    event_text_style(&event.kind),
+                ),
             ])
         })
         .collect::<Vec<_>>();
 
     Text::from(lines)
+}
+
+fn log_text(
+    lines: &[String],
+    filter: FocusFilter,
+    width: usize,
+    max_lines: usize,
+    accent: Color,
+) -> Text<'static> {
+    if max_lines == 0 {
+        return Text::default();
+    }
+
+    let filtered = filtered_log_lines(lines, filter, max_lines);
+    if filtered.is_empty() {
+        return Text::from(Line::from(empty_output_message(filter)));
+    }
+
+    Text::from(
+        filtered
+            .into_iter()
+            .map(|line| styled_log_line(line, width, accent))
+            .collect::<Vec<_>>(),
+    )
 }
 
 fn input_target_label(mode: &InputMode, session: &SessionSnapshot) -> String {
@@ -1364,6 +1471,229 @@ fn session_batch_ids(session: &SessionSnapshot) -> Vec<u64> {
         }
     }
     batch_ids
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LogLineKind {
+    Prompt,
+    Assistant,
+    Command,
+    Output,
+    Error,
+    Other,
+}
+
+fn focus_filter_label(filter: FocusFilter) -> &'static str {
+    match filter {
+        FocusFilter::All => "all",
+        FocusFilter::Summary => "summary",
+        FocusFilter::Commands => "commands",
+        FocusFilter::Errors => "errors",
+    }
+}
+
+fn focus_filter_chip(filter: FocusFilter) -> &'static str {
+    match filter {
+        FocusFilter::All => "[all]",
+        FocusFilter::Summary => "[sum]",
+        FocusFilter::Commands => "[cmd]",
+        FocusFilter::Errors => "[err]",
+    }
+}
+
+fn focus_filter_style(filter: FocusFilter, accent: Color) -> Style {
+    let color = match filter {
+        FocusFilter::All => accent,
+        FocusFilter::Summary => Color::Rgb(114, 194, 255),
+        FocusFilter::Commands => Color::Rgb(124, 218, 146),
+        FocusFilter::Errors => Color::Rgb(255, 133, 133),
+    };
+    Style::default().fg(color).add_modifier(Modifier::BOLD)
+}
+
+fn empty_timeline_message(filter: FocusFilter) -> &'static str {
+    match filter {
+        FocusFilter::All => "No orchestration events yet.",
+        FocusFilter::Summary => "No summary events matched this view.",
+        FocusFilter::Commands => "No command events matched this view.",
+        FocusFilter::Errors => "No error events matched this view.",
+    }
+}
+
+fn empty_output_message(filter: FocusFilter) -> &'static str {
+    match filter {
+        FocusFilter::All => "No output yet.",
+        FocusFilter::Summary => "No summary output matched this view.",
+        FocusFilter::Commands => "No command/output lines matched this view.",
+        FocusFilter::Errors => "No error output matched this view.",
+    }
+}
+
+fn event_matches_filter(kind: &SessionEventKind, filter: FocusFilter) -> bool {
+    match filter {
+        FocusFilter::All => true,
+        FocusFilter::Summary => !matches!(kind, SessionEventKind::Command),
+        FocusFilter::Commands => matches!(kind, SessionEventKind::Command),
+        FocusFilter::Errors => matches!(kind, SessionEventKind::Error),
+    }
+}
+
+fn filtered_session_events<'a>(
+    events: &'a [SessionEvent],
+    filter: FocusFilter,
+    max_events: usize,
+) -> Vec<&'a SessionEvent> {
+    if max_events == 0 {
+        return Vec::new();
+    }
+
+    let filtered = events
+        .iter()
+        .filter(|event| event_matches_filter(&event.kind, filter))
+        .collect::<Vec<_>>();
+    let start = filtered.len().saturating_sub(max_events);
+    filtered[start..].to_vec()
+}
+
+fn filtered_batch_events<'a>(
+    events: &'a [BatchEventSnapshot],
+    filter: FocusFilter,
+    max_events: usize,
+) -> Vec<&'a BatchEventSnapshot> {
+    if max_events == 0 {
+        return Vec::new();
+    }
+
+    let filtered = events
+        .iter()
+        .filter(|event| event_matches_filter(&event.kind, filter))
+        .collect::<Vec<_>>();
+    let start = filtered.len().saturating_sub(max_events);
+    filtered[start..].to_vec()
+}
+
+fn classify_log_line(line: &str) -> LogLineKind {
+    if line.starts_with("user> ")
+        || line.starts_with("system> ")
+        || line.starts_with("orchestrator> ")
+        || line.starts_with("runtime> ")
+    {
+        LogLineKind::Prompt
+    } else if line.starts_with("assistant> ") {
+        LogLineKind::Assistant
+    } else if line.starts_with("command> ") {
+        LogLineKind::Command
+    } else if line.starts_with("output> ") {
+        LogLineKind::Output
+    } else if line.starts_with("error> ") {
+        LogLineKind::Error
+    } else {
+        LogLineKind::Other
+    }
+}
+
+fn log_line_matches_filter(line: &str, filter: FocusFilter) -> bool {
+    let kind = classify_log_line(line);
+    match filter {
+        FocusFilter::All => true,
+        FocusFilter::Summary => matches!(
+            kind,
+            LogLineKind::Prompt | LogLineKind::Assistant | LogLineKind::Error | LogLineKind::Other
+        ),
+        FocusFilter::Commands => matches!(kind, LogLineKind::Command | LogLineKind::Output),
+        FocusFilter::Errors => matches!(kind, LogLineKind::Error),
+    }
+}
+
+fn filtered_log_lines<'a>(
+    lines: &'a [String],
+    filter: FocusFilter,
+    max_lines: usize,
+) -> Vec<&'a str> {
+    if max_lines == 0 {
+        return Vec::new();
+    }
+
+    let filtered = lines
+        .iter()
+        .map(String::as_str)
+        .filter(|line| log_line_matches_filter(line, filter))
+        .collect::<Vec<_>>();
+    let start = filtered.len().saturating_sub(max_lines);
+    filtered[start..].to_vec()
+}
+
+fn styled_log_line(line: &str, width: usize, accent: Color) -> Line<'static> {
+    let compact = compact_inline(line);
+    let max_body = width.saturating_sub(13).max(10);
+    let kind = classify_log_line(&compact);
+
+    if let Some((prefix, body)) = compact.split_once("> ") {
+        let prefix = format!("{prefix}>");
+        return Line::from(vec![
+            Span::styled(prefix, log_prefix_style(kind, accent)),
+            Span::raw(" "),
+            Span::styled(truncate(body, max_body), log_body_style(kind, accent)),
+        ]);
+    }
+
+    Line::from(Span::styled(
+        truncate(&compact, width.max(12)),
+        log_body_style(kind, accent),
+    ))
+}
+
+fn log_prefix_style(kind: LogLineKind, accent: Color) -> Style {
+    let color = match kind {
+        LogLineKind::Prompt => Color::Rgb(114, 194, 255),
+        LogLineKind::Assistant => accent,
+        LogLineKind::Command => Color::Rgb(124, 218, 146),
+        LogLineKind::Output => Color::Rgb(168, 176, 190),
+        LogLineKind::Error => Color::Rgb(255, 133, 133),
+        LogLineKind::Other => Color::Gray,
+    };
+    Style::default().fg(color).add_modifier(Modifier::BOLD)
+}
+
+fn log_body_style(kind: LogLineKind, accent: Color) -> Style {
+    let color = match kind {
+        LogLineKind::Prompt => Color::Rgb(198, 224, 255),
+        LogLineKind::Assistant => brighten_color(accent),
+        LogLineKind::Command => Color::Rgb(198, 244, 205),
+        LogLineKind::Output => Color::Rgb(202, 208, 218),
+        LogLineKind::Error => Color::Rgb(255, 204, 204),
+        LogLineKind::Other => Color::White,
+    };
+    Style::default().fg(color)
+}
+
+fn event_text_style(kind: &SessionEventKind) -> Style {
+    let color = match kind {
+        SessionEventKind::User => Color::Rgb(183, 234, 255),
+        SessionEventKind::Bootstrap => Color::Rgb(188, 210, 255),
+        SessionEventKind::Orchestrator => Color::Rgb(255, 228, 160),
+        SessionEventKind::Runtime => Color::Rgb(227, 197, 255),
+        SessionEventKind::System => Color::Rgb(198, 203, 214),
+        SessionEventKind::Command => Color::Rgb(196, 243, 205),
+        SessionEventKind::Status => Color::Rgb(184, 232, 188),
+        SessionEventKind::Error => Color::Rgb(255, 204, 204),
+    };
+    Style::default().fg(color)
+}
+
+fn compact_inline(value: &str) -> String {
+    value.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn brighten_color(color: Color) -> Color {
+    match color {
+        Color::Rgb(r, g, b) => Color::Rgb(
+            r.saturating_add(28),
+            g.saturating_add(28),
+            b.saturating_add(28),
+        ),
+        _ => color,
+    }
 }
 
 fn event_kind_label(kind: &SessionEventKind) -> &'static str {

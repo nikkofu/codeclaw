@@ -13,13 +13,14 @@ CodeClaw now has a functioning master-worker control loop:
 - persisted timeline and batch history across CLI/TUI process boundaries
 - a dedicated batch inspection view inside the TUI
 - color-coded and animated task-state supervision in the TUI
+- right-pane focus filters for summary, command, and error supervision
 - status files and session monitoring under `.codeclaw/`
 
 ## Next Phase
 
 The next engineering target is to harden supervision into long-running operator workflows:
 
-- add right-pane filtering/folding so command and output noise can be focused on demand
+- deepen right-pane folding and saved filter presets so operators can keep stable inspection views across long sessions
 - expose more explicit worker lifecycle milestones such as spawn requested, bootstrapped, blocked, and handed back
 - persist selected portions of live output so restart recovery includes more than the timeline
 - add explicit CLI batch inspection commands so the same orchestration can be queried without launching the TUI

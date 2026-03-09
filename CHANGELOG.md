@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.7.0 - 2026-03-09
+
+- added right-pane focus modes so `f` can cycle between all, summary, command, and error supervision views
+- colorized timeline bodies and live-output lines by source so assistant text, command activity, and failures are easier to scan
+- surfaced visible/total counts for filtered timeline, batch, and output panels
+
 ## 0.6.0 - 2026-03-09
 
 - added color-coded session and batch supervision cues across the TUI

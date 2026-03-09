@@ -24,6 +24,7 @@ This repository now includes a working Rust control-plane prototype with:
 - persisted session timeline and orchestration batch history across process restarts
 - a dedicated batch inspection view in the TUI for replaying one orchestration chain across multiple sessions
 - color-coded and animated status cues across the sidebar, panels, status bar, and terminal title
+- right-pane focus filters and colorized log rendering for summary, command, and error inspection
 - persisted master summary and last-message status across restarts
 
 ## Commands
@@ -52,6 +53,7 @@ Current TUI keybindings:
 i       send a prompt to master
 e       send a prompt to the selected worker
 n       spawn a worker using "group: task"
+f       cycle right-pane focus between all / summary / commands / errors
 b       toggle batch view for the selected session
 [ / ]   cycle older/newer batches for the selected session
 g       focus master
@@ -66,6 +68,7 @@ The right pane now separates supervision metadata from execution noise:
 - `Timeline` shows recent structured events such as user prompts, orchestrator dispatches, runtime acknowledgements, status changes, and command completions
 - timeline entries carry `bNNN` batch markers so the same orchestration chain can be traced after `codeclaw send` or `codeclaw up` restarts
 - `Live Output` remains the rolling text stream for assistant output and command/output lines
+- `f` cycles both `Timeline` and `Live Output` through focused supervision modes so you can isolate summary signals, command noise, or failures without leaving the selected session
 
 Press `b` to switch the right pane into a batch-centric supervision view. In that mode, CodeClaw shows:
 
@@ -78,6 +81,7 @@ The TUI now uses stronger visual supervision cues:
 - session rows are color-coded by role/group and status
 - running and queued sessions animate with lightweight ASCII spinners/pulses
 - selected panel borders and the status bar shift color with the current task state
+- timeline rows and live-output lines are color-tagged by source so assistant text, commands, output, and errors read differently at a glance
 - the terminal window title also reflects live running state for the selected session
 
 The master session is now instructed to append a machine-readable orchestration block at the end of its replies. CodeClaw parses that block and can automatically:

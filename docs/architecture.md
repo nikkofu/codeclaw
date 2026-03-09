@@ -16,6 +16,7 @@ Implemented now:
 - persisted `session_history` and `batches` metadata inside `.codeclaw/state.json`
 - a dedicated batch inspection mode in the TUI, built from persisted batch history
 - color/animation-based task-state cues in the TUI for faster operator scanning
+- right-pane focus filters and colorized live-output rendering for faster supervision triage
 - session recovery using `thread/resume`
 
 Not implemented yet:
