@@ -12,6 +12,7 @@ CodeClaw now has a functioning master-worker control loop:
 - a structured right-pane timeline for orchestration and execution state
 - persisted timeline and batch history across CLI/TUI process boundaries
 - a dedicated batch inspection view inside the TUI
+- color-coded and animated task-state supervision in the TUI
 - status files and session monitoring under `.codeclaw/`
 
 ## Next Phase

@@ -42,6 +42,7 @@ struct App {
     selected_id: String,
     selected_batch_id: Option<u64>,
     detail_mode: DetailMode,
+    animation_tick: u64,
     input_mode: InputMode,
     input_buffer: String,
     status_message: String,
@@ -69,6 +70,7 @@ impl App {
             selected_id: "master".to_owned(),
             selected_batch_id: None,
             detail_mode: DetailMode::Session,
+            animation_tick: 0,
             input_mode: InputMode::Normal,
             input_buffer: String::new(),
             status_message:
@@ -88,6 +90,7 @@ impl App {
             terminal
                 .draw(|frame| self.draw(frame, &sessions))
                 .context("failed to draw TUI frame")?;
+            self.animation_tick = self.animation_tick.wrapping_add(1);
 
             if event::poll(Duration::from_millis(120)).context("failed to poll terminal event")? {
                 let event = event::read().context("failed to read terminal event")?;
@@ -129,21 +132,47 @@ impl App {
         sessions: &[SessionSnapshot],
         mut list_state: ListState,
     ) {
+        let selected = sessions
+            .iter()
+            .find(|session| session.id == self.selected_id);
+        let selected_accent = selected
+            .map(session_accent_color)
+            .unwrap_or(Color::Rgb(112, 122, 140));
+        let running_count = sessions
+            .iter()
+            .filter(|session| is_busy_status(&session.status))
+            .count();
+
         let items = sessions
             .iter()
             .map(|session| {
-                let status = status_badge(&session.status);
-                let subtitle = truncate(&session_list_subtitle(session), 28);
+                let accent = session_accent_color(session);
+                let title = truncate(&session.title, 17);
+                let subtitle = truncate(&session_list_subtitle(session), 27);
                 ListItem::new(Text::from(vec![
                     Line::from(vec![
-                        Span::styled(status, status_style(&session.status)),
+                        Span::styled("|", Style::default().fg(accent)),
                         Span::raw(" "),
                         Span::styled(
-                            &session.title,
-                            Style::default().add_modifier(Modifier::BOLD),
+                            animated_status_badge(&session.status, self.animation_tick),
+                            status_badge_style(&session.status, self.animation_tick),
                         ),
+                        Span::raw(" "),
+                        Span::styled(
+                            format!("[{}]", session_kind_badge(session)),
+                            Style::default().fg(accent).add_modifier(Modifier::BOLD),
+                        ),
+                        Span::raw(" "),
+                        Span::styled(title, session_title_style(session)),
                     ]),
-                    Line::from(Span::styled(subtitle, Style::default().fg(Color::DarkGray))),
+                    Line::from(vec![
+                        Span::styled(
+                            status_caption(&session.status, self.animation_tick),
+                            status_secondary_style(&session.status),
+                        ),
+                        Span::raw("  "),
+                        Span::styled(subtitle, Style::default().fg(Color::DarkGray)),
+                    ]),
                 ]))
             })
             .collect::<Vec<_>>();
@@ -151,11 +180,31 @@ impl App {
         let list = List::new(items)
             .block(
                 Block::default()
-                    .title("Sessions")
+                    .title(Line::from(vec![
+                        Span::styled(
+                            "Sessions",
+                            Style::default()
+                                .fg(selected_accent)
+                                .add_modifier(Modifier::BOLD),
+                        ),
+                        Span::raw(" "),
+                        Span::styled(
+                            format!("{} active", running_count),
+                            Style::default().fg(status_color("running", self.animation_tick)),
+                        ),
+                    ]))
                     .borders(Borders::ALL)
-                    .border_style(Style::default().fg(Color::Gray)),
+                    .border_style(Style::default().fg(animated_border_color(
+                        "running",
+                        selected_accent,
+                        self.animation_tick,
+                    ))),
             )
-            .highlight_style(Style::default().bg(Color::Rgb(35, 44, 53)).fg(Color::White))
+            .highlight_style(
+                Style::default()
+                    .bg(selected_highlight_bg(selected_accent))
+                    .fg(Color::White),
+            )
             .highlight_symbol(">> ");
 
         frame.render_stateful_widget(list, area, &mut list_state);
@@ -188,6 +237,8 @@ impl App {
             frame.render_widget(empty, area);
             return;
         };
+        let accent = session_accent_color(session);
+        let border_style = panel_border_style(&session.status, accent, self.animation_tick);
 
         let sections = Layout::default()
             .direction(Direction::Vertical)
@@ -201,13 +252,18 @@ impl App {
         let meta = Paragraph::new(Text::from(vec![
             Line::from(vec![
                 Span::styled(
+                    animated_status_badge(&session.status, self.animation_tick),
+                    status_badge_style(&session.status, self.animation_tick),
+                ),
+                Span::raw(" "),
+                Span::styled(
                     &session.title,
-                    Style::default().add_modifier(Modifier::BOLD),
+                    Style::default().fg(accent).add_modifier(Modifier::BOLD),
                 ),
                 Span::raw("  "),
                 Span::styled(
-                    format!("[{}]", session.status),
-                    status_style(&session.status),
+                    format!("[{}]", status_caption(&session.status, self.animation_tick)),
+                    status_style(&session.status, self.animation_tick),
                 ),
             ]),
             Line::from(format!("id: {}", session.id)),
@@ -221,8 +277,19 @@ impl App {
         ]))
         .block(
             Block::default()
-                .title("Selected Session")
-                .borders(Borders::ALL),
+                .title(Line::from(vec![
+                    Span::styled(
+                        "Session",
+                        Style::default().fg(accent).add_modifier(Modifier::BOLD),
+                    ),
+                    Span::raw(" "),
+                    Span::styled(
+                        detail_mode_chip(self.detail_mode),
+                        Style::default().fg(Color::DarkGray),
+                    ),
+                ]))
+                .borders(Borders::ALL)
+                .border_style(border_style),
         )
         .wrap(Wrap { trim: false });
         frame.render_widget(meta, sections[0]);
@@ -233,7 +300,29 @@ impl App {
             sections[1].height.saturating_sub(2) as usize,
         );
         let timeline = Paragraph::new(timeline)
-            .block(Block::default().title("Timeline").borders(Borders::ALL))
+            .block(
+                Block::default()
+                    .title(Line::from(vec![
+                        Span::styled(
+                            format!(
+                                "Timeline {}",
+                                activity_glyph(&session.status, self.animation_tick)
+                            ),
+                            Style::default().fg(status_color(&session.status, self.animation_tick)),
+                        ),
+                        Span::raw(" "),
+                        Span::styled(
+                            timeline_status_hint(&session.status),
+                            Style::default().fg(Color::DarkGray),
+                        ),
+                    ]))
+                    .borders(Borders::ALL)
+                    .border_style(secondary_panel_border_style(
+                        accent,
+                        &session.status,
+                        self.animation_tick,
+                    )),
+            )
             .wrap(Wrap { trim: false });
         frame.render_widget(timeline, sections[1]);
 
@@ -248,7 +337,29 @@ impl App {
         };
 
         let detail = Paragraph::new(body)
-            .block(Block::default().title("Live Output").borders(Borders::ALL))
+            .block(
+                Block::default()
+                    .title(Line::from(vec![
+                        Span::styled(
+                            format!(
+                                "Live Output {}",
+                                activity_glyph(&session.status, self.animation_tick)
+                            ),
+                            Style::default().fg(accent),
+                        ),
+                        Span::raw(" "),
+                        Span::styled(
+                            live_output_hint(&session.status),
+                            Style::default().fg(Color::DarkGray),
+                        ),
+                    ]))
+                    .borders(Borders::ALL)
+                    .border_style(secondary_panel_border_style(
+                        accent,
+                        &session.status,
+                        self.animation_tick,
+                    )),
+            )
             .wrap(Wrap { trim: false });
         frame.render_widget(detail, sections[2]);
     }
@@ -275,6 +386,8 @@ impl App {
             frame.render_widget(empty, area);
             return;
         };
+        let accent = session_accent_color(session);
+        let border_style = panel_border_style(&batch.status, accent, self.animation_tick);
 
         let sections = Layout::default()
             .direction(Direction::Vertical)
@@ -288,11 +401,18 @@ impl App {
         let meta = Paragraph::new(Text::from(vec![
             Line::from(vec![
                 Span::styled(
-                    format!("b{:03}", batch.id),
-                    Style::default().add_modifier(Modifier::BOLD),
+                    format!(
+                        "{} b{:03}",
+                        activity_glyph(&batch.status, self.animation_tick),
+                        batch.id
+                    ),
+                    Style::default().fg(accent).add_modifier(Modifier::BOLD),
                 ),
                 Span::raw("  "),
-                Span::styled(format!("[{}]", batch.status), status_style(&batch.status)),
+                Span::styled(
+                    format!("[{}]", status_caption(&batch.status, self.animation_tick)),
+                    status_style(&batch.status, self.animation_tick),
+                ),
             ]),
             Line::from(format!("focus session: {}", session.title)),
             Line::from(format!(
@@ -310,7 +430,22 @@ impl App {
                 truncate(batch.last_event.as_deref().unwrap_or("-"), 44)
             )),
         ]))
-        .block(Block::default().title("Batch").borders(Borders::ALL))
+        .block(
+            Block::default()
+                .title(Line::from(vec![
+                    Span::styled(
+                        "Batch",
+                        Style::default().fg(accent).add_modifier(Modifier::BOLD),
+                    ),
+                    Span::raw(" "),
+                    Span::styled(
+                        detail_mode_chip(self.detail_mode),
+                        Style::default().fg(Color::DarkGray),
+                    ),
+                ]))
+                .borders(Borders::ALL)
+                .border_style(border_style),
+        )
         .wrap(Wrap { trim: false });
         frame.render_widget(meta, sections[0]);
 
@@ -327,8 +462,20 @@ impl App {
         let members = Paragraph::new(members)
             .block(
                 Block::default()
-                    .title("Batch Sessions")
-                    .borders(Borders::ALL),
+                    .title(Line::from(vec![
+                        Span::styled("Batch Sessions", Style::default().fg(accent)),
+                        Span::raw(" "),
+                        Span::styled(
+                            format!("{}", batch.sessions.len()),
+                            Style::default().fg(status_color(&batch.status, self.animation_tick)),
+                        ),
+                    ]))
+                    .borders(Borders::ALL)
+                    .border_style(secondary_panel_border_style(
+                        accent,
+                        &batch.status,
+                        self.animation_tick,
+                    )),
             )
             .wrap(Wrap { trim: false });
         frame.render_widget(members, sections[1]);
@@ -342,10 +489,16 @@ impl App {
             .block(
                 Block::default()
                     .title(format!(
-                        "Batch Timeline :: {}",
-                        truncate(&batch.root_prompt, 34)
+                        "Batch Timeline {} :: {}",
+                        activity_glyph(&batch.status, self.animation_tick),
+                        truncate(&batch.root_prompt, 31)
                     ))
-                    .borders(Borders::ALL),
+                    .borders(Borders::ALL)
+                    .border_style(secondary_panel_border_style(
+                        accent,
+                        &batch.status,
+                        self.animation_tick,
+                    )),
             )
             .wrap(Wrap { trim: false });
         frame.render_widget(timeline, sections[2]);
@@ -367,7 +520,7 @@ impl App {
                 format!(
                     "selected={} | status={} | queued={} | batch={} | view={} | target={} | keys: ↑↓ switch  i master  e worker  n spawn  b batch  [ ] cycle  g master  q quit",
                     session.title,
-                    session.status,
+                    status_caption(&session.status, self.animation_tick),
                     session.pending_turns,
                     session
                         .latest_batch_id
@@ -379,8 +532,16 @@ impl App {
             })
             .unwrap_or_else(|| "No session selected".to_owned());
 
-        let paragraph = Paragraph::new(status)
-            .style(Style::default().bg(Color::Rgb(28, 32, 38)).fg(Color::White));
+        let paragraph = if let Some(session) = selected {
+            Paragraph::new(status).style(status_bar_style(
+                &session.status,
+                session_accent_color(session),
+                self.animation_tick,
+            ))
+        } else {
+            Paragraph::new(status)
+                .style(Style::default().bg(Color::Rgb(28, 32, 38)).fg(Color::White))
+        };
         frame.render_widget(paragraph, area);
     }
 
@@ -437,7 +598,16 @@ impl App {
                 Style::default().fg(Color::DarkGray),
             )),
         ]))
-        .block(Block::default().title(title).borders(Borders::ALL))
+        .block(
+            Block::default()
+                .title(title)
+                .borders(Borders::ALL)
+                .border_style(input_border_style(
+                    &self.input_mode,
+                    selected,
+                    self.animation_tick,
+                )),
+        )
         .wrap(Wrap { trim: false });
         frame.render_widget(paragraph, area);
     }
@@ -609,16 +779,30 @@ impl App {
             return Ok(());
         };
         let title = match self.detail_mode {
-            DetailMode::Session => format!("CodeClaw :: {} [{}]", session.title, session.status),
+            DetailMode::Session => format!(
+                "CodeClaw :: {} {} [{}]",
+                activity_glyph(&session.status, self.animation_tick),
+                session.title,
+                status_caption(&session.status, self.animation_tick)
+            ),
             DetailMode::Batch => self
                 .selected_batch_id
                 .map(|batch_id| {
                     format!(
-                        "CodeClaw :: {} :: b{batch_id} [{}]",
-                        session.title, session.status
+                        "CodeClaw :: {} {} :: b{batch_id} [{}]",
+                        activity_glyph(&session.status, self.animation_tick),
+                        session.title,
+                        status_caption(&session.status, self.animation_tick)
                     )
                 })
-                .unwrap_or_else(|| format!("CodeClaw :: {} [{}]", session.title, session.status)),
+                .unwrap_or_else(|| {
+                    format!(
+                        "CodeClaw :: {} {} [{}]",
+                        activity_glyph(&session.status, self.animation_tick),
+                        session.title,
+                        status_caption(&session.status, self.animation_tick)
+                    )
+                }),
         };
         if self.last_title != title {
             execute!(io::stdout(), SetTitle(title.clone())).context("failed to set title")?;
@@ -778,21 +962,226 @@ fn truncate(value: &str, max: usize) -> String {
     }
 }
 
-fn status_badge(status: &str) -> &'static str {
+fn animated_status_badge(status: &str, tick: u64) -> String {
     match status {
-        "completed" => "OK",
-        "failed" => "ER",
-        "running" | "queued" | "active" | "inProgress" => "RN",
-        _ => "ID",
+        "completed" => "[OK]".to_owned(),
+        "failed" => "[!!]".to_owned(),
+        "queued" => format!("[{}]", queue_glyph(tick)),
+        "running" | "active" | "inProgress" => format!("[{}]", spinner_glyph(tick)),
+        _ => "[--]".to_owned(),
     }
 }
 
-fn status_style(status: &str) -> Style {
+fn status_caption(status: &str, tick: u64) -> String {
     match status {
-        "completed" => Style::default().fg(Color::Green),
-        "failed" => Style::default().fg(Color::Red),
-        "running" | "queued" | "active" | "inProgress" => Style::default().fg(Color::Yellow),
-        _ => Style::default().fg(Color::Gray),
+        "completed" => "completed".to_owned(),
+        "failed" => "failed".to_owned(),
+        "queued" => format!("queued {}", queue_glyph(tick)),
+        "running" | "active" | "inProgress" => format!("running {}", spinner_glyph(tick)),
+        "idle" => "idle".to_owned(),
+        other => other.to_owned(),
+    }
+}
+
+fn status_style(status: &str, tick: u64) -> Style {
+    Style::default()
+        .fg(status_color(status, tick))
+        .add_modifier(Modifier::BOLD)
+}
+
+fn status_badge_style(status: &str, tick: u64) -> Style {
+    Style::default()
+        .fg(Color::Black)
+        .bg(status_color(status, tick))
+        .add_modifier(Modifier::BOLD)
+}
+
+fn status_secondary_style(status: &str) -> Style {
+    Style::default().fg(match status {
+        "completed" => Color::Rgb(124, 218, 146),
+        "failed" => Color::Rgb(255, 133, 133),
+        "queued" => Color::Rgb(129, 173, 255),
+        "running" | "active" | "inProgress" => Color::Rgb(255, 217, 102),
+        _ => Color::DarkGray,
+    })
+}
+
+fn status_color(status: &str, tick: u64) -> Color {
+    let pulse = (tick / 3) % 2 == 0;
+    match status {
+        "completed" => Color::Rgb(76, 201, 126),
+        "failed" => Color::Rgb(232, 93, 93),
+        "queued" => {
+            if pulse {
+                Color::Rgb(108, 142, 255)
+            } else {
+                Color::Rgb(86, 119, 231)
+            }
+        }
+        "running" | "active" | "inProgress" => {
+            if pulse {
+                Color::Rgb(255, 201, 79)
+            } else {
+                Color::Rgb(242, 176, 52)
+            }
+        }
+        _ => Color::Rgb(132, 141, 156),
+    }
+}
+
+fn spinner_glyph(tick: u64) -> &'static str {
+    const FRAMES: [&str; 4] = ["-", "\\", "|", "/"];
+    FRAMES[((tick / 2) as usize) % FRAMES.len()]
+}
+
+fn queue_glyph(tick: u64) -> &'static str {
+    const FRAMES: [&str; 4] = [".", "o", "O", "o"];
+    FRAMES[((tick / 2) as usize) % FRAMES.len()]
+}
+
+fn activity_glyph(status: &str, tick: u64) -> &'static str {
+    match status {
+        "completed" => "+",
+        "failed" => "x",
+        "queued" => queue_glyph(tick),
+        "running" | "active" | "inProgress" => spinner_glyph(tick),
+        _ => "-",
+    }
+}
+
+fn is_busy_status(status: &str) -> bool {
+    matches!(status, "queued" | "running" | "active" | "inProgress")
+}
+
+fn session_accent_color(session: &SessionSnapshot) -> Color {
+    match &session.kind {
+        SessionKind::Master => Color::Rgb(232, 190, 92),
+        SessionKind::Worker { group, .. } => match group.as_str() {
+            "backend" => Color::Rgb(96, 165, 250),
+            "frontend" => Color::Rgb(72, 187, 158),
+            "infra" => Color::Rgb(244, 162, 97),
+            _ => Color::Rgb(167, 139, 250),
+        },
+    }
+}
+
+fn session_title_style(session: &SessionSnapshot) -> Style {
+    Style::default()
+        .fg(session_accent_color(session))
+        .add_modifier(Modifier::BOLD)
+}
+
+fn session_kind_badge(session: &SessionSnapshot) -> &'static str {
+    match &session.kind {
+        SessionKind::Master => "MSTR",
+        SessionKind::Worker { group, .. } => match group.as_str() {
+            "backend" => "BACK",
+            "frontend" => "FRNT",
+            "infra" => "INFR",
+            _ => "WORK",
+        },
+    }
+}
+
+fn animated_border_color(status: &str, accent: Color, tick: u64) -> Color {
+    if matches!(
+        status,
+        "failed" | "completed" | "queued" | "running" | "active" | "inProgress"
+    ) {
+        status_color(status, tick)
+    } else {
+        accent
+    }
+}
+
+fn panel_border_style(status: &str, accent: Color, tick: u64) -> Style {
+    Style::default()
+        .fg(animated_border_color(status, accent, tick))
+        .add_modifier(if matches!(status, "running" | "active" | "inProgress") {
+            Modifier::BOLD
+        } else {
+            Modifier::empty()
+        })
+}
+
+fn secondary_panel_border_style(accent: Color, status: &str, tick: u64) -> Style {
+    let color = if matches!(status, "running" | "active" | "inProgress" | "queued") {
+        animated_border_color(status, accent, tick)
+    } else {
+        accent
+    };
+    Style::default().fg(color)
+}
+
+fn selected_highlight_bg(accent: Color) -> Color {
+    match accent {
+        Color::Rgb(232, 190, 92) => Color::Rgb(60, 52, 28),
+        Color::Rgb(96, 165, 250) => Color::Rgb(27, 45, 74),
+        Color::Rgb(72, 187, 158) => Color::Rgb(22, 57, 52),
+        Color::Rgb(244, 162, 97) => Color::Rgb(70, 44, 27),
+        _ => Color::Rgb(43, 36, 71),
+    }
+}
+
+fn status_bar_style(status: &str, accent: Color, tick: u64) -> Style {
+    let bg = match status {
+        "completed" => Color::Rgb(20, 58, 35),
+        "failed" => Color::Rgb(72, 25, 25),
+        "queued" => {
+            if (tick / 3) % 2 == 0 {
+                Color::Rgb(24, 40, 82)
+            } else {
+                Color::Rgb(20, 33, 67)
+            }
+        }
+        "running" | "active" | "inProgress" => {
+            if (tick / 3) % 2 == 0 {
+                Color::Rgb(72, 51, 14)
+            } else {
+                Color::Rgb(86, 58, 12)
+            }
+        }
+        _ => selected_highlight_bg(accent),
+    };
+    Style::default().bg(bg).fg(Color::White)
+}
+
+fn input_border_style(mode: &InputMode, selected: Option<&SessionSnapshot>, tick: u64) -> Style {
+    match mode {
+        InputMode::Normal => selected
+            .map(|session| Style::default().fg(session_accent_color(session)))
+            .unwrap_or_else(|| Style::default().fg(Color::Gray)),
+        InputMode::MasterPrompt | InputMode::WorkerPrompt(_) => {
+            Style::default().fg(status_color("running", tick))
+        }
+        InputMode::SpawnWorker => Style::default().fg(status_color("queued", tick)),
+    }
+}
+
+fn detail_mode_chip(mode: DetailMode) -> &'static str {
+    match mode {
+        DetailMode::Session => "[session]",
+        DetailMode::Batch => "[batch]",
+    }
+}
+
+fn timeline_status_hint(status: &str) -> &'static str {
+    match status {
+        "failed" => "faults highlighted",
+        "completed" => "settled",
+        "queued" => "dispatch queued",
+        "running" | "active" | "inProgress" => "live orchestration",
+        _ => "recent events",
+    }
+}
+
+fn live_output_hint(status: &str) -> &'static str {
+    match status {
+        "failed" => "check latest errors",
+        "completed" => "final transcript",
+        "queued" => "awaiting worker turn",
+        "running" | "active" | "inProgress" => "streaming",
+        _ => "latest stream",
     }
 }
 

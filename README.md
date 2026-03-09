@@ -23,6 +23,7 @@ This repository now includes a working Rust control-plane prototype with:
 - batch-scoped CLI waiting so `send --to master` only waits for the orchestration it triggered
 - persisted session timeline and orchestration batch history across process restarts
 - a dedicated batch inspection view in the TUI for replaying one orchestration chain across multiple sessions
+- color-coded and animated status cues across the sidebar, panels, status bar, and terminal title
 - persisted master summary and last-message status across restarts
 
 ## Commands
@@ -71,6 +72,13 @@ Press `b` to switch the right pane into a batch-centric supervision view. In tha
 - batch id, status, root prompt, related sessions, and last event
 - an aggregated batch timeline merged across all involved sessions
 - `[` and `]` navigation across historical batches for the selected session
+
+The TUI now uses stronger visual supervision cues:
+
+- session rows are color-coded by role/group and status
+- running and queued sessions animate with lightweight ASCII spinners/pulses
+- selected panel borders and the status bar shift color with the current task state
+- the terminal window title also reflects live running state for the selected session
 
 The master session is now instructed to append a machine-readable orchestration block at the end of its replies. CodeClaw parses that block and can automatically:
 

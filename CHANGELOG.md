@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.6.0 - 2026-03-09
+
+- added color-coded session and batch supervision cues across the TUI
+- animated running and queued states with lightweight ASCII spinners in the sidebar, panel headers, and terminal title
+- tinted panel borders and the status bar by task state so failures, completions, queueing, and active execution are easier to distinguish at a glance
+- strengthened sidebar metadata with role/group badges and active-session counts
+
 ## 0.5.0 - 2026-03-09
 
 - added a dedicated TUI batch inspection view for replaying one orchestration chain across sessions
