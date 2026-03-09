@@ -1,7 +1,9 @@
 use crate::{
     app_server::{AppServerClient, Notification},
     config::{Config, CoordinationPaths, GroupConfig},
-    orchestration::{parse_master_response, MasterAction, ParsedMasterResponse},
+    orchestration::{
+        parse_master_response, visible_stream_text, MasterAction, ParsedMasterResponse,
+    },
     session::{SessionSnapshot, SessionView},
     state::{now_unix_ts, AppState, SessionStatus, WorkerRecord, WorkerStatus},
 };
@@ -15,7 +17,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
 };
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, oneshot};
 
 const MASTER_SESSION_ID: &str = "master";
 
@@ -39,11 +41,6 @@ pub struct DoctorReport {
 
 #[derive(Debug, Deserialize)]
 struct ThreadStartResponse {
-    thread: ThreadSummary,
-}
-
-#[derive(Debug, Deserialize)]
-struct ThreadReadResponse {
     thread: ThreadSummary,
 }
 
@@ -158,7 +155,12 @@ impl Controller {
         let state = AppState::load(&paths.state_file)?;
         let sessions = build_sessions(&state, &workspace_root);
         let client = Arc::new(
-            AppServerClient::spawn(env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION")).await?,
+            AppServerClient::spawn(
+                env!("CARGO_PKG_NAME"),
+                env!("CARGO_PKG_VERSION"),
+                &config.master.reasoning_effort,
+            )
+            .await?,
         );
 
         Ok(Self {
@@ -175,13 +177,21 @@ impl Controller {
         let config_path = Config::write_default_config_if_missing(&self.workspace_root)?;
         self.paths.ensure_layout()?;
         self.save_state()?;
-        self.write_master_status("idle", None, None)?;
+        self.write_master_status(
+            "idle",
+            self.master_last_turn_id(),
+            self.master_last_message(),
+        )?;
         Ok(config_path)
     }
 
     pub async fn doctor(&self) -> Result<DoctorReport> {
-        let client =
-            AppServerClient::spawn(env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION")).await?;
+        let client = AppServerClient::spawn(
+            env!("CARGO_PKG_NAME"),
+            env!("CARGO_PKG_VERSION"),
+            &self.config.master.reasoning_effort,
+        )
+        .await?;
         let response: ThreadStartResponse = client
             .request(
                 "thread/start",
@@ -235,9 +245,17 @@ impl Controller {
         self.paths.ensure_layout()?;
 
         if let Some(thread_id) = self.master_thread_id() {
-            if self.thread_exists(&thread_id).await {
+            if self
+                .resume_thread(&thread_id, Some(self.master_instructions()))
+                .await
+                .is_ok()
+            {
                 self.ensure_master_session(thread_id.clone());
-                self.write_master_status("idle", self.master_last_turn_id(), None)?;
+                self.write_master_status(
+                    "idle",
+                    self.master_last_turn_id(),
+                    self.master_last_message(),
+                )?;
                 return Ok(thread_id);
             }
         }
@@ -256,6 +274,7 @@ impl Controller {
             let mut state = self.state.lock().expect("state lock poisoned");
             state.master_thread_id = Some(thread_id.clone());
             state.master_last_turn_id = None;
+            state.master_last_message = None;
         }
         self.save_state()?;
         self.ensure_master_session(thread_id.clone());
@@ -265,7 +284,13 @@ impl Controller {
 
     pub async fn submit_prompt(&self, target: PromptTarget, prompt: &str) -> Result<()> {
         let (session_id, thread_id, log_label, role) = self.resolve_prompt_target(target).await?;
-        self.enqueue_turn(session_id, thread_id, log_label, role, prompt)
+        self.enqueue_turn(session_id, thread_id, log_label, role, prompt, false)
+    }
+
+    pub async fn submit_prompt_and_wait(&self, target: PromptTarget, prompt: &str) -> Result<()> {
+        let (session_id, thread_id, log_label, role) = self.resolve_prompt_target(target).await?;
+        self.enqueue_turn_and_wait(session_id, thread_id, log_label, role, prompt, true)
+            .await
     }
 
     fn enqueue_turn(
@@ -275,7 +300,48 @@ impl Controller {
         log_label: String,
         role: SessionRole,
         prompt: &str,
+        wait_for_follow_on: bool,
     ) -> Result<()> {
+        self.enqueue_turn_with_completion(
+            session_id,
+            thread_id,
+            log_label,
+            role,
+            prompt,
+            wait_for_follow_on,
+        )?;
+        Ok(())
+    }
+
+    async fn enqueue_turn_and_wait(
+        &self,
+        session_id: String,
+        thread_id: String,
+        log_label: String,
+        role: SessionRole,
+        prompt: &str,
+        wait_for_follow_on: bool,
+    ) -> Result<()> {
+        let done = self.enqueue_turn_with_completion(
+            session_id,
+            thread_id,
+            log_label,
+            role,
+            prompt,
+            wait_for_follow_on,
+        )?;
+        done.await.context("turn task dropped before completion")?
+    }
+
+    fn enqueue_turn_with_completion(
+        &self,
+        session_id: String,
+        thread_id: String,
+        log_label: String,
+        role: SessionRole,
+        prompt: &str,
+        wait_for_follow_on: bool,
+    ) -> Result<oneshot::Receiver<Result<()>>> {
         if self.session_is_busy(&session_id) {
             return Err(anyhow!("session `{session_id}` is already running"));
         }
@@ -285,21 +351,35 @@ impl Controller {
 
         let controller = self.clone();
         let prompt = prompt.to_owned();
+        let (tx, rx) = oneshot::channel();
         tokio::spawn(async move {
-            if let Err(error) = controller
-                .process_turn(session_id.clone(), thread_id, log_label, prompt, role)
-                .await
-            {
+            let result = controller
+                .process_turn(
+                    session_id.clone(),
+                    thread_id,
+                    log_label,
+                    prompt,
+                    role,
+                    wait_for_follow_on,
+                )
+                .await;
+            if let Err(error) = &result {
                 let _ = controller.append_log_line(&session_id, format!("error> {error}"));
                 let _ = controller.set_session_status(&session_id, "failed");
             }
+            let _ = tx.send(result);
         });
 
-        Ok(())
+        Ok(rx)
     }
 
     pub async fn spawn_worker(&self, group: &str, task: &str) -> Result<WorkerRecord> {
-        self.spawn_worker_with_options(group, task, None, None)
+        self.spawn_worker_with_options(group, task, None, None, false)
+            .await
+    }
+
+    pub async fn spawn_worker_and_wait(&self, group: &str, task: &str) -> Result<WorkerRecord> {
+        self.spawn_worker_with_options(group, task, None, None, true)
             .await
     }
 
@@ -327,6 +407,7 @@ impl Controller {
         task: &str,
         summary: Option<String>,
         prompt: Option<String>,
+        wait_for_bootstrap: bool,
     ) -> Result<WorkerRecord> {
         let group_config = self
             .config
@@ -394,13 +475,27 @@ impl Controller {
             self.append_log_line(&record.id, format!("system> summary: {summary}"))?;
         }
 
-        self.enqueue_turn(
-            record.id.clone(),
-            record.thread_id.clone(),
-            record.id.clone(),
-            SessionRole::Worker(record.id.clone()),
-            &prompt.unwrap_or_else(|| worker_bootstrap_prompt(&record)),
-        )?;
+        let bootstrap_prompt = prompt.unwrap_or_else(|| worker_bootstrap_prompt(&record));
+        if wait_for_bootstrap {
+            self.enqueue_turn_and_wait(
+                record.id.clone(),
+                record.thread_id.clone(),
+                record.id.clone(),
+                SessionRole::Worker(record.id.clone()),
+                &bootstrap_prompt,
+                false,
+            )
+            .await?;
+        } else {
+            self.enqueue_turn(
+                record.id.clone(),
+                record.thread_id.clone(),
+                record.id.clone(),
+                SessionRole::Worker(record.id.clone()),
+                &bootstrap_prompt,
+                false,
+            )?;
+        }
 
         Ok(record)
     }
@@ -420,12 +515,7 @@ impl Controller {
                 ))
             }
             PromptTarget::Worker(worker_id) => {
-                let state = self.state.lock().expect("state lock poisoned");
-                let worker = state
-                    .workers
-                    .get(&worker_id)
-                    .cloned()
-                    .with_context(|| format!("unknown worker `{worker_id}`"))?;
+                let worker = self.ensure_worker_thread(&worker_id).await?;
                 Ok((
                     worker.id.clone(),
                     worker.thread_id.clone(),
@@ -436,16 +526,11 @@ impl Controller {
         }
     }
 
-    fn resolve_worker_target(
+    async fn resolve_worker_target(
         &self,
         worker_id: &str,
     ) -> Result<(String, String, String, SessionRole)> {
-        let state = self.state.lock().expect("state lock poisoned");
-        let worker = state
-            .workers
-            .get(worker_id)
-            .cloned()
-            .with_context(|| format!("unknown worker `{worker_id}`"))?;
+        let worker = self.ensure_worker_thread(worker_id).await?;
         Ok((
             worker.id.clone(),
             worker.thread_id.clone(),
@@ -461,6 +546,7 @@ impl Controller {
         log_label: String,
         prompt: String,
         role: SessionRole,
+        wait_for_follow_on: bool,
     ) -> Result<()> {
         let mut receiver = self.client.subscribe();
         self.write_role_status(&role, "running", None, None)?;
@@ -478,7 +564,8 @@ impl Controller {
                             "text": model_prompt,
                             "text_elements": [],
                         }
-                    ]
+                    ],
+                    "effort": self.config.master.reasoning_effort,
                 }),
             )
             .await?;
@@ -500,8 +587,15 @@ impl Controller {
                     let event: AgentMessageDeltaNotification =
                         serde_json::from_value(notification.params)?;
                     if event.thread_id == thread_id && event.turn_id == turn_id {
-                        self.append_live_chunk(&session_id, &event.delta)?;
                         assistant_text.push_str(&event.delta);
+                        if matches!(role, SessionRole::Master) {
+                            self.set_live_buffer(
+                                &session_id,
+                                visible_stream_text(&assistant_text),
+                            )?;
+                        } else {
+                            self.append_live_chunk(&session_id, &event.delta)?;
+                        }
                         streamed_delta = true;
                     }
                 }
@@ -512,7 +606,20 @@ impl Controller {
                         match event.item {
                             ThreadItem::AgentMessage { text } if !streamed_delta => {
                                 assistant_text.push_str(&text);
-                                self.append_log_line(&session_id, format!("assistant> {text}"))?;
+                                if matches!(role, SessionRole::Master) {
+                                    let visible = visible_stream_text(&assistant_text).trim();
+                                    if !visible.is_empty() {
+                                        self.append_log_line(
+                                            &session_id,
+                                            format!("assistant> {visible}"),
+                                        )?;
+                                    }
+                                } else {
+                                    self.append_log_line(
+                                        &session_id,
+                                        format!("assistant> {text}"),
+                                    )?;
+                                }
                             }
                             ThreadItem::CommandExecution {
                                 command,
@@ -602,8 +709,9 @@ impl Controller {
                         };
 
                         if let Some(parsed) = parsed_master {
-                            if let Some(visible) =
-                                self.apply_master_response(&session_id, &parsed).await?
+                            if let Some(visible) = self
+                                .apply_master_response(&session_id, &parsed, wait_for_follow_on)
+                                .await?
                             {
                                 last_message = Some(compact_message(&visible));
                             }
@@ -664,31 +772,95 @@ impl Controller {
         Ok(response)
     }
 
-    async fn thread_exists(&self, thread_id: &str) -> bool {
+    async fn ensure_worker_thread(&self, worker_id: &str) -> Result<WorkerRecord> {
+        let worker = {
+            let state = self.state.lock().expect("state lock poisoned");
+            state
+                .workers
+                .get(worker_id)
+                .cloned()
+                .with_context(|| format!("unknown worker `{worker_id}`"))?
+        };
+
+        let thread_name = format!("[{}] {}", worker.group, worker.task);
+        let instructions =
+            worker_instructions(&worker.group, &worker.task, Path::new(&worker.task_file));
+        if self
+            .resume_thread(&worker.thread_id, Some(instructions.clone()))
+            .await
+            .is_ok()
+        {
+            return Ok(worker);
+        }
+
         let response = self
-            .client
-            .request::<ThreadReadResponse>(
-                "thread/read",
+            .start_thread(&thread_name, Some(instructions), Some(&thread_name), false)
+            .await?;
+
+        let updated_worker = {
+            let mut state = self.state.lock().expect("state lock poisoned");
+            let stored = state
+                .workers
+                .get_mut(worker_id)
+                .with_context(|| format!("unknown worker `{worker_id}`"))?;
+            stored.thread_id = response.thread.id.clone();
+            stored.updated_at = now_unix_ts();
+            stored.clone()
+        };
+
+        self.save_state()?;
+        self.write_worker_status(&updated_worker)?;
+        self.upsert_worker_session(&updated_worker);
+        self.append_log_line(
+            worker_id,
+            format!(
+                "system> resumed with fresh thread {}",
+                updated_worker.thread_id
+            ),
+        )?;
+        Ok(updated_worker)
+    }
+
+    async fn resume_thread(
+        &self,
+        thread_id: &str,
+        developer_instructions: Option<String>,
+    ) -> Result<ThreadStartResponse> {
+        self.client
+            .request(
+                "thread/resume",
                 json!({
                     "threadId": thread_id,
-                    "includeTurns": false,
+                    "cwd": self.workspace_root,
+                    "sandbox": self.config.master.sandbox,
+                    "approvalPolicy": self.config.master.approval,
+                    "personality": "pragmatic",
+                    "model": self.config.master.model,
+                    "developerInstructions": developer_instructions,
+                    "persistExtendedHistory": false,
                 }),
             )
-            .await;
-
-        match response {
-            Ok(thread) => thread.thread.id == thread_id,
-            Err(_) => false,
-        }
+            .await
     }
 
     fn ensure_master_session(&self, thread_id: String) {
+        let summary = self.master_summary();
+        let last_message = self.master_last_message();
         let mut sessions = self.sessions.lock().expect("sessions lock poisoned");
         sessions
             .entry(MASTER_SESSION_ID.to_owned())
-            .and_modify(|session| session.set_thread_id(thread_id.clone()))
+            .and_modify(|session| {
+                session.set_thread_id(thread_id.clone());
+                session.set_summary(summary.clone());
+                session.set_last_message(last_message.clone());
+            })
             .or_insert_with(|| {
-                SessionView::master(thread_id, self.workspace_root.display().to_string())
+                SessionView::master(
+                    thread_id,
+                    self.workspace_root.display().to_string(),
+                    summary,
+                    last_message,
+                )
             });
     }
 
@@ -725,6 +897,14 @@ impl Controller {
         let mut sessions = self.sessions.lock().expect("sessions lock poisoned");
         if let Some(session) = sessions.get_mut(session_id) {
             session.append_live_chunk(chunk);
+        }
+        Ok(())
+    }
+
+    fn set_live_buffer(&self, session_id: &str, content: &str) -> Result<()> {
+        let mut sessions = self.sessions.lock().expect("sessions lock poisoned");
+        if let Some(session) = sessions.get_mut(session_id) {
+            session.set_live_buffer(content);
         }
         Ok(())
     }
@@ -776,6 +956,16 @@ impl Controller {
         Ok(())
     }
 
+    fn update_master_summary(&self, summary: &str) -> Result<()> {
+        {
+            let mut state = self.state.lock().expect("state lock poisoned");
+            state.master_summary = Some(summary.to_owned());
+        }
+        self.save_state()?;
+        self.set_session_summary(MASTER_SESSION_ID, Some(summary.to_owned()))?;
+        Ok(())
+    }
+
     fn master_thread_id(&self) -> Option<String> {
         let state = self.state.lock().expect("state lock poisoned");
         state.master_thread_id.clone()
@@ -784,6 +974,16 @@ impl Controller {
     fn master_last_turn_id(&self) -> Option<String> {
         let state = self.state.lock().expect("state lock poisoned");
         state.master_last_turn_id.clone()
+    }
+
+    fn master_summary(&self) -> Option<String> {
+        let state = self.state.lock().expect("state lock poisoned");
+        state.master_summary.clone()
+    }
+
+    fn master_last_message(&self) -> Option<String> {
+        let state = self.state.lock().expect("state lock poisoned");
+        state.master_last_message.clone()
     }
 
     fn save_state(&self) -> Result<()> {
@@ -816,9 +1016,14 @@ impl Controller {
     ) -> Result<()> {
         match role {
             SessionRole::Master => {
-                if let Some(turn_id) = &last_turn_id {
+                {
                     let mut persisted = self.state.lock().expect("state lock poisoned");
-                    persisted.master_last_turn_id = Some(turn_id.clone());
+                    if let Some(turn_id) = &last_turn_id {
+                        persisted.master_last_turn_id = Some(turn_id.clone());
+                    }
+                    if last_message.is_some() {
+                        persisted.master_last_message = last_message.clone();
+                    }
                 }
                 self.save_state()?;
                 self.set_session_status(MASTER_SESSION_ID, state)?;
@@ -865,7 +1070,9 @@ impl Controller {
             thread_id,
             state: state.to_owned(),
             updated_at: now_unix_ts(),
-            summary: Some("Primary planner and dispatcher".to_owned()),
+            summary: self
+                .master_summary()
+                .or_else(|| Some("Primary planner and dispatcher".to_owned())),
             last_turn_id,
             last_message,
         };
@@ -905,6 +1112,7 @@ impl Controller {
         &self,
         session_id: &str,
         parsed: &ParsedMasterResponse,
+        wait_for_follow_on: bool,
     ) -> Result<Option<String>> {
         let visible = parsed.visible_response.trim();
         if !visible.is_empty() {
@@ -912,6 +1120,7 @@ impl Controller {
         }
 
         if let Some(summary) = &parsed.envelope.summary {
+            self.update_master_summary(summary)?;
             self.append_log_line(session_id, format!("orchestrator> summary: {summary}"))?;
         }
 
@@ -928,7 +1137,13 @@ impl Controller {
                         format!("orchestrator> spawn_worker group={group} task={task}"),
                     )?;
                     match self
-                        .spawn_worker_with_options(group, task, summary.clone(), prompt.clone())
+                        .spawn_worker_with_options(
+                            group,
+                            task,
+                            summary.clone(),
+                            prompt.clone(),
+                            wait_for_follow_on,
+                        )
                         .await
                     {
                         Ok(worker) => {
@@ -953,15 +1168,29 @@ impl Controller {
                         session_id,
                         format!("orchestrator> send_worker_prompt worker={worker_id}"),
                     )?;
-                    match self.resolve_worker_target(worker_id) {
+                    match self.resolve_worker_target(worker_id).await {
                         Ok((target_session_id, thread_id, log_label, role)) => {
-                            if let Err(error) = self.enqueue_turn(
-                                target_session_id,
-                                thread_id,
-                                log_label,
-                                role,
-                                prompt,
-                            ) {
+                            let result = if wait_for_follow_on {
+                                self.enqueue_turn_and_wait(
+                                    target_session_id,
+                                    thread_id,
+                                    log_label,
+                                    role,
+                                    prompt,
+                                    false,
+                                )
+                                .await
+                            } else {
+                                self.enqueue_turn(
+                                    target_session_id,
+                                    thread_id,
+                                    log_label,
+                                    role,
+                                    prompt,
+                                    false,
+                                )
+                            };
+                            if let Err(error) = result {
                                 self.append_log_line(
                                     session_id,
                                     format!("orchestrator> send_worker_prompt failed: {error}"),
@@ -1004,7 +1233,12 @@ fn build_sessions(state: &AppState, workspace_root: &Path) -> BTreeMap<String, S
     if let Some(thread_id) = state.master_thread_id.clone() {
         sessions.insert(
             MASTER_SESSION_ID.to_owned(),
-            SessionView::master(thread_id, workspace_root.display().to_string()),
+            SessionView::master(
+                thread_id,
+                workspace_root.display().to_string(),
+                state.master_summary.clone(),
+                state.master_last_message.clone(),
+            ),
         );
     }
     for worker in state.workers.values() {

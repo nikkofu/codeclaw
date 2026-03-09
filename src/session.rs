@@ -2,6 +2,7 @@ use crate::state::WorkerRecord;
 use std::collections::VecDeque;
 
 const MAX_LOG_LINES: usize = 512;
+const DEFAULT_MASTER_SUMMARY: &str = "Primary planner and dispatcher";
 
 #[derive(Debug, Clone)]
 pub enum SessionKind {
@@ -44,17 +45,22 @@ pub struct SessionView {
 }
 
 impl SessionView {
-    pub fn master(thread_id: String, cwd: String) -> Self {
+    pub fn master(
+        thread_id: String,
+        cwd: String,
+        summary: Option<String>,
+        last_message: Option<String>,
+    ) -> Self {
         Self {
             id: "master".to_owned(),
             thread_id,
             title: "master".to_owned(),
-            summary: Some("Primary planner and dispatcher".to_owned()),
+            summary: summary.or_else(|| Some(DEFAULT_MASTER_SUMMARY.to_owned())),
             kind: SessionKind::Master,
             status: "idle".to_owned(),
             cwd,
             last_turn_id: None,
-            last_message: None,
+            last_message,
             lines: VecDeque::new(),
             live_buffer: String::new(),
         }
@@ -111,6 +117,11 @@ impl SessionView {
 
     pub fn append_live_chunk(&mut self, chunk: &str) {
         self.live_buffer.push_str(chunk);
+    }
+
+    pub fn set_live_buffer(&mut self, content: &str) {
+        self.live_buffer.clear();
+        self.live_buffer.push_str(content);
     }
 
     pub fn commit_live_buffer(&mut self) -> Option<String> {

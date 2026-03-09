@@ -164,7 +164,7 @@ impl App {
 
         let sections = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([Constraint::Length(5), Constraint::Min(8)])
+            .constraints([Constraint::Length(9), Constraint::Min(8)])
             .split(area);
 
         let meta = Paragraph::new(Text::from(vec![
@@ -179,10 +179,12 @@ impl App {
                     status_style(&session.status),
                 ),
             ]),
-            Line::from(session.subtitle.clone()),
+            Line::from(format!("id: {}", session.id)),
+            Line::from(session_identity_line(session)),
+            Line::from(session_summary_line(session)),
+            Line::from(session_last_message_line(session)),
             Line::from(format!("thread: {}", session.thread_id)),
-            Line::from(format!("cwd: {}", session.cwd)),
-            Line::from(session_detail_line(session)),
+            Line::from(session_location_line(session)),
         ]))
         .block(
             Block::default()
@@ -526,29 +528,46 @@ fn input_target_label(mode: &InputMode, session: &SessionSnapshot) -> String {
     }
 }
 
-fn session_detail_line(session: &SessionSnapshot) -> String {
+fn session_identity_line(session: &SessionSnapshot) -> String {
     match &session.kind {
-        SessionKind::Master => format!(
-            "role: master | summary: {}",
-            session
-                .summary
-                .clone()
-                .or_else(|| session.last_message.clone())
-                .unwrap_or_else(|| "Primary planner and dispatcher".to_owned())
-        ),
-        SessionKind::Worker {
-            group,
-            task,
-            task_file,
-        } => format!(
-            "group: {} | task: {} | summary: {} | task file: {}",
-            group,
-            task,
-            session
+        SessionKind::Master => "role: master".to_owned(),
+        SessionKind::Worker { group, task, .. } => {
+            format!("group: {group} | task: {}", truncate(task, 28))
+        }
+    }
+}
+
+fn session_summary_line(session: &SessionSnapshot) -> String {
+    format!(
+        "summary: {}",
+        truncate(
+            &session
                 .summary
                 .clone()
                 .unwrap_or_else(|| "not set".to_owned()),
-            task_file
-        ),
+            44,
+        )
+    )
+}
+
+fn session_last_message_line(session: &SessionSnapshot) -> String {
+    format!(
+        "last: {}",
+        truncate(
+            &session
+                .last_message
+                .clone()
+                .unwrap_or_else(|| "-".to_owned()),
+            47,
+        )
+    )
+}
+
+fn session_location_line(session: &SessionSnapshot) -> String {
+    match &session.kind {
+        SessionKind::Master => format!("workspace: {}", truncate(&session.cwd, 39)),
+        SessionKind::Worker { task_file, .. } => {
+            format!("task file: {}", truncate(task_file, 39))
+        }
     }
 }

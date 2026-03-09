@@ -39,6 +39,22 @@ pub struct ParsedMasterResponse {
     pub envelope: MasterEnvelope,
 }
 
+pub fn visible_stream_text(raw: &str) -> &str {
+    if let Some(start) = raw.find(START_MARKER) {
+        return &raw[..start];
+    }
+
+    let max_prefix = raw.len().min(START_MARKER.len().saturating_sub(1));
+    for prefix_len in (1..=max_prefix).rev() {
+        if raw.ends_with(&START_MARKER[..prefix_len]) {
+            let visible_len = raw.len() - prefix_len;
+            return &raw[..visible_len];
+        }
+    }
+
+    raw
+}
+
 pub fn parse_master_response(raw: &str) -> Result<ParsedMasterResponse> {
     let Some(start) = raw.rfind(START_MARKER) else {
         return Ok(ParsedMasterResponse {
@@ -66,7 +82,7 @@ pub fn parse_master_response(raw: &str) -> Result<ParsedMasterResponse> {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_master_response, MasterAction};
+    use super::{parse_master_response, visible_stream_text, MasterAction};
 
     #[test]
     fn parses_response_with_actions_block() {
@@ -107,5 +123,19 @@ mod tests {
             "No orchestration needed right now."
         );
         assert!(parsed.envelope.actions.is_empty());
+    }
+
+    #[test]
+    fn hides_partial_action_marker_during_streaming() {
+        assert_eq!(
+            visible_stream_text("Planning the split.\n<codecl"),
+            "Planning the split.\n"
+        );
+        assert_eq!(
+            visible_stream_text(
+                "Planning the split.\n<codeclaw-actions>\n{\"summary\":\"x\",\"actions\":[]}"
+            ),
+            "Planning the split.\n"
+        );
     }
 }

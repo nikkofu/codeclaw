@@ -11,6 +11,10 @@ use std::{
 pub struct AppState {
     pub master_thread_id: Option<String>,
     pub master_last_turn_id: Option<String>,
+    #[serde(default)]
+    pub master_summary: Option<String>,
+    #[serde(default)]
+    pub master_last_message: Option<String>,
     pub next_task_number: u64,
     #[serde(default)]
     pub workers: BTreeMap<String, WorkerRecord>,
@@ -58,6 +62,8 @@ impl Default for AppState {
         Self {
             master_thread_id: None,
             master_last_turn_id: None,
+            master_summary: None,
+            master_last_message: None,
             next_task_number: 1,
             workers: BTreeMap::new(),
         }

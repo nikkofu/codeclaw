@@ -93,7 +93,7 @@ async fn run_up(workspace_root: PathBuf) -> Result<()> {
 async fn run_spawn(workspace_root: PathBuf, group: &str, task: &str) -> Result<()> {
     let controller = Controller::start(workspace_root).await?;
     controller.init_workspace()?;
-    let worker = controller.spawn_worker(group, task).await?;
+    let worker = controller.spawn_worker_and_wait(group, task).await?;
     println!("worker: {}", worker.id);
     println!("thread: {}", worker.thread_id);
     println!("task file: {}", worker.task_file);
@@ -109,7 +109,7 @@ async fn run_send(workspace_root: PathBuf, to: &str, prompt: &str) -> Result<()>
     } else {
         PromptTarget::Worker(to.to_owned())
     };
-    controller.submit_prompt(target, prompt).await?;
+    controller.submit_prompt_and_wait(target, prompt).await?;
     println!("submitted");
     Ok(())
 }

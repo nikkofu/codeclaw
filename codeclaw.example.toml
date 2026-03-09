@@ -1,6 +1,7 @@
 [master]
 mode = "app-server"
 model = "gpt-5-codex"
+reasoning_effort = "high"
 sandbox = "workspace-write"
 approval = "on-request"
 

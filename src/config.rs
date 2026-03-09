@@ -23,6 +23,8 @@ pub struct Config {
 pub struct MasterConfig {
     pub mode: String,
     pub model: String,
+    #[serde(default = "default_reasoning_effort")]
+    pub reasoning_effort: String,
     pub sandbox: String,
     pub approval: String,
 }
@@ -129,6 +131,10 @@ impl Config {
     pub fn group(&self, id: &str) -> Option<&GroupConfig> {
         self.groups.iter().find(|group| group.id == id)
     }
+}
+
+fn default_reasoning_effort() -> String {
+    "high".to_owned()
 }
 
 impl CoordinationPaths {

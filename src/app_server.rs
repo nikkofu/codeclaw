@@ -31,10 +31,16 @@ pub struct AppServerClient {
 }
 
 impl AppServerClient {
-    pub async fn spawn(client_name: &str, client_version: &str) -> Result<Self> {
+    pub async fn spawn(
+        client_name: &str,
+        client_version: &str,
+        reasoning_effort: &str,
+    ) -> Result<Self> {
         let mut command = Command::new("codex");
         command
             .arg("app-server")
+            .arg("-c")
+            .arg(format!("model_reasoning_effort={reasoning_effort:?}"))
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
