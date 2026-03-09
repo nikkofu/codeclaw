@@ -20,6 +20,7 @@ pub struct SessionSnapshot {
     pub thread_id: String,
     pub title: String,
     pub subtitle: String,
+    pub pending_turns: usize,
     pub summary: Option<String>,
     pub kind: SessionKind,
     pub status: String,
@@ -37,6 +38,7 @@ pub struct SessionView {
     summary: Option<String>,
     kind: SessionKind,
     status: String,
+    pending_turns: usize,
     cwd: String,
     last_turn_id: Option<String>,
     last_message: Option<String>,
@@ -58,6 +60,7 @@ impl SessionView {
             summary: summary.or_else(|| Some(DEFAULT_MASTER_SUMMARY.to_owned())),
             kind: SessionKind::Master,
             status: "idle".to_owned(),
+            pending_turns: 0,
             cwd,
             last_turn_id: None,
             last_message,
@@ -78,6 +81,7 @@ impl SessionView {
                 task_file: worker.task_file.clone(),
             },
             status: worker.status.to_string(),
+            pending_turns: 0,
             cwd,
             last_turn_id: worker.last_turn_id.clone(),
             last_message: worker.last_message.clone(),
@@ -92,6 +96,10 @@ impl SessionView {
 
     pub fn set_status(&mut self, status: impl Into<String>) {
         self.status = status.into();
+    }
+
+    pub fn set_pending_turns(&mut self, pending_turns: usize) {
+        self.pending_turns = pending_turns;
     }
 
     pub fn set_last_turn_id(&mut self, turn_id: Option<String>) {
@@ -161,6 +169,7 @@ impl SessionView {
             thread_id: self.thread_id.clone(),
             title: self.title.clone(),
             subtitle,
+            pending_turns: self.pending_turns,
             summary: self.summary.clone(),
             kind: self.kind.clone(),
             status: self.status.clone(),

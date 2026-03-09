@@ -1,5 +1,25 @@
 # CodeClaw Architecture
 
+## 0. Implementation Status
+
+As of March 9, 2026, the repository implements a working control-plane prototype, not just a design stub.
+
+Implemented now:
+
+- one master session and multiple worker sessions inside a single Rust TUI
+- persistent state and status files under `.codeclaw/`
+- master orchestration actions for spawning workers, sending worker prompts, and updating summaries
+- queued turns for busy sessions
+- automatic worker completion/failure updates routed back into the master session
+- session recovery using `thread/resume`
+
+Not implemented yet:
+
+- dedicated per-worker `git worktree` isolation
+- hard lease enforcement on file paths
+- merge queue / integration branch automation
+- true PTY attachment inside the right-side pane
+
 ## 1. Problem Statement
 
 Running one interactive `codex` process in one terminal does not scale well for:
@@ -45,21 +65,18 @@ The user still launches everything from the terminal, but the visible UI is `cod
 
 ### 3.2 Worker Sessions
 
-Use two worker modes:
+The current repository uses `codex app-server` threads for both master and workers.
 
-- default worker mode: `codex exec --json`
-- attach mode: `codex resume` or a dedicated interactive worker PTY when manual intervention is needed
+Why the current implementation does this:
 
-This split is important.
+- it keeps the transport consistent for every session
+- it makes queueing, recovery, and event handling much simpler
+- it avoids mixing multiple runtime protocols too early
 
-`codex exec --json` is better for autonomous task execution because:
+Planned follow-up:
 
-- it is simpler to supervise
-- it streams structured events
-- it is cheaper than embedding many interactive TUIs
-- it is easier to mark complete, failed, blocked, or waiting
-
-Attach mode exists for the cases where a human wants to inspect or steer a worker directly.
+- keep the current thread-based supervision path as the default
+- add an attach mode later, backed by `codex resume` or a PTY-based worker view when a human needs direct intervention
 
 ## 4. Why This Fits the Requested UX
 
@@ -120,6 +137,11 @@ Rust is the best fit because it gives:
    - checks overlap and mergeability
    - gates integration into the shared branch
    - opens PRs or local merge queues later
+
+Current implementation note:
+
+- items 1 through 5 exist in prototype form
+- item 6 is still planned
 
 ## 5.2 High-Level Flow
 

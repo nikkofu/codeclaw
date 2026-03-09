@@ -11,11 +11,12 @@ use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, VecDeque},
     fs::{self, OpenOptions},
     io::Write,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
+    time::Duration,
 };
 use tokio::sync::{broadcast, oneshot};
 
@@ -28,6 +29,7 @@ pub struct Controller {
     pub paths: CoordinationPaths,
     state: Arc<Mutex<AppState>>,
     sessions: Arc<Mutex<BTreeMap<String, SessionView>>>,
+    pending_turns: Arc<Mutex<BTreeMap<String, VecDeque<QueuedTurn>>>>,
     client: Arc<AppServerClient>,
 }
 
@@ -148,6 +150,43 @@ enum SessionRole {
     Worker(String),
 }
 
+#[derive(Debug, Clone)]
+enum TurnSource {
+    User,
+    Bootstrap,
+    Orchestrator,
+    Runtime,
+}
+
+impl TurnSource {
+    fn log_prefix(&self) -> &'static str {
+        match self {
+            Self::User => "user",
+            Self::Bootstrap => "system",
+            Self::Orchestrator => "orchestrator",
+            Self::Runtime => "runtime",
+        }
+    }
+
+    fn format_prompt(&self, prompt: &str) -> String {
+        match self {
+            Self::User => prompt.to_owned(),
+            Self::Bootstrap | Self::Orchestrator | Self::Runtime => compact_message(prompt),
+        }
+    }
+}
+
+struct QueuedTurn {
+    session_id: String,
+    thread_id: String,
+    log_label: String,
+    role: SessionRole,
+    prompt: String,
+    wait_for_follow_on: bool,
+    source: TurnSource,
+    completion: oneshot::Sender<Result<()>>,
+}
+
 impl Controller {
     pub async fn start(workspace_root: PathBuf) -> Result<Self> {
         let config = Config::load(&workspace_root)?;
@@ -169,6 +208,7 @@ impl Controller {
             paths,
             state: Arc::new(Mutex::new(state)),
             sessions: Arc::new(Mutex::new(sessions)),
+            pending_turns: Arc::new(Mutex::new(BTreeMap::new())),
             client,
         })
     }
@@ -284,13 +324,30 @@ impl Controller {
 
     pub async fn submit_prompt(&self, target: PromptTarget, prompt: &str) -> Result<()> {
         let (session_id, thread_id, log_label, role) = self.resolve_prompt_target(target).await?;
-        self.enqueue_turn(session_id, thread_id, log_label, role, prompt, false)
+        self.enqueue_turn(
+            session_id,
+            thread_id,
+            log_label,
+            role,
+            prompt,
+            false,
+            TurnSource::User,
+        )
     }
 
     pub async fn submit_prompt_and_wait(&self, target: PromptTarget, prompt: &str) -> Result<()> {
         let (session_id, thread_id, log_label, role) = self.resolve_prompt_target(target).await?;
-        self.enqueue_turn_and_wait(session_id, thread_id, log_label, role, prompt, true)
-            .await
+        self.enqueue_turn_and_wait(
+            session_id,
+            thread_id,
+            log_label,
+            role,
+            prompt,
+            true,
+            TurnSource::User,
+        )
+        .await?;
+        self.wait_for_quiescence().await
     }
 
     fn enqueue_turn(
@@ -301,6 +358,7 @@ impl Controller {
         role: SessionRole,
         prompt: &str,
         wait_for_follow_on: bool,
+        source: TurnSource,
     ) -> Result<()> {
         self.enqueue_turn_with_completion(
             session_id,
@@ -309,6 +367,7 @@ impl Controller {
             role,
             prompt,
             wait_for_follow_on,
+            source,
         )?;
         Ok(())
     }
@@ -321,6 +380,7 @@ impl Controller {
         role: SessionRole,
         prompt: &str,
         wait_for_follow_on: bool,
+        source: TurnSource,
     ) -> Result<()> {
         let done = self.enqueue_turn_with_completion(
             session_id,
@@ -329,6 +389,7 @@ impl Controller {
             role,
             prompt,
             wait_for_follow_on,
+            source,
         )?;
         done.await.context("turn task dropped before completion")?
     }
@@ -341,34 +402,40 @@ impl Controller {
         role: SessionRole,
         prompt: &str,
         wait_for_follow_on: bool,
+        source: TurnSource,
     ) -> Result<oneshot::Receiver<Result<()>>> {
+        let (tx, rx) = oneshot::channel();
+        let turn = QueuedTurn {
+            session_id: session_id.clone(),
+            thread_id,
+            log_label,
+            role,
+            prompt: prompt.to_owned(),
+            wait_for_follow_on,
+            source: source.clone(),
+            completion: tx,
+        };
+
         if self.session_is_busy(&session_id) {
-            return Err(anyhow!("session `{session_id}` is already running"));
+            let pending_count = {
+                let mut pending = self.pending_turns.lock().expect("pending lock poisoned");
+                let queue = pending.entry(session_id.clone()).or_default();
+                queue.push_back(turn);
+                queue.len()
+            };
+            self.set_session_pending_turns(&session_id, pending_count)?;
+            self.append_log_line(
+                &session_id,
+                format!(
+                    "queue> {} queued ({pending_count} waiting): {}",
+                    source.log_prefix(),
+                    source.format_prompt(prompt)
+                ),
+            )?;
+            return Ok(rx);
         }
 
-        self.append_log_line(&session_id, format!("user> {prompt}"))?;
-        self.set_session_status(&session_id, "queued")?;
-
-        let controller = self.clone();
-        let prompt = prompt.to_owned();
-        let (tx, rx) = oneshot::channel();
-        tokio::spawn(async move {
-            let result = controller
-                .process_turn(
-                    session_id.clone(),
-                    thread_id,
-                    log_label,
-                    prompt,
-                    role,
-                    wait_for_follow_on,
-                )
-                .await;
-            if let Err(error) = &result {
-                let _ = controller.append_log_line(&session_id, format!("error> {error}"));
-                let _ = controller.set_session_status(&session_id, "failed");
-            }
-            let _ = tx.send(result);
-        });
+        self.start_queued_turn(turn)?;
 
         Ok(rx)
     }
@@ -484,6 +551,7 @@ impl Controller {
                 SessionRole::Worker(record.id.clone()),
                 &bootstrap_prompt,
                 false,
+                TurnSource::Bootstrap,
             )
             .await?;
         } else {
@@ -494,6 +562,7 @@ impl Controller {
                 SessionRole::Worker(record.id.clone()),
                 &bootstrap_prompt,
                 false,
+                TurnSource::Bootstrap,
             )?;
         }
 
@@ -690,6 +759,10 @@ impl Controller {
                                 Some(turn_id.clone()),
                                 Some(error.message.clone()),
                             )?;
+                            if let SessionRole::Worker(worker_id) = &role {
+                                self.publish_worker_runtime_update(worker_id, "failed")
+                                    .await?;
+                            }
                             return Err(anyhow!(error.message));
                         }
 
@@ -723,6 +796,10 @@ impl Controller {
                             Some(turn_id.clone()),
                             last_message,
                         )?;
+                        if let SessionRole::Worker(worker_id) = &role {
+                            self.publish_worker_runtime_update(worker_id, "completed")
+                                .await?;
+                        }
                         return Ok(());
                     }
                 }
@@ -872,6 +949,63 @@ impl Controller {
         );
     }
 
+    fn start_queued_turn(&self, turn: QueuedTurn) -> Result<()> {
+        self.append_log_line(
+            &turn.session_id,
+            format!(
+                "{}> {}",
+                turn.source.log_prefix(),
+                turn.source.format_prompt(&turn.prompt)
+            ),
+        )?;
+        self.set_session_status(&turn.session_id, "queued")?;
+
+        let controller = self.clone();
+        tokio::spawn(async move {
+            let result = controller
+                .process_turn(
+                    turn.session_id.clone(),
+                    turn.thread_id,
+                    turn.log_label,
+                    turn.prompt,
+                    turn.role,
+                    turn.wait_for_follow_on,
+                )
+                .await;
+            if let Err(error) = &result {
+                let _ = controller.append_log_line(&turn.session_id, format!("error> {error}"));
+                let _ = controller.set_session_status(&turn.session_id, "failed");
+            }
+            let _ = turn.completion.send(result);
+            let _ = controller.schedule_next_turn(&turn.session_id);
+        });
+
+        Ok(())
+    }
+
+    fn schedule_next_turn(&self, session_id: &str) -> Result<()> {
+        let (next_turn, pending_count) = {
+            let mut pending = self.pending_turns.lock().expect("pending lock poisoned");
+            let next_turn = if let Some(queue) = pending.get_mut(session_id) {
+                let next = queue.pop_front();
+                let remaining = queue.len();
+                let should_remove = remaining == 0;
+                (next, remaining, should_remove)
+            } else {
+                (None, 0, false)
+            };
+            if next_turn.2 {
+                pending.remove(session_id);
+            }
+            (next_turn.0, next_turn.1)
+        };
+        self.set_session_pending_turns(session_id, pending_count)?;
+        if let Some(turn) = next_turn {
+            self.start_queued_turn(turn)?;
+        }
+        Ok(())
+    }
+
     fn session_is_busy(&self, session_id: &str) -> bool {
         let sessions = self.sessions.lock().expect("sessions lock poisoned");
         sessions
@@ -883,6 +1017,38 @@ impl Controller {
                 )
             })
             .unwrap_or(false)
+    }
+
+    fn set_session_pending_turns(&self, session_id: &str, pending_turns: usize) -> Result<()> {
+        let mut sessions = self.sessions.lock().expect("sessions lock poisoned");
+        if let Some(session) = sessions.get_mut(session_id) {
+            session.set_pending_turns(pending_turns);
+        }
+        Ok(())
+    }
+
+    fn has_pending_turns(&self) -> bool {
+        let pending = self.pending_turns.lock().expect("pending lock poisoned");
+        pending.values().any(|queue| !queue.is_empty())
+    }
+
+    fn has_active_sessions(&self) -> bool {
+        let sessions = self.sessions.lock().expect("sessions lock poisoned");
+        sessions.values().any(|session| {
+            matches!(
+                session.snapshot().status.as_str(),
+                "queued" | "running" | "active" | "inProgress"
+            )
+        })
+    }
+
+    async fn wait_for_quiescence(&self) -> Result<()> {
+        loop {
+            if !self.has_active_sessions() && !self.has_pending_turns() {
+                return Ok(());
+            }
+            tokio::time::sleep(Duration::from_millis(120)).await;
+        }
     }
 
     fn append_log_line(&self, session_id: &str, line: impl Into<String>) -> Result<()> {
@@ -1092,9 +1258,49 @@ impl Controller {
         status.write(&worker.status_path(&self.paths.status_dir))
     }
 
+    async fn publish_worker_runtime_update(
+        &self,
+        worker_id: &str,
+        worker_state: &str,
+    ) -> Result<()> {
+        let worker = {
+            let state = self.state.lock().expect("state lock poisoned");
+            state
+                .workers
+                .get(worker_id)
+                .cloned()
+                .with_context(|| format!("unknown worker `{worker_id}`"))?
+        };
+
+        let master_thread_id = self.ensure_master_thread().await?;
+        let prompt = format!(
+            "CodeClaw runtime update. This is an internal worker status event, not a direct human message.\n\nWorker id: {worker_id}\nState: {worker_state}\nGroup: {}\nTask: {}\nSidebar summary: {}\nLast worker message: {}\n\nUpdate the operator with a concise coordination response and include the required <codeclaw-actions> block. If no follow-up is needed, return an empty actions list.",
+            worker.group,
+            worker.task,
+            worker
+                .summary
+                .clone()
+                .unwrap_or_else(|| "not set".to_owned()),
+            worker
+                .last_message
+                .clone()
+                .unwrap_or_else(|| "none".to_owned())
+        );
+
+        self.enqueue_turn(
+            MASTER_SESSION_ID.to_owned(),
+            master_thread_id,
+            MASTER_SESSION_ID.to_owned(),
+            SessionRole::Master,
+            &prompt,
+            false,
+            TurnSource::Runtime,
+        )
+    }
+
     fn master_instructions(&self) -> String {
         format!(
-            "You are the master controller for CodeClaw in {}. Coordinate work across workers, keep plans concise, and prefer actionable task splits.\n\nWhen you respond to the user, append exactly one machine-readable block at the end using this format:\n<codeclaw-actions>\n{{\"summary\":\"short orchestration summary\",\"actions\":[...]}}\n</codeclaw-actions>\n\nAllowed actions:\n- {{\"type\":\"spawn_worker\",\"group\":\"backend|frontend|infra\",\"task\":\"short task title\",\"summary\":\"optional short sidebar summary\",\"prompt\":\"optional initial worker prompt\"}}\n- {{\"type\":\"send_worker_prompt\",\"worker_id\":\"existing-worker-id\",\"prompt\":\"follow-up instructions\"}}\n- {{\"type\":\"update_worker_summary\",\"worker_id\":\"existing-worker-id\",\"summary\":\"new short summary\"}}\n\nRules:\n- Always include the block, even when no actions are needed.\n- Keep `summary` short enough to fit a sidebar.\n- Use worker ids exactly as shown in the UI when referencing existing workers.",
+            "You are the master controller for CodeClaw in {}. Coordinate work across workers, keep plans concise, and prefer actionable task splits.\n\nYou may receive direct human prompts and internal runtime updates about worker completions or failures. Treat runtime updates as scheduler inputs: absorb the worker result, update summaries when useful, and dispatch follow-up actions only when they are actually needed.\n\nWhen you respond, append exactly one machine-readable block at the end using this format:\n<codeclaw-actions>\n{{\"summary\":\"short orchestration summary\",\"actions\":[...]}}\n</codeclaw-actions>\n\nAllowed actions:\n- {{\"type\":\"spawn_worker\",\"group\":\"backend|frontend|infra\",\"task\":\"short task title\",\"summary\":\"optional short sidebar summary\",\"prompt\":\"optional initial worker prompt\"}}\n- {{\"type\":\"send_worker_prompt\",\"worker_id\":\"existing-worker-id\",\"prompt\":\"follow-up instructions\"}}\n- {{\"type\":\"update_worker_summary\",\"worker_id\":\"existing-worker-id\",\"summary\":\"new short summary\"}}\n\nRules:\n- Always include the block, even when no actions are needed.\n- Keep `summary` short enough to fit a sidebar.\n- Use worker ids exactly as shown in the UI when referencing existing workers.",
             self.workspace_root.display()
         )
     }
@@ -1178,6 +1384,7 @@ impl Controller {
                                     role,
                                     prompt,
                                     false,
+                                    TurnSource::Orchestrator,
                                 )
                                 .await
                             } else {
@@ -1188,6 +1395,7 @@ impl Controller {
                                     role,
                                     prompt,
                                     false,
+                                    TurnSource::Orchestrator,
                                 )
                             };
                             if let Err(error) = result {

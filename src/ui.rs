@@ -118,7 +118,7 @@ impl App {
             .iter()
             .map(|session| {
                 let status = status_badge(&session.status);
-                let subtitle = truncate(&session.subtitle, 28);
+                let subtitle = truncate(&session_list_subtitle(session), 28);
                 ListItem::new(Text::from(vec![
                     Line::from(vec![
                         Span::styled(status, status_style(&session.status)),
@@ -181,6 +181,7 @@ impl App {
             ]),
             Line::from(format!("id: {}", session.id)),
             Line::from(session_identity_line(session)),
+            Line::from(session_queue_line(session)),
             Line::from(session_summary_line(session)),
             Line::from(session_last_message_line(session)),
             Line::from(format!("thread: {}", session.thread_id)),
@@ -217,9 +218,10 @@ impl App {
         let status = selected
             .map(|session| {
                 format!(
-                    "selected={} | status={} | target={} | keys: ↑↓ switch  i master  e worker  n spawn  g master  q quit",
+                    "selected={} | status={} | queued={} | target={} | keys: ↑↓ switch  i master  e worker  n spawn  g master  q quit",
                     session.title,
                     session.status,
+                    session.pending_turns,
                     input_target_label(&self.input_mode, session),
                 )
             })
@@ -528,6 +530,14 @@ fn input_target_label(mode: &InputMode, session: &SessionSnapshot) -> String {
     }
 }
 
+fn session_list_subtitle(session: &SessionSnapshot) -> String {
+    if session.pending_turns == 0 {
+        session.subtitle.clone()
+    } else {
+        format!("q{} | {}", session.pending_turns, session.subtitle)
+    }
+}
+
 fn session_identity_line(session: &SessionSnapshot) -> String {
     match &session.kind {
         SessionKind::Master => "role: master".to_owned(),
@@ -535,6 +545,10 @@ fn session_identity_line(session: &SessionSnapshot) -> String {
             format!("group: {group} | task: {}", truncate(task, 28))
         }
     }
+}
+
+fn session_queue_line(session: &SessionSnapshot) -> String {
+    format!("queue: {} pending turn(s)", session.pending_turns)
 }
 
 fn session_summary_line(session: &SessionSnapshot) -> String {

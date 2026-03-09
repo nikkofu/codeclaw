@@ -6,7 +6,7 @@ It combines task routing, session management, shared coordination files, and Git
 
 ## Current Status
 
-This repository now includes a working Rust MVP with:
+This repository now includes a working Rust control-plane prototype with:
 
 - a local `codeclaw` CLI
 - persistent `.codeclaw/` coordination state
@@ -16,6 +16,9 @@ This repository now includes a working Rust MVP with:
 - a left/right TUI for session navigation and live output
 - terminal window title updates based on the selected Codex session
 - a structured orchestration protocol so the master can spawn workers and send follow-up prompts
+- queued turns for busy sessions
+- automatic worker completion and failure updates routed back to the master session
+- persisted master summary and last-message status across restarts
 
 ## Commands
 
@@ -47,11 +50,15 @@ g       focus master
 q       quit
 ```
 
+The sidebar now also reflects per-session queue depth with `qN` prefixes when a session has pending turns.
+
 The master session is now instructed to append a machine-readable orchestration block at the end of its replies. CodeClaw parses that block and can automatically:
 
 - spawn a worker
 - update a worker summary for the sidebar
 - send follow-up prompts to an existing worker
+
+When a worker finishes or fails, CodeClaw also pushes a runtime update back into the master session. If the master is busy, the update is queued and processed afterward.
 
 ## Requirements
 
@@ -66,6 +73,15 @@ The master session is now instructed to append a machine-readable orchestration 
 - Coordination state root: `.codeclaw/`
 - `master.reasoning_effort` defaults to `high` so CodeClaw can override incompatible global Codex defaults when launching `codex app-server`
 
-## Design
+## Known Gaps
 
+- the right pane is still a structured log view, not a full PTY terminal emulator
+- worker sessions do not yet run in dedicated `git worktree` directories
+- path leases are documented but not yet hard-enforced at dispatch time
+- merge gating and integration-branch automation are still ahead
+
+## References
+
+- Changelog: [CHANGELOG.md](CHANGELOG.md)
 - Architecture notes: [docs/architecture.md](docs/architecture.md)
+- Roadmap: [docs/roadmap.md](docs/roadmap.md)
