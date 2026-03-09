@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.5.0 - 2026-03-09
+
+- added a dedicated TUI batch inspection view for replaying one orchestration chain across sessions
+- added `b`, `[` and `]` keyboard controls for toggling batch view and navigating historical batches
+- aggregated batch timelines from persisted per-session history so master and worker events can be reviewed as one stream
+- surfaced batch metadata such as root prompt, related sessions, status, and last event directly in the right pane
+
 ## 0.4.0 - 2026-03-09
 
 - persisted per-session timeline history into `.codeclaw/state.json` so supervision context survives `codeclaw up` restarts

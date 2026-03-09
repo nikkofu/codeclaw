@@ -22,6 +22,7 @@ This repository now includes a working Rust control-plane prototype with:
 - source-tagged session events for user, bootstrap, orchestrator, runtime, command, status, and error activity
 - batch-scoped CLI waiting so `send --to master` only waits for the orchestration it triggered
 - persisted session timeline and orchestration batch history across process restarts
+- a dedicated batch inspection view in the TUI for replaying one orchestration chain across multiple sessions
 - persisted master summary and last-message status across restarts
 
 ## Commands
@@ -50,6 +51,8 @@ Current TUI keybindings:
 i       send a prompt to master
 e       send a prompt to the selected worker
 n       spawn a worker using "group: task"
+b       toggle batch view for the selected session
+[ / ]   cycle older/newer batches for the selected session
 g       focus master
 q       quit
 ```
@@ -62,6 +65,12 @@ The right pane now separates supervision metadata from execution noise:
 - `Timeline` shows recent structured events such as user prompts, orchestrator dispatches, runtime acknowledgements, status changes, and command completions
 - timeline entries carry `bNNN` batch markers so the same orchestration chain can be traced after `codeclaw send` or `codeclaw up` restarts
 - `Live Output` remains the rolling text stream for assistant output and command/output lines
+
+Press `b` to switch the right pane into a batch-centric supervision view. In that mode, CodeClaw shows:
+
+- batch id, status, root prompt, related sessions, and last event
+- an aggregated batch timeline merged across all involved sessions
+- `[` and `]` navigation across historical batches for the selected session
 
 The master session is now instructed to append a machine-readable orchestration block at the end of its replies. CodeClaw parses that block and can automatically:
 

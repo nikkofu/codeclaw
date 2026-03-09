@@ -1,5 +1,7 @@
 use crate::{
-    controller::{Controller, PromptTarget},
+    controller::{
+        BatchEventSnapshot, BatchSessionSnapshot, BatchSnapshot, Controller, PromptTarget,
+    },
     session::{SessionEvent, SessionEventKind, SessionKind, SessionSnapshot},
 };
 use anyhow::{Context, Result};
@@ -38,10 +40,18 @@ pub async fn run(controller: Controller) -> Result<()> {
 struct App {
     controller: Controller,
     selected_id: String,
+    selected_batch_id: Option<u64>,
+    detail_mode: DetailMode,
     input_mode: InputMode,
     input_buffer: String,
     status_message: String,
     last_title: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DetailMode {
+    Session,
+    Batch,
 }
 
 #[derive(Debug, Clone)]
@@ -57,9 +67,13 @@ impl App {
         Self {
             controller,
             selected_id: "master".to_owned(),
+            selected_batch_id: None,
+            detail_mode: DetailMode::Session,
             input_mode: InputMode::Normal,
             input_buffer: String::new(),
-            status_message: "Press `i` to talk to master, `n` to spawn a worker.".to_owned(),
+            status_message:
+                "Press `i` to talk to master, `n` to spawn a worker, `b` to inspect batches."
+                    .to_owned(),
             last_title: String::new(),
         }
     }
@@ -68,6 +82,7 @@ impl App {
         loop {
             let sessions = self.controller.sessions_snapshot();
             self.sync_selection(&sessions);
+            self.sync_batch_selection(&sessions);
             self.sync_title(&sessions)?;
 
             terminal
@@ -152,6 +167,18 @@ impl App {
         area: Rect,
         sessions: &[SessionSnapshot],
     ) {
+        match self.detail_mode {
+            DetailMode::Session => self.draw_selected_session_view(frame, area, sessions),
+            DetailMode::Batch => self.draw_batch_view(frame, area, sessions),
+        }
+    }
+
+    fn draw_selected_session_view(
+        &self,
+        frame: &mut Frame<'_>,
+        area: Rect,
+        sessions: &[SessionSnapshot],
+    ) {
         let Some(session) = sessions
             .iter()
             .find(|session| session.id == self.selected_id)
@@ -226,14 +253,119 @@ impl App {
         frame.render_widget(detail, sections[2]);
     }
 
+    fn draw_batch_view(&self, frame: &mut Frame<'_>, area: Rect, sessions: &[SessionSnapshot]) {
+        let Some(session) = sessions
+            .iter()
+            .find(|session| session.id == self.selected_id)
+        else {
+            let empty = Paragraph::new("No session selected")
+                .block(Block::default().title("Batch").borders(Borders::ALL));
+            frame.render_widget(empty, area);
+            return;
+        };
+        let Some(batch_id) = self.selected_batch_id else {
+            let empty = Paragraph::new("No batch selected for this session.")
+                .block(Block::default().title("Batch").borders(Borders::ALL));
+            frame.render_widget(empty, area);
+            return;
+        };
+        let Some(batch) = self.controller.batch_snapshot(batch_id) else {
+            let empty = Paragraph::new(format!("Batch b{batch_id} is no longer available."))
+                .block(Block::default().title("Batch").borders(Borders::ALL));
+            frame.render_widget(empty, area);
+            return;
+        };
+
+        let sections = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(11),
+                Constraint::Length(6),
+                Constraint::Min(7),
+            ])
+            .split(area);
+
+        let meta = Paragraph::new(Text::from(vec![
+            Line::from(vec![
+                Span::styled(
+                    format!("b{:03}", batch.id),
+                    Style::default().add_modifier(Modifier::BOLD),
+                ),
+                Span::raw("  "),
+                Span::styled(format!("[{}]", batch.status), status_style(&batch.status)),
+            ]),
+            Line::from(format!("focus session: {}", session.title)),
+            Line::from(format!(
+                "root: {} ({})",
+                truncate(&batch.root_session_title, 28),
+                batch.root_session_id
+            )),
+            Line::from(format!("prompt: {}", truncate(&batch.root_prompt, 44))),
+            Line::from(format!("sessions: {}", batch.sessions.len())),
+            Line::from(format!("events: {}", batch.events.len())),
+            Line::from(format!("created: {}", batch.created_at)),
+            Line::from(format!("updated: {}", batch.updated_at)),
+            Line::from(format!(
+                "last: {}",
+                truncate(batch.last_event.as_deref().unwrap_or("-"), 44)
+            )),
+        ]))
+        .block(Block::default().title("Batch").borders(Borders::ALL))
+        .wrap(Wrap { trim: false });
+        frame.render_widget(meta, sections[0]);
+
+        let members = if batch.sessions.is_empty() {
+            "No batch members.".to_owned()
+        } else {
+            batch
+                .sessions
+                .iter()
+                .map(batch_member_line)
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        let members = Paragraph::new(members)
+            .block(
+                Block::default()
+                    .title("Batch Sessions")
+                    .borders(Borders::ALL),
+            )
+            .wrap(Wrap { trim: false });
+        frame.render_widget(members, sections[1]);
+
+        let timeline = batch_timeline_text(
+            &batch,
+            sections[2].width.saturating_sub(4) as usize,
+            sections[2].height.saturating_sub(2) as usize,
+        );
+        let timeline = Paragraph::new(timeline)
+            .block(
+                Block::default()
+                    .title(format!(
+                        "Batch Timeline :: {}",
+                        truncate(&batch.root_prompt, 34)
+                    ))
+                    .borders(Borders::ALL),
+            )
+            .wrap(Wrap { trim: false });
+        frame.render_widget(timeline, sections[2]);
+    }
+
     fn draw_status_bar(&self, frame: &mut Frame<'_>, area: Rect, sessions: &[SessionSnapshot]) {
         let selected = sessions
             .iter()
             .find(|session| session.id == self.selected_id);
         let status = selected
             .map(|session| {
+                let detail = match self.detail_mode {
+                    DetailMode::Session => "session".to_owned(),
+                    DetailMode::Batch => self
+                        .selected_batch_id
+                        .map(|batch_id| format!("batch=b{batch_id}"))
+                        .unwrap_or_else(|| "batch=-".to_owned()),
+                };
                 format!(
-                    "selected={} | status={} | queued={} | batch={} | target={} | keys: ↑↓ switch  i master  e worker  n spawn  g master  q quit",
+                    "selected={} | status={} | queued={} | batch={} | view={} | target={} | keys: ↑↓ switch  i master  e worker  n spawn  b batch  [ ] cycle  g master  q quit",
                     session.title,
                     session.status,
                     session.pending_turns,
@@ -241,6 +373,7 @@ impl App {
                         .latest_batch_id
                         .map(|batch_id| format!("b{batch_id}"))
                         .unwrap_or_else(|| "-".to_owned()),
+                    detail,
                     input_target_label(&self.input_mode, session),
                 )
             })
@@ -331,9 +464,12 @@ impl App {
             KeyCode::Up | KeyCode::Char('k') => self.select_previous(sessions),
             KeyCode::Down | KeyCode::Char('j') => self.select_next(sessions),
             KeyCode::Char('g') => {
-                self.selected_id = "master".to_owned();
+                self.focus_session("master".to_owned(), sessions);
                 self.status_message = "focused master".to_owned();
             }
+            KeyCode::Char('b') => self.toggle_batch_view(sessions),
+            KeyCode::Char('[') => self.select_previous_batch(sessions),
+            KeyCode::Char(']') => self.select_next_batch(sessions),
             KeyCode::Char('i') => {
                 self.input_mode = InputMode::MasterPrompt;
                 self.input_buffer.clear();
@@ -394,6 +530,8 @@ impl App {
                         let (group, task) = parse_spawn_input(&buffer)?;
                         let worker = self.controller.spawn_worker(&group, &task).await?;
                         self.selected_id = worker.id.clone();
+                        self.detail_mode = DetailMode::Session;
+                        self.selected_batch_id = None;
                         self.status_message = format!("spawned {}", worker.id);
                     }
                 }
@@ -426,6 +564,7 @@ impl App {
     fn sync_selection(&mut self, sessions: &[SessionSnapshot]) {
         if sessions.is_empty() {
             self.selected_id.clear();
+            self.selected_batch_id = None;
             return;
         }
 
@@ -437,6 +576,31 @@ impl App {
         }
     }
 
+    fn sync_batch_selection(&mut self, sessions: &[SessionSnapshot]) {
+        if self.detail_mode != DetailMode::Batch {
+            return;
+        }
+        let Some(session) = sessions
+            .iter()
+            .find(|session| session.id == self.selected_id)
+        else {
+            self.selected_batch_id = None;
+            return;
+        };
+        let batch_ids = session_batch_ids(session);
+        if batch_ids.is_empty() {
+            self.selected_batch_id = None;
+            self.detail_mode = DetailMode::Session;
+            return;
+        }
+        if !self
+            .selected_batch_id
+            .is_some_and(|batch_id| batch_ids.contains(&batch_id))
+        {
+            self.selected_batch_id = batch_ids.last().copied();
+        }
+    }
+
     fn sync_title(&mut self, sessions: &[SessionSnapshot]) -> Result<()> {
         let Some(session) = sessions
             .iter()
@@ -444,7 +608,18 @@ impl App {
         else {
             return Ok(());
         };
-        let title = format!("CodeClaw :: {} [{}]", session.title, session.status);
+        let title = match self.detail_mode {
+            DetailMode::Session => format!("CodeClaw :: {} [{}]", session.title, session.status),
+            DetailMode::Batch => self
+                .selected_batch_id
+                .map(|batch_id| {
+                    format!(
+                        "CodeClaw :: {} :: b{batch_id} [{}]",
+                        session.title, session.status
+                    )
+                })
+                .unwrap_or_else(|| format!("CodeClaw :: {} [{}]", session.title, session.status)),
+        };
         if self.last_title != title {
             execute!(io::stdout(), SetTitle(title.clone())).context("failed to set title")?;
             self.last_title = title;
@@ -462,7 +637,7 @@ impl App {
             .position(|session| session.id == self.selected_id)
             .unwrap_or(0);
         let next = current.saturating_sub(1);
-        self.selected_id = sessions[next].id.clone();
+        self.focus_session(sessions[next].id.clone(), sessions);
     }
 
     fn select_next(&mut self, sessions: &[SessionSnapshot]) {
@@ -475,7 +650,99 @@ impl App {
             .position(|session| session.id == self.selected_id)
             .unwrap_or(0);
         let next = min(current + 1, sessions.len() - 1);
-        self.selected_id = sessions[next].id.clone();
+        self.focus_session(sessions[next].id.clone(), sessions);
+    }
+
+    fn focus_session(&mut self, session_id: String, sessions: &[SessionSnapshot]) {
+        self.selected_id = session_id.clone();
+        if self.detail_mode == DetailMode::Batch {
+            self.selected_batch_id = sessions
+                .iter()
+                .find(|session| session.id == session_id)
+                .and_then(|session| session_batch_ids(session).last().copied());
+        } else {
+            self.selected_batch_id = None;
+        }
+    }
+
+    fn toggle_batch_view(&mut self, sessions: &[SessionSnapshot]) {
+        match self.detail_mode {
+            DetailMode::Session => {
+                let Some(session) = sessions
+                    .iter()
+                    .find(|session| session.id == self.selected_id)
+                else {
+                    self.status_message = "no session selected".to_owned();
+                    return;
+                };
+                let batch_ids = session_batch_ids(session);
+                if let Some(batch_id) = batch_ids.last().copied() {
+                    self.detail_mode = DetailMode::Batch;
+                    self.selected_batch_id = Some(batch_id);
+                    self.status_message = format!("inspecting batch b{batch_id}");
+                } else {
+                    self.status_message = "selected session has no batch history".to_owned();
+                }
+            }
+            DetailMode::Batch => {
+                self.detail_mode = DetailMode::Session;
+                self.status_message = "returned to session view".to_owned();
+            }
+        }
+    }
+
+    fn select_previous_batch(&mut self, sessions: &[SessionSnapshot]) {
+        if self.detail_mode != DetailMode::Batch {
+            return;
+        }
+        let Some(session) = sessions
+            .iter()
+            .find(|session| session.id == self.selected_id)
+        else {
+            return;
+        };
+        let batch_ids = session_batch_ids(session);
+        if batch_ids.len() < 2 {
+            return;
+        }
+        let current = self
+            .selected_batch_id
+            .and_then(|batch_id| {
+                batch_ids
+                    .iter()
+                    .position(|candidate| *candidate == batch_id)
+            })
+            .unwrap_or(batch_ids.len() - 1);
+        let next = current.saturating_sub(1);
+        self.selected_batch_id = Some(batch_ids[next]);
+        self.status_message = format!("inspecting batch b{}", batch_ids[next]);
+    }
+
+    fn select_next_batch(&mut self, sessions: &[SessionSnapshot]) {
+        if self.detail_mode != DetailMode::Batch {
+            return;
+        }
+        let Some(session) = sessions
+            .iter()
+            .find(|session| session.id == self.selected_id)
+        else {
+            return;
+        };
+        let batch_ids = session_batch_ids(session);
+        if batch_ids.len() < 2 {
+            return;
+        }
+        let current = self
+            .selected_batch_id
+            .and_then(|batch_id| {
+                batch_ids
+                    .iter()
+                    .position(|candidate| *candidate == batch_id)
+            })
+            .unwrap_or(batch_ids.len() - 1);
+        let next = min(current + 1, batch_ids.len() - 1);
+        self.selected_batch_id = Some(batch_ids[next]);
+        self.status_message = format!("inspecting batch b{}", batch_ids[next]);
     }
 }
 
@@ -575,6 +842,43 @@ fn timeline_text(events: &[SessionEvent], width: usize, max_lines: usize) -> Tex
     Text::from(lines)
 }
 
+fn tail_batch_events(events: &[BatchEventSnapshot], max_events: usize) -> Vec<BatchEventSnapshot> {
+    if max_events == 0 {
+        return Vec::new();
+    }
+    let start = events.len().saturating_sub(max_events);
+    events[start..].to_vec()
+}
+
+fn batch_timeline_text(batch: &BatchSnapshot, width: usize, max_lines: usize) -> Text<'static> {
+    if batch.events.is_empty() || max_lines == 0 {
+        return Text::from(Line::from("No batch events yet."));
+    }
+
+    let max_session = width.saturating_sub(18).clamp(10, 18);
+    let max_body = width.saturating_sub(max_session + 8).max(12);
+    let lines = tail_batch_events(&batch.events, max_lines)
+        .into_iter()
+        .map(|event| {
+            Line::from(vec![
+                Span::styled(
+                    truncate(&event.session_title, max_session),
+                    Style::default().fg(Color::DarkGray),
+                ),
+                Span::raw(" "),
+                Span::styled(
+                    format!("[{}]", event_kind_label(&event.kind)),
+                    event_kind_style(&event.kind),
+                ),
+                Span::raw(" "),
+                Span::raw(truncate(&event.text, max_body)),
+            ])
+        })
+        .collect::<Vec<_>>();
+
+    Text::from(lines)
+}
+
 fn input_target_label(mode: &InputMode, session: &SessionSnapshot) -> String {
     match mode {
         InputMode::MasterPrompt => "master".to_owned(),
@@ -651,6 +955,26 @@ fn session_location_line(session: &SessionSnapshot) -> String {
             format!("task file: {}", truncate(task_file, 39))
         }
     }
+}
+
+fn batch_member_line(session: &BatchSessionSnapshot) -> String {
+    format!(
+        "{} [{}]",
+        truncate(&session.title, 28),
+        truncate(&session.status, 10)
+    )
+}
+
+fn session_batch_ids(session: &SessionSnapshot) -> Vec<u64> {
+    let mut batch_ids = Vec::new();
+    for event in &session.timeline_events {
+        if let Some(batch_id) = event.batch_id {
+            if !batch_ids.contains(&batch_id) {
+                batch_ids.push(batch_id);
+            }
+        }
+    }
+    batch_ids
 }
 
 fn event_kind_label(kind: &SessionEventKind) -> &'static str {

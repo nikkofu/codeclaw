@@ -14,6 +14,7 @@ Implemented now:
 - a structured right-pane timeline for session supervision
 - batch-scoped CLI waiting for the orchestration chain initiated by the active prompt
 - persisted `session_history` and `batches` metadata inside `.codeclaw/state.json`
+- a dedicated batch inspection mode in the TUI, built from persisted batch history
 - session recovery using `thread/resume`
 
 Not implemented yet:
@@ -114,6 +115,7 @@ Rust is the best fit because it gives:
 
 1. `codeclaw tui`
    - renders the left session list and right active view
+   - can switch the right pane between session supervision and orchestration-batch supervision
    - handles keyboard shortcuts, filtering, session focus, and attach/detach
 
 2. `master adapter`

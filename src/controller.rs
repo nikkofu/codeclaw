@@ -45,6 +45,34 @@ pub struct DoctorReport {
     pub thread_start_ok: bool,
 }
 
+#[derive(Debug, Clone)]
+pub struct BatchSessionSnapshot {
+    pub id: String,
+    pub title: String,
+    pub status: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct BatchEventSnapshot {
+    pub session_title: String,
+    pub kind: SessionEventKind,
+    pub text: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct BatchSnapshot {
+    pub id: u64,
+    pub root_session_id: String,
+    pub root_session_title: String,
+    pub root_prompt: String,
+    pub status: String,
+    pub created_at: u64,
+    pub updated_at: u64,
+    pub sessions: Vec<BatchSessionSnapshot>,
+    pub last_event: Option<String>,
+    pub events: Vec<BatchEventSnapshot>,
+}
+
 #[derive(Debug, Deserialize)]
 struct ThreadStartResponse {
     thread: ThreadSummary,
@@ -334,6 +362,89 @@ impl Controller {
     pub fn list_workers(&self) -> Vec<WorkerRecord> {
         let state = self.state.lock().expect("state lock poisoned");
         state.workers.values().cloned().collect()
+    }
+
+    pub fn batch_snapshot(&self, batch_id: u64) -> Option<BatchSnapshot> {
+        let (record, events) = {
+            let state = self.state.lock().expect("state lock poisoned");
+            let record = state.batches.get(&batch_id).cloned()?;
+            let mut events = state
+                .session_history
+                .iter()
+                .flat_map(|(session_id, session_events)| {
+                    session_events
+                        .iter()
+                        .filter(move |event| event.batch_id == Some(batch_id))
+                        .cloned()
+                        .map(move |event| (session_id.clone(), event))
+                })
+                .collect::<Vec<_>>();
+            events.sort_by(|left, right| {
+                left.1
+                    .ts
+                    .cmp(&right.1.ts)
+                    .then_with(|| left.0.cmp(&right.0))
+                    .then_with(|| left.1.text.cmp(&right.1.text))
+            });
+            (record, events)
+        };
+
+        let session_meta = {
+            let sessions = self.sessions.lock().expect("sessions lock poisoned");
+            record
+                .sessions
+                .iter()
+                .map(|session_id| {
+                    let snapshot = sessions.get(session_id).map(SessionView::snapshot);
+                    BatchSessionSnapshot {
+                        id: session_id.clone(),
+                        title: snapshot
+                            .as_ref()
+                            .map(|session| session.title.clone())
+                            .unwrap_or_else(|| session_id.clone()),
+                        status: snapshot
+                            .as_ref()
+                            .map(|session| session.status.clone())
+                            .unwrap_or_else(|| "unknown".to_owned()),
+                    }
+                })
+                .collect::<Vec<_>>()
+        };
+
+        let root_session_title = session_meta
+            .iter()
+            .find(|session| session.id == record.root_session_id)
+            .map(|session| session.title.clone())
+            .unwrap_or_else(|| record.root_session_id.clone());
+
+        let events = events
+            .into_iter()
+            .map(|(session_id, event)| {
+                let session_title = session_meta
+                    .iter()
+                    .find(|session| session.id == session_id)
+                    .map(|session| session.title.clone())
+                    .unwrap_or_else(|| session_id.clone());
+                BatchEventSnapshot {
+                    session_title,
+                    kind: event.kind,
+                    text: event.text,
+                }
+            })
+            .collect::<Vec<_>>();
+
+        Some(BatchSnapshot {
+            id: record.id,
+            root_session_id: record.root_session_id,
+            root_session_title,
+            root_prompt: record.root_prompt,
+            status: batch_status_text(&record.status).to_owned(),
+            created_at: record.created_at,
+            updated_at: record.updated_at,
+            sessions: session_meta,
+            last_event: record.last_event,
+            events,
+        })
     }
 
     pub async fn ensure_master_thread(&self) -> Result<String> {
@@ -1884,6 +1995,14 @@ fn worker_status_for(state: &str) -> WorkerStatus {
         "failed" => WorkerStatus::Failed,
         "running" | "queued" | "active" | "inProgress" => WorkerStatus::Running,
         _ => WorkerStatus::Idle,
+    }
+}
+
+fn batch_status_text(status: &BatchStatus) -> &'static str {
+    match status {
+        BatchStatus::Running => "running",
+        BatchStatus::Completed => "completed",
+        BatchStatus::Failed => "failed",
     }
 }
 
