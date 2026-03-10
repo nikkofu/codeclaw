@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.9.0 - 2026-03-10
+
+- added `codeclaw inspect --session ...` and `codeclaw inspect --batch ...` for terminal-side supervision without launching the TUI
+- reused persisted session and batch snapshots so CLI inspection reflects the same orchestration state shown in the UI
+- formatted recent timeline and output slices into readable command-line summaries for faster operator checks
+
 ## 0.8.0 - 2026-03-10
 
 - added explicit worker lifecycle states including `spawn_requested`, `bootstrapping`, `bootstrapped`, `blocked`, and `handed_back`

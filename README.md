@@ -36,6 +36,8 @@ cargo run -- doctor
 cargo run -- up
 cargo run -- spawn --group backend --task "Payment API refactor"
 cargo run -- send --to master "Plan the next backend refactor step."
+cargo run -- inspect --session master --events 8 --output 6
+cargo run -- inspect --batch 3 --events 12
 cargo run -- list
 ```
 
@@ -102,6 +104,12 @@ The master session is now instructed to append a machine-readable orchestration 
 When a worker finishes or fails, CodeClaw also pushes a runtime update back into the master session. If the master is busy, the update is queued and processed afterward.
 
 Recent session timeline history and orchestration batch metadata are now persisted into `.codeclaw/state.json`, so the TUI can reconstruct supervision history from earlier CLI-driven runs.
+
+The CLI can now inspect the same supervision data without opening the TUI:
+
+- `codeclaw inspect --session master` prints one session's status, summary, recent timeline slice, and recent output slice
+- `codeclaw inspect --batch 3` prints one batch's root prompt, participating sessions, and recent aggregated events
+- `--events` and `--output` tune how much recent history is printed
 
 ## Requirements
 

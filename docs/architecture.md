@@ -18,6 +18,7 @@ Implemented now:
 - color/animation-based task-state cues in the TUI for faster operator scanning
 - right-pane focus filters and colorized live-output rendering for faster supervision triage
 - explicit worker lifecycle states covering spawn request, bootstrap, blocker, and handoff phases
+- CLI inspection commands backed by the same persisted session and batch supervision data
 - session recovery using `thread/resume`
 
 Not implemented yet:

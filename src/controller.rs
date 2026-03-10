@@ -368,6 +368,11 @@ impl Controller {
         snapshots
     }
 
+    pub fn session_snapshot(&self, session_id: &str) -> Option<SessionSnapshot> {
+        let sessions = self.sessions.lock().expect("sessions lock poisoned");
+        sessions.get(session_id).map(SessionView::snapshot)
+    }
+
     pub fn list_workers(&self) -> Vec<WorkerRecord> {
         let state = self.state.lock().expect("state lock poisoned");
         state.workers.values().cloned().collect()
