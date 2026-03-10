@@ -1047,7 +1047,12 @@ fn animated_status_badge(status: &str, tick: u64) -> String {
     match status {
         "completed" => "[OK]".to_owned(),
         "failed" => "[!!]".to_owned(),
+        "spawn_requested" => "[RQ]".to_owned(),
+        "bootstrapped" => "[UP]".to_owned(),
+        "blocked" => "[BL]".to_owned(),
+        "handed_back" => "[HB]".to_owned(),
         "queued" => format!("[{}]", queue_glyph(tick)),
+        "bootstrapping" => format!("[{}]", spinner_glyph(tick)),
         "running" | "active" | "inProgress" => format!("[{}]", spinner_glyph(tick)),
         _ => "[--]".to_owned(),
     }
@@ -1057,6 +1062,11 @@ fn status_caption(status: &str, tick: u64) -> String {
     match status {
         "completed" => "completed".to_owned(),
         "failed" => "failed".to_owned(),
+        "spawn_requested" => format!("spawn req {}", queue_glyph(tick)),
+        "bootstrapping" => format!("bootstrapping {}", spinner_glyph(tick)),
+        "bootstrapped" => "bootstrapped".to_owned(),
+        "blocked" => "blocked".to_owned(),
+        "handed_back" => "handed back".to_owned(),
         "queued" => format!("queued {}", queue_glyph(tick)),
         "running" | "active" | "inProgress" => format!("running {}", spinner_glyph(tick)),
         "idle" => "idle".to_owned(),
@@ -1081,6 +1091,11 @@ fn status_secondary_style(status: &str) -> Style {
     Style::default().fg(match status {
         "completed" => Color::Rgb(124, 218, 146),
         "failed" => Color::Rgb(255, 133, 133),
+        "spawn_requested" => Color::Rgb(201, 182, 255),
+        "bootstrapping" => Color::Rgb(144, 235, 231),
+        "bootstrapped" => Color::Rgb(136, 226, 197),
+        "blocked" => Color::Rgb(255, 195, 120),
+        "handed_back" => Color::Rgb(160, 222, 255),
         "queued" => Color::Rgb(129, 173, 255),
         "running" | "active" | "inProgress" => Color::Rgb(255, 217, 102),
         _ => Color::DarkGray,
@@ -1092,6 +1107,29 @@ fn status_color(status: &str, tick: u64) -> Color {
     match status {
         "completed" => Color::Rgb(76, 201, 126),
         "failed" => Color::Rgb(232, 93, 93),
+        "spawn_requested" => {
+            if pulse {
+                Color::Rgb(182, 153, 255)
+            } else {
+                Color::Rgb(154, 123, 235)
+            }
+        }
+        "bootstrapping" => {
+            if pulse {
+                Color::Rgb(92, 219, 215)
+            } else {
+                Color::Rgb(67, 194, 190)
+            }
+        }
+        "bootstrapped" => Color::Rgb(90, 210, 184),
+        "blocked" => {
+            if pulse {
+                Color::Rgb(255, 176, 94)
+            } else {
+                Color::Rgb(232, 150, 63)
+            }
+        }
+        "handed_back" => Color::Rgb(111, 203, 255),
         "queued" => {
             if pulse {
                 Color::Rgb(108, 142, 255)
@@ -1124,6 +1162,11 @@ fn activity_glyph(status: &str, tick: u64) -> &'static str {
     match status {
         "completed" => "+",
         "failed" => "x",
+        "spawn_requested" => "+",
+        "bootstrapping" => spinner_glyph(tick),
+        "bootstrapped" => "^",
+        "blocked" => "!",
+        "handed_back" => "<",
         "queued" => queue_glyph(tick),
         "running" | "active" | "inProgress" => spinner_glyph(tick),
         _ => "-",
@@ -1131,7 +1174,10 @@ fn activity_glyph(status: &str, tick: u64) -> &'static str {
 }
 
 fn is_busy_status(status: &str) -> bool {
-    matches!(status, "queued" | "running" | "active" | "inProgress")
+    matches!(
+        status,
+        "spawn_requested" | "bootstrapping" | "queued" | "running" | "active" | "inProgress"
+    )
 }
 
 fn session_accent_color(session: &SessionSnapshot) -> Color {
@@ -1167,7 +1213,17 @@ fn session_kind_badge(session: &SessionSnapshot) -> &'static str {
 fn animated_border_color(status: &str, accent: Color, tick: u64) -> Color {
     if matches!(
         status,
-        "failed" | "completed" | "queued" | "running" | "active" | "inProgress"
+        "failed"
+            | "completed"
+            | "spawn_requested"
+            | "bootstrapping"
+            | "bootstrapped"
+            | "blocked"
+            | "handed_back"
+            | "queued"
+            | "running"
+            | "active"
+            | "inProgress"
     ) {
         status_color(status, tick)
     } else {
@@ -1178,15 +1234,31 @@ fn animated_border_color(status: &str, accent: Color, tick: u64) -> Color {
 fn panel_border_style(status: &str, accent: Color, tick: u64) -> Style {
     Style::default()
         .fg(animated_border_color(status, accent, tick))
-        .add_modifier(if matches!(status, "running" | "active" | "inProgress") {
-            Modifier::BOLD
-        } else {
-            Modifier::empty()
-        })
+        .add_modifier(
+            if matches!(
+                status,
+                "bootstrapping" | "running" | "active" | "inProgress" | "blocked"
+            ) {
+                Modifier::BOLD
+            } else {
+                Modifier::empty()
+            },
+        )
 }
 
 fn secondary_panel_border_style(accent: Color, status: &str, tick: u64) -> Style {
-    let color = if matches!(status, "running" | "active" | "inProgress" | "queued") {
+    let color = if matches!(
+        status,
+        "spawn_requested"
+            | "bootstrapping"
+            | "running"
+            | "active"
+            | "inProgress"
+            | "queued"
+            | "blocked"
+            | "handed_back"
+            | "bootstrapped"
+    ) {
         animated_border_color(status, accent, tick)
     } else {
         accent
@@ -1208,6 +1280,29 @@ fn status_bar_style(status: &str, accent: Color, tick: u64) -> Style {
     let bg = match status {
         "completed" => Color::Rgb(20, 58, 35),
         "failed" => Color::Rgb(72, 25, 25),
+        "spawn_requested" => {
+            if (tick / 3) % 2 == 0 {
+                Color::Rgb(49, 33, 83)
+            } else {
+                Color::Rgb(42, 28, 70)
+            }
+        }
+        "bootstrapping" => {
+            if (tick / 3) % 2 == 0 {
+                Color::Rgb(18, 68, 71)
+            } else {
+                Color::Rgb(15, 57, 60)
+            }
+        }
+        "bootstrapped" => Color::Rgb(16, 63, 53),
+        "blocked" => {
+            if (tick / 3) % 2 == 0 {
+                Color::Rgb(84, 50, 10)
+            } else {
+                Color::Rgb(73, 43, 8)
+            }
+        }
+        "handed_back" => Color::Rgb(18, 52, 74),
         "queued" => {
             if (tick / 3) % 2 == 0 {
                 Color::Rgb(24, 40, 82)
@@ -1250,6 +1345,11 @@ fn timeline_status_hint(status: &str) -> &'static str {
     match status {
         "failed" => "faults highlighted",
         "completed" => "settled",
+        "spawn_requested" => "launching worker",
+        "bootstrapping" => "initializing worker",
+        "bootstrapped" => "initial handoff ready",
+        "blocked" => "attention needed",
+        "handed_back" => "returned to master",
         "queued" => "dispatch queued",
         "running" | "active" | "inProgress" => "live orchestration",
         _ => "recent events",
@@ -1260,6 +1360,11 @@ fn live_output_hint(status: &str) -> &'static str {
     match status {
         "failed" => "check latest errors",
         "completed" => "final transcript",
+        "spawn_requested" => "preparing worker thread",
+        "bootstrapping" => "bootstrap stream",
+        "bootstrapped" => "bootstrap complete",
+        "blocked" => "review blocker details",
+        "handed_back" => "ready for next dispatch",
         "queued" => "awaiting worker turn",
         "running" | "active" | "inProgress" => "streaming",
         _ => "latest stream",

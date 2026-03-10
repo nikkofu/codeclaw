@@ -255,6 +255,15 @@ impl TurnSource {
             }
         }
     }
+
+    fn runtime_label(&self) -> &'static str {
+        match self {
+            Self::User => "user_prompt",
+            Self::Bootstrap => "bootstrap",
+            Self::Orchestrator => "orchestrator_follow_up",
+            Self::Runtime => "runtime",
+        }
+    }
 }
 
 struct QueuedTurn {
@@ -736,24 +745,15 @@ impl Controller {
         )
         .with_context(|| format!("failed to write {}", task_file.display()))?;
 
-        let response = self
-            .start_thread(
-                &thread_name,
-                Some(worker_instructions(group, task, &task_file)),
-                Some(&thread_name),
-                false,
-            )
-            .await?;
-
         let now = now_unix_ts();
-        let record = WorkerRecord {
+        let mut record = WorkerRecord {
             id: worker_id.clone(),
             group: group.to_owned(),
             task: task.to_owned(),
             summary: summary.clone(),
             task_file: task_file.display().to_string(),
-            thread_id: response.thread.id,
-            status: WorkerStatus::Idle,
+            thread_id: "pending".to_owned(),
+            status: WorkerStatus::SpawnRequested,
             created_at: now,
             updated_at: now,
             last_turn_id: None,
@@ -767,6 +767,12 @@ impl Controller {
         self.save_state()?;
         self.write_worker_status(&record)?;
         self.upsert_worker_session(&record);
+        self.write_role_status(
+            &SessionRole::Worker(record.id.clone()),
+            "spawn_requested",
+            None,
+            None,
+        )?;
         self.append_log_line(
             &record.id,
             format!("system> worker created from {}", record.task_file),
@@ -774,7 +780,7 @@ impl Controller {
         self.append_session_event(
             &record.id,
             SessionEventKind::System,
-            format!("worker registered from {}", record.task_file),
+            format!("spawn requested from {}", record.task_file),
             Some(batch_id),
         )?;
         if let Some(summary) = summary {
@@ -787,6 +793,57 @@ impl Controller {
                 Some(batch_id),
             )?;
         }
+
+        let response = match self
+            .start_thread(
+                &thread_name,
+                Some(worker_instructions(group, task, &task_file)),
+                Some(&thread_name),
+                false,
+            )
+            .await
+        {
+            Ok(response) => response,
+            Err(error) => {
+                self.append_log_line(
+                    &record.id,
+                    format!("error> failed to start worker: {error}"),
+                )?;
+                self.append_session_event(
+                    &record.id,
+                    SessionEventKind::Error,
+                    format!("worker spawn failed: {error}"),
+                    Some(batch_id),
+                )?;
+                self.write_role_status(
+                    &SessionRole::Worker(record.id.clone()),
+                    "failed",
+                    None,
+                    Some(compact_message(&error.to_string())),
+                )?;
+                return Err(error);
+            }
+        };
+
+        self.update_worker_thread(&record.id, response.thread.id.clone())?;
+        record.thread_id = response.thread.id;
+        record.status = WorkerStatus::Bootstrapping;
+        self.write_role_status(
+            &SessionRole::Worker(record.id.clone()),
+            "bootstrapping",
+            None,
+            None,
+        )?;
+        self.append_log_line(
+            &record.id,
+            format!("system> worker thread started: {}", record.thread_id),
+        )?;
+        self.append_session_event(
+            &record.id,
+            SessionEventKind::System,
+            format!("worker thread ready: {}", record.thread_id),
+            Some(batch_id),
+        )?;
 
         let bootstrap_prompt = prompt.unwrap_or_else(|| worker_bootstrap_prompt(&record));
         if wait_for_bootstrap {
@@ -814,7 +871,12 @@ impl Controller {
             )?;
         }
 
-        Ok(record)
+        let latest = {
+            let state = self.state.lock().expect("state lock poisoned");
+            state.workers.get(&record.id).cloned().unwrap_or(record)
+        };
+
+        Ok(latest)
     }
 
     async fn resolve_prompt_target(
@@ -864,10 +926,11 @@ impl Controller {
         log_label: String,
         prompt: String,
         role: SessionRole,
+        source: TurnSource,
         wait_for_follow_on: bool,
     ) -> Result<()> {
         let mut receiver = self.client.subscribe();
-        self.write_role_status(&role, "running", None, None)?;
+        self.write_role_status(&role, active_state_for_turn(&role, &source), None, None)?;
         let model_prompt = self.prepare_prompt_for_role(&prompt, &role);
 
         let response: TurnStartResponse = self
@@ -890,7 +953,12 @@ impl Controller {
 
         let turn_id = response.turn.id.clone();
         self.set_session_last_turn_id(&session_id, Some(turn_id.clone()))?;
-        self.write_role_status(&role, "running", Some(turn_id.clone()), None)?;
+        self.write_role_status(
+            &role,
+            active_state_for_turn(&role, &source),
+            Some(turn_id.clone()),
+            None,
+        )?;
 
         let mut streamed_delta = false;
         let mut assistant_text = String::new();
@@ -974,14 +1042,20 @@ impl Controller {
                         serde_json::from_value(notification.params)?;
                     if event.thread_id == thread_id {
                         let status = thread_state_text(&event.status);
-                        self.set_session_status(&session_id, &status)?;
+                        if let Some(mapped) = inflight_runtime_state(&status, &role, &source) {
+                            self.set_session_status(&session_id, mapped)?;
+                        }
                     }
                 }
                 "turn/started" => {
                     let event: TurnStartedNotification =
                         serde_json::from_value(notification.params)?;
                     if event.thread_id == thread_id && event.turn.id == turn_id {
-                        self.set_session_status(&session_id, &event.turn.status)?;
+                        let _ = &event.turn.status;
+                        self.set_session_status(
+                            &session_id,
+                            active_state_for_turn(&role, &source),
+                        )?;
                     }
                 }
                 "error" => {
@@ -1028,8 +1102,10 @@ impl Controller {
                                 Some(error.message.clone()),
                             )?;
                             if let SessionRole::Worker(worker_id) = &role {
-                                self.publish_worker_runtime_update(worker_id, "failed", batch_id)
-                                    .await?;
+                                self.publish_worker_runtime_update(
+                                    worker_id, "failed", batch_id, &source,
+                                )
+                                .await?;
                             }
                             return Err(anyhow!(error.message));
                         }
@@ -1063,15 +1139,18 @@ impl Controller {
                             }
                         }
 
+                        let next_state = completed_state_for_turn(&role, &source, &assistant_text);
                         self.write_role_status(
                             &role,
-                            "completed",
+                            next_state,
                             Some(turn_id.clone()),
                             last_message,
                         )?;
                         if let SessionRole::Worker(worker_id) = &role {
-                            self.publish_worker_runtime_update(worker_id, "completed", batch_id)
-                                .await?;
+                            self.publish_worker_runtime_update(
+                                worker_id, next_state, batch_id, &source,
+                            )
+                            .await?;
                         }
                         return Ok(());
                     }
@@ -1258,9 +1337,13 @@ impl Controller {
             Some(turn.batch_id),
         )?;
         self.set_active_turn_batch(&turn.session_id, turn.batch_id)?;
-        self.set_session_status(&turn.session_id, "queued")?;
+        self.set_session_status(
+            &turn.session_id,
+            queued_state_for_turn(&turn.role, &turn.source),
+        )?;
 
         let controller = self.clone();
+        let source = turn.source.clone();
         tokio::spawn(async move {
             let result = controller
                 .process_turn(
@@ -1270,6 +1353,7 @@ impl Controller {
                     turn.log_label,
                     turn.prompt,
                     turn.role,
+                    source,
                     turn.wait_for_follow_on,
                 )
                 .await;
@@ -1491,6 +1575,27 @@ impl Controller {
         Ok(())
     }
 
+    fn update_worker_thread(&self, worker_id: &str, thread_id: String) -> Result<()> {
+        let worker = {
+            let mut persisted = self.state.lock().expect("state lock poisoned");
+            let worker = persisted
+                .workers
+                .get_mut(worker_id)
+                .with_context(|| format!("unknown worker `{worker_id}`"))?;
+            worker.thread_id = thread_id.clone();
+            worker.updated_at = now_unix_ts();
+            worker.clone()
+        };
+        self.save_state()?;
+        {
+            let mut sessions = self.sessions.lock().expect("sessions lock poisoned");
+            if let Some(session) = sessions.get_mut(worker_id) {
+                session.set_thread_id(thread_id);
+            }
+        }
+        self.write_worker_status(&worker)
+    }
+
     fn touch_batch(&self, batch_id: u64, session_id: &str, event_text: Option<&str>) -> Result<()> {
         {
             let mut state = self.state.lock().expect("state lock poisoned");
@@ -1710,6 +1815,7 @@ impl Controller {
         worker_id: &str,
         worker_state: &str,
         batch_id: u64,
+        source: &TurnSource,
     ) -> Result<()> {
         let worker = {
             let state = self.state.lock().expect("state lock poisoned");
@@ -1724,11 +1830,15 @@ impl Controller {
         self.append_session_event(
             MASTER_SESSION_ID,
             SessionEventKind::Runtime,
-            format!("worker {worker_id} reported {worker_state}"),
+            format!(
+                "worker {worker_id} reported {worker_state} ({})",
+                source.runtime_label()
+            ),
             Some(batch_id),
         )?;
         let prompt = format!(
-            "CodeClaw runtime update. This is an internal worker status event, not a direct human message.\n\nWorker id: {worker_id}\nState: {worker_state}\nGroup: {}\nTask: {}\nSidebar summary: {}\nLast worker message: {}\n\nUpdate the operator with a concise coordination response and include the required <codeclaw-actions> block. If no follow-up is needed, return an empty actions list.",
+            "CodeClaw runtime update. This is an internal worker status event, not a direct human message.\n\nWorker id: {worker_id}\nLifecycle state: {worker_state}\nOrigin: {}\nGroup: {}\nTask: {}\nSidebar summary: {}\nLast worker message: {}\n\nInterpret lifecycle states as follows:\n- bootstrapped: the worker completed its initial bootstrap turn and is ready for supervision\n- handed_back: the worker finished a follow-up turn and returned control to the master\n- blocked: the worker reported a blocker and likely needs intervention\n- failed: the worker turn failed unexpectedly\n\nUpdate the operator with a concise coordination response and include the required <codeclaw-actions> block. If no follow-up is needed, return an empty actions list.",
+            source.runtime_label(),
             worker.group,
             worker.task,
             worker
@@ -1755,7 +1865,7 @@ impl Controller {
 
     fn master_instructions(&self) -> String {
         format!(
-            "You are the master controller for CodeClaw in {}. Coordinate work across workers, keep plans concise, and prefer actionable task splits.\n\nYou may receive direct human prompts and internal runtime updates about worker completions or failures. Treat runtime updates as scheduler inputs: absorb the worker result, update summaries when useful, and dispatch follow-up actions only when they are actually needed.\n\nWhen you respond, append exactly one machine-readable block at the end using this format:\n<codeclaw-actions>\n{{\"summary\":\"short orchestration summary\",\"actions\":[...]}}\n</codeclaw-actions>\n\nAllowed actions:\n- {{\"type\":\"spawn_worker\",\"group\":\"backend|frontend|infra\",\"task\":\"short task title\",\"summary\":\"optional short sidebar summary\",\"prompt\":\"optional initial worker prompt\"}}\n- {{\"type\":\"send_worker_prompt\",\"worker_id\":\"existing-worker-id\",\"prompt\":\"follow-up instructions\"}}\n- {{\"type\":\"update_worker_summary\",\"worker_id\":\"existing-worker-id\",\"summary\":\"new short summary\"}}\n\nRules:\n- Always include the block, even when no actions are needed.\n- Keep `summary` short enough to fit a sidebar.\n- Use worker ids exactly as shown in the UI when referencing existing workers.",
+            "You are the master controller for CodeClaw in {}. Coordinate work across workers, keep plans concise, and prefer actionable task splits.\n\nYou may receive direct human prompts and internal runtime updates about worker lifecycle changes. Treat runtime updates as scheduler inputs: absorb the worker result, update summaries when useful, and dispatch follow-up actions only when they are actually needed.\n\nImportant lifecycle meanings:\n- bootstrapped: the worker completed its initial bootstrap turn\n- handed_back: the worker completed a later turn and returned control\n- blocked: the worker reported a blocker and likely needs intervention\n- failed: the worker turn failed unexpectedly\n\nWhen you respond, append exactly one machine-readable block at the end using this format:\n<codeclaw-actions>\n{{\"summary\":\"short orchestration summary\",\"actions\":[...]}}\n</codeclaw-actions>\n\nAllowed actions:\n- {{\"type\":\"spawn_worker\",\"group\":\"backend|frontend|infra\",\"task\":\"short task title\",\"summary\":\"optional short sidebar summary\",\"prompt\":\"optional initial worker prompt\"}}\n- {{\"type\":\"send_worker_prompt\",\"worker_id\":\"existing-worker-id\",\"prompt\":\"follow-up instructions\"}}\n- {{\"type\":\"update_worker_summary\",\"worker_id\":\"existing-worker-id\",\"summary\":\"new short summary\"}}\n\nRules:\n- Always include the block, even when no actions are needed.\n- Keep `summary` short enough to fit a sidebar.\n- Use worker ids exactly as shown in the UI when referencing existing workers.",
             self.workspace_root.display()
         )
     }
@@ -1991,11 +2101,79 @@ fn thread_state_text(value: &Value) -> String {
 
 fn worker_status_for(state: &str) -> WorkerStatus {
     match state {
+        "spawn_requested" => WorkerStatus::SpawnRequested,
+        "bootstrapping" => WorkerStatus::Bootstrapping,
+        "bootstrapped" => WorkerStatus::Bootstrapped,
+        "blocked" => WorkerStatus::Blocked,
+        "handed_back" => WorkerStatus::HandedBack,
         "completed" => WorkerStatus::Completed,
         "failed" => WorkerStatus::Failed,
         "running" | "queued" | "active" | "inProgress" => WorkerStatus::Running,
         _ => WorkerStatus::Idle,
     }
+}
+
+fn queued_state_for_turn(role: &SessionRole, source: &TurnSource) -> &'static str {
+    match (role, source) {
+        (SessionRole::Worker(_), TurnSource::Bootstrap) => "bootstrapping",
+        _ => "queued",
+    }
+}
+
+fn active_state_for_turn(role: &SessionRole, source: &TurnSource) -> &'static str {
+    match (role, source) {
+        (SessionRole::Worker(_), TurnSource::Bootstrap) => "bootstrapping",
+        _ => "running",
+    }
+}
+
+fn inflight_runtime_state<'a>(
+    raw_state: &'a str,
+    role: &SessionRole,
+    source: &TurnSource,
+) -> Option<&'a str> {
+    match raw_state {
+        "queued" => Some(queued_state_for_turn(role, source)),
+        "running" | "active" | "inProgress" => Some(active_state_for_turn(role, source)),
+        "failed" => Some("failed"),
+        _ => None,
+    }
+}
+
+fn completed_state_for_turn(
+    role: &SessionRole,
+    source: &TurnSource,
+    assistant_text: &str,
+) -> &'static str {
+    match role {
+        SessionRole::Master => "completed",
+        SessionRole::Worker(_) => {
+            if worker_message_indicates_blocker(assistant_text) {
+                "blocked"
+            } else if matches!(source, TurnSource::Bootstrap) {
+                "bootstrapped"
+            } else {
+                "handed_back"
+            }
+        }
+    }
+}
+
+fn worker_message_indicates_blocker(message: &str) -> bool {
+    let normalized = message.to_ascii_lowercase();
+    [
+        "blocked",
+        "blocker",
+        "need approval",
+        "need input",
+        "need guidance",
+        "waiting on",
+        "cannot continue",
+        "can't continue",
+        "unable to continue",
+    ]
+    .iter()
+    .any(|needle| normalized.contains(needle))
 }
 
 fn batch_status_text(status: &BatchStatus) -> &'static str {
@@ -2071,4 +2249,74 @@ fn trim_persisted_events(events: &mut Vec<SessionEvent>) {
 
 fn map_broadcast_error(error: broadcast::error::RecvError) -> anyhow::Error {
     anyhow!("app-server notification channel error: {error}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        completed_state_for_turn, worker_message_indicates_blocker, worker_status_for, SessionRole,
+        TurnSource,
+    };
+    use crate::state::WorkerStatus;
+
+    #[test]
+    fn worker_status_maps_lifecycle_states() {
+        assert_eq!(
+            worker_status_for("spawn_requested"),
+            WorkerStatus::SpawnRequested
+        );
+        assert_eq!(
+            worker_status_for("bootstrapping"),
+            WorkerStatus::Bootstrapping
+        );
+        assert_eq!(
+            worker_status_for("bootstrapped"),
+            WorkerStatus::Bootstrapped
+        );
+        assert_eq!(worker_status_for("blocked"), WorkerStatus::Blocked);
+        assert_eq!(worker_status_for("handed_back"), WorkerStatus::HandedBack);
+    }
+
+    #[test]
+    fn blocker_detection_matches_common_worker_phrases() {
+        assert!(worker_message_indicates_blocker(
+            "Blocked: I need approval before I can continue."
+        ));
+        assert!(worker_message_indicates_blocker(
+            "I am waiting on input from the operator."
+        ));
+        assert!(!worker_message_indicates_blocker(
+            "Implemented the requested refactor and handed the result back."
+        ));
+    }
+
+    #[test]
+    fn completed_worker_turns_map_to_bootstrap_and_handoff_states() {
+        let worker_role = SessionRole::Worker("backend-001-test".to_owned());
+
+        assert_eq!(
+            completed_state_for_turn(
+                &worker_role,
+                &TurnSource::Bootstrap,
+                "Task finished cleanly."
+            ),
+            "bootstrapped"
+        );
+        assert_eq!(
+            completed_state_for_turn(
+                &worker_role,
+                &TurnSource::Orchestrator,
+                "Implemented and summarized."
+            ),
+            "handed_back"
+        );
+        assert_eq!(
+            completed_state_for_turn(
+                &worker_role,
+                &TurnSource::Orchestrator,
+                "Blocked on missing approval."
+            ),
+            "blocked"
+        );
+    }
 }

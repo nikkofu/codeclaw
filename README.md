@@ -25,6 +25,7 @@ This repository now includes a working Rust control-plane prototype with:
 - a dedicated batch inspection view in the TUI for replaying one orchestration chain across multiple sessions
 - color-coded and animated status cues across the sidebar, panels, status bar, and terminal title
 - right-pane focus filters and colorized log rendering for summary, command, and error inspection
+- explicit worker lifecycle supervision for spawn request, bootstrap, blocker, and handoff states
 - persisted master summary and last-message status across restarts
 
 ## Commands
@@ -83,6 +84,14 @@ The TUI now uses stronger visual supervision cues:
 - selected panel borders and the status bar shift color with the current task state
 - timeline rows and live-output lines are color-tagged by source so assistant text, commands, output, and errors read differently at a glance
 - the terminal window title also reflects live running state for the selected session
+
+Workers now surface explicit lifecycle states instead of collapsing everything into `completed`:
+
+- `spawn requested` while CodeClaw is creating and registering the worker
+- `bootstrapping` during the worker's initial task boot
+- `bootstrapped` once the first handoff is ready for the master
+- `blocked` when the worker response indicates it cannot proceed without help
+- `handed back` when a later worker turn finishes and returns control to the master
 
 The master session is now instructed to append a machine-readable orchestration block at the end of its replies. CodeClaw parses that block and can automatically:
 

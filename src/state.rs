@@ -69,7 +69,12 @@ pub struct WorkerRecord {
 #[serde(rename_all = "snake_case")]
 pub enum WorkerStatus {
     Idle,
+    SpawnRequested,
+    Bootstrapping,
+    Bootstrapped,
     Running,
+    Blocked,
+    HandedBack,
     Completed,
     Failed,
 }
@@ -162,7 +167,12 @@ impl fmt::Display for WorkerStatus {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let value = match self {
             Self::Idle => "idle",
+            Self::SpawnRequested => "spawn_requested",
+            Self::Bootstrapping => "bootstrapping",
+            Self::Bootstrapped => "bootstrapped",
             Self::Running => "running",
+            Self::Blocked => "blocked",
+            Self::HandedBack => "handed_back",
             Self::Completed => "completed",
             Self::Failed => "failed",
         };
@@ -183,7 +193,7 @@ fn default_next_batch_id() -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{AppState, BatchStatus, OrchestrationBatchRecord};
+    use super::{AppState, BatchStatus, OrchestrationBatchRecord, WorkerStatus};
     use crate::session::{SessionEvent, SessionEventKind};
 
     #[test]
@@ -219,5 +229,22 @@ mod tests {
         assert_eq!(decoded.next_batch_id, 7);
         assert_eq!(decoded.session_history["master"][0].batch_id, Some(6));
         assert_eq!(decoded.batches[&6].status, BatchStatus::Completed);
+    }
+
+    #[test]
+    fn worker_status_round_trips_lifecycle_states() {
+        let statuses = [
+            WorkerStatus::SpawnRequested,
+            WorkerStatus::Bootstrapping,
+            WorkerStatus::Bootstrapped,
+            WorkerStatus::Blocked,
+            WorkerStatus::HandedBack,
+        ];
+
+        for status in statuses {
+            let raw = serde_json::to_string(&status).expect("status should encode");
+            let decoded: WorkerStatus = serde_json::from_str(&raw).expect("status should decode");
+            assert_eq!(decoded, status);
+        }
     }
 }

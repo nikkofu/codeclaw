@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.8.0 - 2026-03-10
+
+- added explicit worker lifecycle states including `spawn_requested`, `bootstrapping`, `bootstrapped`, `blocked`, and `handed_back`
+- surfaced lifecycle-aware worker supervision across persisted state, status files, runtime updates, and the TUI
+- detected common blocker phrases from worker replies so blocked workers stand out instead of looking merely completed
+- extended the master runtime prompt so orchestration decisions can react differently to bootstrap handoff, blocker, and failed-worker events
+
 ## 0.7.0 - 2026-03-09
 
 - added right-pane focus modes so `f` can cycle between all, summary, command, and error supervision views
