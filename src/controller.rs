@@ -10,8 +10,9 @@ use crate::{
         MAX_TIMELINE_EVENTS,
     },
     state::{
-        now_unix_ts, AppState, BatchStatus, JobPolicy, JobRecord, JobStatus,
-        OrchestrationBatchRecord, SessionStatus, WorkerRecord, WorkerStatus,
+        now_unix_ts, AppState, BatchStatus, JobPolicy, JobRecord, JobReportKind,
+        JobReportRecord, JobStatus, OrchestrationBatchRecord, SessionStatus, WorkerRecord,
+        WorkerStatus,
     },
 };
 use anyhow::{anyhow, Context, Result};
@@ -28,6 +29,8 @@ use std::{
 use tokio::sync::{broadcast, oneshot};
 
 const MASTER_SESSION_ID: &str = "master";
+const DEFAULT_REPORT_CADENCE_SECS: u64 = 900;
+const MAX_JOB_REPORTS_PER_JOB: usize = 32;
 
 #[derive(Clone)]
 pub struct Controller {
@@ -122,11 +125,24 @@ pub struct JobSnapshot {
     pub created_at: u64,
     pub updated_at: u64,
     pub latest_summary: Option<String>,
+    pub latest_report_at: Option<u64>,
+    pub next_report_due_at: Option<u64>,
     pub escalation_state: Option<String>,
     pub final_outcome: Option<String>,
     pub context: Option<String>,
     pub batch_ids: Vec<JobBatchSnapshot>,
     pub workers: Vec<JobWorkerSnapshot>,
+    pub reports: Vec<JobReportSnapshot>,
+}
+
+#[derive(Debug, Clone)]
+pub struct JobReportSnapshot {
+    pub id: u64,
+    pub kind: String,
+    pub status: String,
+    pub summary: String,
+    pub body: String,
+    pub created_at: u64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -478,6 +494,24 @@ impl Controller {
             .collect::<Vec<_>>();
         workers.sort_by(|left, right| left.id.cmp(&right.id));
 
+        let mut reports = state
+            .reports
+            .values()
+            .filter(|report| report.job_id == job.id)
+            .map(|report| JobReportSnapshot {
+                id: report.id,
+                kind: report.kind.to_string(),
+                status: report.job_status.to_string(),
+                summary: report.summary.clone(),
+                body: report.body.clone(),
+                created_at: report.created_at,
+            })
+            .collect::<Vec<_>>();
+        reports.sort_by(|left, right| left.id.cmp(&right.id));
+        if reports.len() > 12 {
+            reports.drain(0..reports.len() - 12);
+        }
+
         Some(JobSnapshot {
             id: job.id,
             status: job.status.to_string(),
@@ -491,11 +525,14 @@ impl Controller {
             created_at: job.created_at,
             updated_at: job.updated_at,
             latest_summary: job.latest_summary,
+            latest_report_at: job.latest_report_at,
+            next_report_due_at: job.next_report_due_at,
             escalation_state: job.escalation_state,
             final_outcome: job.final_outcome,
             context: job.context,
             batch_ids: batches,
             workers,
+            reports,
         })
     }
 
@@ -543,6 +580,12 @@ impl Controller {
         };
 
         self.save_state()?;
+        self.emit_job_report(
+            &job.id,
+            JobReportKind::Accepted,
+            format!("job accepted: {}", job.title),
+            render_job_report_body(&job, JobReportKind::Accepted, job.latest_summary.as_deref()),
+        )?;
         Ok(job)
     }
 
@@ -564,6 +607,7 @@ impl Controller {
             tick,
             900,
             dispatched_jobs,
+            Vec::new(),
             last_error,
         );
         snapshot.write(&self.service_file())
@@ -596,12 +640,14 @@ impl Controller {
         }
 
         self.reconcile_jobs()?;
+        let generated_reports = self.emit_due_job_reports()?;
         let snapshot = self.build_service_snapshot(
             ServiceLifecycle::Running,
             started_at,
             tick,
             stall_after_secs,
             dispatched_jobs,
+            generated_reports,
             None,
         );
         snapshot.write(&self.service_file())?;
@@ -2198,9 +2244,9 @@ impl Controller {
     }
 
     fn refresh_job_tracking(&self, job_id: &str, latest_summary: Option<String>) -> Result<()> {
-        {
+        let (previous_status, previous_summary, next_status, next_summary, report_job, changed) = {
             let mut state = self.state.lock().expect("state lock poisoned");
-            let (batch_ids, worker_ids, existing_summary) = {
+            let (batch_ids, worker_ids, existing_summary, previous_status, job_record) = {
                 let job = state
                     .jobs
                     .get(job_id)
@@ -2209,24 +2255,65 @@ impl Controller {
                     job.batch_ids.clone(),
                     job.worker_ids.clone(),
                     job.latest_summary.clone(),
+                    job.status.clone(),
+                    job.clone(),
                 )
             };
 
-            let status = derive_job_status_from_state(&state, &batch_ids, &worker_ids);
+            let next_status = derive_job_status_from_state(&state, &batch_ids, &worker_ids);
             let next_summary = latest_summary.or(existing_summary);
+            let changed = previous_status != next_status
+                || next_summary.as_deref().map(str::trim) != job_record.latest_summary.as_deref().map(str::trim);
+            let mut report_job = job_record.clone();
+            report_job.status = next_status.clone();
+            if next_summary.is_some() {
+                report_job.latest_summary = next_summary.clone();
+            }
             if let Some(job) = state.jobs.get_mut(job_id) {
-                job.status = status.clone();
-                job.updated_at = now_unix_ts();
+                job.status = next_status.clone();
+                if changed {
+                    job.updated_at = now_unix_ts();
+                }
                 if next_summary.is_some() {
                     job.latest_summary = next_summary.clone();
                 }
-                job.final_outcome = match status {
+                job.final_outcome = match next_status {
                     JobStatus::Completed | JobStatus::Failed => job.latest_summary.clone(),
                     _ => None,
                 };
             }
+            (
+                previous_status,
+                job_record.latest_summary.clone(),
+                next_status,
+                next_summary,
+                report_job,
+                changed,
+            )
+        };
+
+        if changed {
+            self.save_state()?;
         }
-        self.save_state()
+
+        if let Some(report_kind) = report_kind_for_job_update(
+            &previous_status,
+            previous_summary.as_deref(),
+            &next_status,
+            next_summary.as_deref(),
+        ) {
+            let report_summary = report_summary_for_job_update(
+                &report_job,
+                &report_kind,
+                next_summary.as_deref(),
+                &next_status,
+            );
+            let report_body =
+                render_job_report_body(&report_job, report_kind.clone(), next_summary.as_deref());
+            self.emit_job_report(job_id, report_kind, report_summary, report_body)?;
+        }
+
+        Ok(())
     }
 
     fn reconcile_jobs(&self) -> Result<()> {
@@ -2256,10 +2343,89 @@ impl Controller {
         jobs
     }
 
+    fn emit_due_job_reports(&self) -> Result<Vec<String>> {
+        let due_jobs = {
+            let state = self.state.lock().expect("state lock poisoned");
+            let now = now_unix_ts();
+            let mut jobs = state
+                .jobs
+                .values()
+                .filter(|job| {
+                    matches!(job.status, JobStatus::Running | JobStatus::Blocked)
+                        && job.next_report_due_at.is_some_and(|due_at| due_at <= now)
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            jobs.sort_by(|left, right| {
+                left.next_report_due_at
+                    .cmp(&right.next_report_due_at)
+                    .then_with(|| left.id.cmp(&right.id))
+            });
+            jobs
+        };
+
+        let mut emitted = Vec::new();
+        for job in due_jobs {
+            let summary = report_summary_for_job_update(
+                &job,
+                &JobReportKind::Digest,
+                job.latest_summary.as_deref(),
+                &job.status,
+            );
+            let body = render_job_report_body(&job, JobReportKind::Digest, job.latest_summary.as_deref());
+            let report = self.emit_job_report(&job.id, JobReportKind::Digest, summary, body)?;
+            emitted.push(format!("RPT-{:03}", report.id));
+        }
+
+        Ok(emitted)
+    }
+
     fn job_for_batch(&self, batch_id: u64) -> Option<JobRecord> {
         let state = self.state.lock().expect("state lock poisoned");
         let job_id = state.batches.get(&batch_id)?.job_id.clone()?;
         state.jobs.get(&job_id).cloned()
+    }
+
+    fn emit_job_report(
+        &self,
+        job_id: &str,
+        kind: JobReportKind,
+        summary: String,
+        body: String,
+    ) -> Result<JobReportRecord> {
+        let now = now_unix_ts();
+        let report = {
+            let mut state = self.state.lock().expect("state lock poisoned");
+            let (job_status, report_id) = {
+                let job = state
+                    .jobs
+                    .get(job_id)
+                    .with_context(|| format!("unknown job `{job_id}`"))?;
+                (job.status.clone(), state.next_report_number)
+            };
+            state.next_report_number += 1;
+            let report = JobReportRecord {
+                id: report_id,
+                job_id: job_id.to_owned(),
+                kind: kind.clone(),
+                job_status: job_status.clone(),
+                summary,
+                body,
+                created_at: now,
+            };
+            state.reports.insert(report_id, report.clone());
+            trim_reports_for_job(&mut state.reports, job_id);
+            if let Some(job) = state.jobs.get_mut(job_id) {
+                job.latest_report_at = Some(now);
+                job.next_report_due_at = match kind {
+                    JobReportKind::Completion | JobReportKind::Failure => None,
+                    _ => Some(now + DEFAULT_REPORT_CADENCE_SECS),
+                };
+            }
+            report
+        };
+        self.save_state()?;
+        Ok(report)
     }
 
     fn build_service_snapshot(
@@ -2269,6 +2435,7 @@ impl Controller {
         tick: u64,
         stall_after_secs: u64,
         dispatched_jobs: Vec<String>,
+        generated_reports: Vec<String>,
         last_error: Option<String>,
     ) -> ServiceSnapshot {
         let now = now_unix_ts();
@@ -2332,6 +2499,7 @@ impl Controller {
             stalled_jobs,
             running_workers,
             dispatched_jobs,
+            generated_reports,
             last_error,
         }
     }
@@ -2973,6 +3141,129 @@ fn format_job_context(job: &JobRecord) -> String {
     )
 }
 
+fn report_kind_for_job_update(
+    previous_status: &JobStatus,
+    previous_summary: Option<&str>,
+    next_status: &JobStatus,
+    next_summary: Option<&str>,
+) -> Option<JobReportKind> {
+    if previous_status != next_status {
+        return match next_status {
+            JobStatus::Pending => None,
+            JobStatus::Running => Some(JobReportKind::Progress),
+            JobStatus::Blocked => Some(JobReportKind::Blocker),
+            JobStatus::Completed => Some(JobReportKind::Completion),
+            JobStatus::Failed => Some(JobReportKind::Failure),
+        };
+    }
+
+    let previous_summary = previous_summary.map(str::trim).filter(|value| !value.is_empty());
+    let next_summary = next_summary.map(str::trim).filter(|value| !value.is_empty());
+    if previous_summary == next_summary {
+        return None;
+    }
+
+    match next_status {
+        JobStatus::Running => Some(JobReportKind::Progress),
+        JobStatus::Blocked => Some(JobReportKind::Blocker),
+        JobStatus::Completed => Some(JobReportKind::Completion),
+        JobStatus::Failed => Some(JobReportKind::Failure),
+        JobStatus::Pending => None,
+    }
+}
+
+fn report_summary_for_job_update(
+    job: &JobRecord,
+    kind: &JobReportKind,
+    summary: Option<&str>,
+    status: &JobStatus,
+) -> String {
+    let summary = summary
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| default_summary_for_job_status(status));
+    match kind {
+        JobReportKind::Accepted => format!("job accepted: {}", job.title),
+        JobReportKind::Progress => format!("progress: {summary}"),
+        JobReportKind::Blocker => format!("blocker: {summary}"),
+        JobReportKind::Completion => format!("completed: {summary}"),
+        JobReportKind::Failure => format!("failed: {summary}"),
+        JobReportKind::Digest => format!("digest: {summary}"),
+    }
+}
+
+fn render_job_report_body(
+    job: &JobRecord,
+    kind: JobReportKind,
+    summary: Option<&str>,
+) -> String {
+    let summary = summary
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| default_summary_for_job_status(&job.status));
+    let requester = job
+        .requester
+        .clone()
+        .unwrap_or_else(|| "unknown".to_owned());
+    let context = job.context.clone().unwrap_or_else(|| "none".to_owned());
+    let next_step = next_step_for_job_status(&job.status, &job.policy.approval_required);
+
+    format!(
+        "Job: {}\nKind: {}\nStatus: {}\nSummary: {}\nRequester: {}\nSource channel: {}\nPriority: {}\nPattern: {}\nApproval required: {}\nBatches: {}\nWorkers: {}\nContext: {}\nNext step: {}",
+        job.id,
+        kind,
+        job.status,
+        summary,
+        requester,
+        job.source_channel,
+        job.priority,
+        job.policy.pattern,
+        if job.policy.approval_required { "yes" } else { "no" },
+        job.batch_ids.len(),
+        job.worker_ids.len(),
+        context,
+        next_step
+    )
+}
+
+fn default_summary_for_job_status(status: &JobStatus) -> &'static str {
+    match status {
+        JobStatus::Pending => "job is pending intake",
+        JobStatus::Running => "job is running",
+        JobStatus::Blocked => "job is blocked",
+        JobStatus::Completed => "job completed successfully",
+        JobStatus::Failed => "job failed",
+    }
+}
+
+fn next_step_for_job_status(status: &JobStatus, approval_required: &bool) -> &'static str {
+    match status {
+        JobStatus::Pending => "awaiting service intake or operator dispatch",
+        JobStatus::Running if *approval_required => {
+            "continue execution, but keep risky actions behind approval gates"
+        }
+        JobStatus::Running => "continue execution and report major milestones",
+        JobStatus::Blocked => "operator attention is likely required to unblock work",
+        JobStatus::Completed => "deliver completion summary and close the job",
+        JobStatus::Failed => "inspect failure details and decide whether to retry or escalate",
+    }
+}
+
+fn trim_reports_for_job(reports: &mut BTreeMap<u64, JobReportRecord>, job_id: &str) {
+    let mut ids = reports
+        .iter()
+        .filter_map(|(report_id, report)| (report.job_id == job_id).then_some(*report_id))
+        .collect::<Vec<_>>();
+    if ids.len() <= MAX_JOB_REPORTS_PER_JOB {
+        return;
+    }
+    ids.sort_unstable();
+    let remove_count = ids.len().saturating_sub(MAX_JOB_REPORTS_PER_JOB);
+    for report_id in ids.into_iter().take(remove_count) {
+        reports.remove(&report_id);
+    }
+}
+
 fn service_job_intake_prompt(job: &JobRecord) -> String {
     let context = job
         .context
@@ -3131,12 +3422,13 @@ fn map_broadcast_error(error: broadcast::error::RecvError) -> anyhow::Error {
 mod tests {
     use super::{
         blocker_reason_from_message, completed_state_for_turn, derive_job_status_from_state,
-        lifecycle_note_for, service_job_intake_prompt, worker_message_indicates_blocker,
+        lifecycle_note_for, report_kind_for_job_update, report_summary_for_job_update,
+        render_job_report_body, service_job_intake_prompt, worker_message_indicates_blocker,
         worker_status_for, SessionRole, TurnSource,
     };
     use crate::state::{
-        AppState, BatchStatus, JobPolicy, JobRecord, JobStatus, OrchestrationBatchRecord,
-        WorkerStatus,
+        AppState, BatchStatus, JobPolicy, JobRecord, JobReportKind, JobStatus,
+        OrchestrationBatchRecord, WorkerStatus,
     };
 
     #[test]
@@ -3295,7 +3587,7 @@ mod tests {
 
     #[test]
     fn service_job_intake_prompt_carries_policy_context() {
-        let prompt = service_job_intake_prompt(&JobRecord {
+        let job = JobRecord {
             id: "JOB-001".to_owned(),
             source_channel: "cli".to_owned(),
             requester: Some("operator".to_owned()),
@@ -3317,11 +3609,61 @@ mod tests {
             next_report_due_at: None,
             escalation_state: None,
             final_outcome: None,
-        });
+        };
+        let prompt = service_job_intake_prompt(&job);
 
         assert!(prompt.contains("Payment API refactor"));
         assert!(prompt.contains("planner_executor_reviewer"));
         assert!(prompt.contains("Approval required: yes"));
         assert!(prompt.contains("Keep rollout low risk"));
+
+        assert_eq!(
+            report_kind_for_job_update(
+                &JobStatus::Pending,
+                Some("job created"),
+                &JobStatus::Running,
+                Some("worker assigned"),
+            ),
+            Some(JobReportKind::Progress)
+        );
+        assert_eq!(
+            report_kind_for_job_update(
+                &JobStatus::Running,
+                Some("worker assigned"),
+                &JobStatus::Running,
+                Some("implemented API changes"),
+            ),
+            Some(JobReportKind::Progress)
+        );
+        assert_eq!(
+            report_kind_for_job_update(
+                &JobStatus::Running,
+                Some("implemented API changes"),
+                &JobStatus::Blocked,
+                Some("waiting for approval"),
+            ),
+            Some(JobReportKind::Blocker)
+        );
+
+        let summary = report_summary_for_job_update(
+            &job,
+            &JobReportKind::Digest,
+            Some("implemented API changes"),
+            &JobStatus::Running,
+        );
+        assert_eq!(summary, "digest: implemented API changes");
+
+        let body = render_job_report_body(
+            &JobRecord {
+                status: JobStatus::Blocked,
+                latest_summary: Some("waiting for approval".to_owned()),
+                ..job
+            },
+            JobReportKind::Blocker,
+            Some("waiting for approval"),
+        );
+        assert!(body.contains("Kind: blocker"));
+        assert!(body.contains("Status: blocked"));
+        assert!(body.contains("Next step: operator attention is likely required"));
     }
 }

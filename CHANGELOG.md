@@ -8,6 +8,8 @@
 - added optional `--job` association for `send` and `spawn` so orchestration batches can be tracked under a named job
 - added `codeclaw serve` as a service-mode skeleton with scheduler ticks, persisted `service.json` heartbeat, and `inspect --service`
 - added service-side intake for pending jobs so background mode can submit new jobs into the master orchestration loop
+- added persisted job report history with accepted/progress/blocker/completion/failure/digest report kinds
+- extended `job inspect` and `inspect --service` so operators can see recent reports and report cadence state before any gateway integration
 
 ## 0.10.0 - 2026-03-12
 

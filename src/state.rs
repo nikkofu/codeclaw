@@ -20,9 +20,13 @@ pub struct AppState {
     pub next_batch_id: u64,
     #[serde(default = "default_next_job_number")]
     pub next_job_number: u64,
+    #[serde(default = "default_next_report_number")]
+    pub next_report_number: u64,
     pub next_task_number: u64,
     #[serde(default)]
     pub jobs: BTreeMap<String, JobRecord>,
+    #[serde(default)]
+    pub reports: BTreeMap<u64, JobReportRecord>,
     #[serde(default)]
     pub workers: BTreeMap<String, WorkerRecord>,
     #[serde(default)]
@@ -110,6 +114,28 @@ pub struct JobRecord {
     pub final_outcome: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum JobReportKind {
+    Accepted,
+    Progress,
+    Blocker,
+    Completion,
+    Failure,
+    Digest,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JobReportRecord {
+    pub id: u64,
+    pub job_id: String,
+    pub kind: JobReportKind,
+    pub job_status: JobStatus,
+    pub summary: String,
+    pub body: String,
+    pub created_at: u64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkerRecord {
     pub id: String,
@@ -169,8 +195,10 @@ impl Default for AppState {
             master_last_message: None,
             next_batch_id: default_next_batch_id(),
             next_job_number: default_next_job_number(),
+            next_report_number: default_next_report_number(),
             next_task_number: 1,
             jobs: BTreeMap::new(),
+            reports: BTreeMap::new(),
             workers: BTreeMap::new(),
             session_history: BTreeMap::new(),
             session_output: BTreeMap::new(),
@@ -258,6 +286,20 @@ impl fmt::Display for JobStatus {
     }
 }
 
+impl fmt::Display for JobReportKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let value = match self {
+            Self::Accepted => "accepted",
+            Self::Progress => "progress",
+            Self::Blocker => "blocker",
+            Self::Completion => "completion",
+            Self::Failure => "failure",
+            Self::Digest => "digest",
+        };
+        f.write_str(value)
+    }
+}
+
 impl fmt::Display for WorkerStatus {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let value = match self {
@@ -290,6 +332,10 @@ fn default_next_job_number() -> u64 {
     1
 }
 
+fn default_next_report_number() -> u64 {
+    1
+}
+
 fn default_job_priority() -> String {
     "normal".to_owned()
 }
@@ -301,16 +347,17 @@ fn default_job_pattern() -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        AppState, BatchStatus, JobPolicy, JobRecord, JobStatus, OrchestrationBatchRecord,
-        WorkerStatus,
+        AppState, BatchStatus, JobPolicy, JobRecord, JobReportKind, JobReportRecord, JobStatus,
+        OrchestrationBatchRecord, WorkerStatus,
     };
     use crate::session::{SessionEvent, SessionEventKind};
 
     #[test]
-    fn app_state_round_trips_jobs_workers_session_history_output_and_batches() {
+    fn app_state_round_trips_jobs_reports_workers_session_history_output_and_batches() {
         let mut state = AppState::default();
         state.next_batch_id = 7;
         state.next_job_number = 2;
+        state.next_report_number = 4;
         state.jobs.insert(
             "JOB-001".to_owned(),
             JobRecord {
@@ -335,6 +382,18 @@ mod tests {
                 next_report_due_at: Some(180),
                 escalation_state: Some("none".to_owned()),
                 final_outcome: None,
+            },
+        );
+        state.reports.insert(
+            3,
+            JobReportRecord {
+                id: 3,
+                job_id: "JOB-001".to_owned(),
+                kind: JobReportKind::Progress,
+                job_status: JobStatus::Running,
+                summary: "Planner assigned backend worker".to_owned(),
+                body: "Job is running with one backend worker.".to_owned(),
+                created_at: 125,
             },
         );
         state.workers.insert(
@@ -390,11 +449,14 @@ mod tests {
 
         assert_eq!(decoded.next_batch_id, 7);
         assert_eq!(decoded.next_job_number, 2);
+        assert_eq!(decoded.next_report_number, 4);
         assert_eq!(decoded.jobs["JOB-001"].status, JobStatus::Running);
         assert_eq!(
             decoded.jobs["JOB-001"].policy.pattern,
             "planner_executor_reviewer"
         );
+        assert_eq!(decoded.reports[&3].kind, JobReportKind::Progress);
+        assert_eq!(decoded.reports[&3].job_id, "JOB-001");
         assert_eq!(
             decoded.workers["backend-001"].job_id.as_deref(),
             Some("JOB-001")
@@ -441,6 +503,24 @@ mod tests {
             let raw = serde_json::to_string(&status).expect("status should encode");
             let decoded: JobStatus = serde_json::from_str(&raw).expect("status should decode");
             assert_eq!(decoded, status);
+        }
+    }
+
+    #[test]
+    fn job_report_kind_round_trips_lifecycle_kinds() {
+        let kinds = [
+            JobReportKind::Accepted,
+            JobReportKind::Progress,
+            JobReportKind::Blocker,
+            JobReportKind::Completion,
+            JobReportKind::Failure,
+            JobReportKind::Digest,
+        ];
+
+        for kind in kinds {
+            let raw = serde_json::to_string(&kind).expect("kind should encode");
+            let decoded: JobReportKind = serde_json::from_str(&raw).expect("kind should decode");
+            assert_eq!(decoded, kind);
         }
     }
 }

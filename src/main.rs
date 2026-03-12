@@ -744,6 +744,18 @@ fn print_job_snapshot(job: &JobSnapshot) {
         job.latest_summary.clone().unwrap_or_else(|| "-".to_owned())
     );
     println!(
+        "latest report: {}",
+        job.latest_report_at
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "-".to_owned())
+    );
+    println!(
+        "next report due: {}",
+        job.next_report_due_at
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "-".to_owned())
+    );
+    println!(
         "escalation state: {}",
         job.escalation_state
             .clone()
@@ -782,11 +794,25 @@ fn print_job_snapshot(job: &JobSnapshot) {
     if job.workers.is_empty() {
         println!("- no workers");
     }
+
+    println!();
+    println!("reports ({}):", job.reports.len());
+    for report in &job.reports {
+        println!(
+            "- RPT-{:03} [{}] [{}] {}",
+            report.id, report.kind, report.status, report.summary
+        );
+        println!("  created: {}", report.created_at);
+        println!("  body: {}", report.body);
+    }
+    if job.reports.is_empty() {
+        println!("- no reports");
+    }
 }
 
 fn print_service_tick(snapshot: &ServiceSnapshot) {
     println!(
-        "tick={} status={} pending={} running={} blocked={} completed={} failed={} workers={} dispatched={}",
+        "tick={} status={} pending={} running={} blocked={} completed={} failed={} workers={} dispatched={} reports={}",
         snapshot.tick,
         snapshot.status,
         snapshot.pending_jobs.len(),
@@ -799,6 +825,11 @@ fn print_service_tick(snapshot: &ServiceSnapshot) {
             "-".to_owned()
         } else {
             snapshot.dispatched_jobs.join(",")
+        },
+        if snapshot.generated_reports.is_empty() {
+            "-".to_owned()
+        } else {
+            snapshot.generated_reports.join(",")
         }
     );
 }
@@ -829,6 +860,7 @@ fn print_service_snapshot(snapshot: &ServiceSnapshot) {
     print_named_ids("stalled jobs", &snapshot.stalled_jobs);
     print_named_ids("running workers", &snapshot.running_workers);
     print_named_ids("last dispatched jobs", &snapshot.dispatched_jobs);
+    print_named_ids("last generated reports", &snapshot.generated_reports);
 }
 
 fn print_named_ids(label: &str, ids: &[String]) {

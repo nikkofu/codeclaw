@@ -49,6 +49,8 @@ pub struct ServiceSnapshot {
     #[serde(default)]
     pub dispatched_jobs: Vec<String>,
     #[serde(default)]
+    pub generated_reports: Vec<String>,
+    #[serde(default)]
     pub last_error: Option<String>,
 }
 
@@ -98,6 +100,7 @@ mod tests {
             stalled_jobs: vec!["JOB-004".to_owned()],
             running_workers: vec!["backend-001".to_owned()],
             dispatched_jobs: vec!["JOB-001".to_owned()],
+            generated_reports: vec!["RPT-001".to_owned()],
             last_error: None,
         };
 
@@ -108,6 +111,7 @@ mod tests {
         assert_eq!(decoded.status, ServiceLifecycle::Running);
         assert_eq!(decoded.pending_jobs, vec!["JOB-001"]);
         assert_eq!(decoded.running_workers, vec!["backend-001"]);
+        assert_eq!(decoded.generated_reports, vec!["RPT-001"]);
         assert_eq!(decoded.tick, 3);
     }
 }
