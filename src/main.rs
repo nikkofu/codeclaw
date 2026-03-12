@@ -808,11 +808,45 @@ fn print_job_snapshot(job: &JobSnapshot) {
     if job.reports.is_empty() {
         println!("- no reports");
     }
+
+    println!();
+    println!("subscriptions ({}):", job.subscriptions.len());
+    for subscription in &job.subscriptions {
+        println!(
+            "- SUB-{:03} [{}] {}",
+            subscription.id, subscription.channel, subscription.target
+        );
+    }
+    if job.subscriptions.is_empty() {
+        println!("- no subscriptions");
+    }
+
+    println!();
+    println!("deliveries ({}):", job.deliveries.len());
+    for delivery in &job.deliveries {
+        println!(
+            "- DLY-{:03} -> RPT-{:03} [{}:{}] [{}] attempts={} updated={}",
+            delivery.id,
+            delivery.report_id,
+            delivery.channel,
+            delivery.target,
+            delivery.status,
+            delivery.attempts,
+            delivery.updated_at
+        );
+        println!(
+            "  last error: {}",
+            delivery.last_error.clone().unwrap_or_else(|| "-".to_owned())
+        );
+    }
+    if job.deliveries.is_empty() {
+        println!("- no deliveries");
+    }
 }
 
 fn print_service_tick(snapshot: &ServiceSnapshot) {
     println!(
-        "tick={} status={} pending={} running={} blocked={} completed={} failed={} workers={} dispatched={} reports={}",
+        "tick={} status={} pending={} running={} blocked={} completed={} failed={} workers={} dispatched={} reports={} queued_deliveries={} delivered={}",
         snapshot.tick,
         snapshot.status,
         snapshot.pending_jobs.len(),
@@ -830,6 +864,12 @@ fn print_service_tick(snapshot: &ServiceSnapshot) {
             "-".to_owned()
         } else {
             snapshot.generated_reports.join(",")
+        },
+        snapshot.queued_deliveries.len(),
+        if snapshot.delivered_notifications.is_empty() {
+            "-".to_owned()
+        } else {
+            snapshot.delivered_notifications.join(" | ")
         }
     );
 }
@@ -861,6 +901,8 @@ fn print_service_snapshot(snapshot: &ServiceSnapshot) {
     print_named_ids("running workers", &snapshot.running_workers);
     print_named_ids("last dispatched jobs", &snapshot.dispatched_jobs);
     print_named_ids("last generated reports", &snapshot.generated_reports);
+    print_named_ids("queued deliveries", &snapshot.queued_deliveries);
+    print_named_ids("last delivered notifications", &snapshot.delivered_notifications);
 }
 
 fn print_named_ids(label: &str, ids: &[String]) {

@@ -22,11 +22,19 @@ pub struct AppState {
     pub next_job_number: u64,
     #[serde(default = "default_next_report_number")]
     pub next_report_number: u64,
+    #[serde(default = "default_next_report_subscription_number")]
+    pub next_report_subscription_number: u64,
+    #[serde(default = "default_next_report_delivery_number")]
+    pub next_report_delivery_number: u64,
     pub next_task_number: u64,
     #[serde(default)]
     pub jobs: BTreeMap<String, JobRecord>,
     #[serde(default)]
     pub reports: BTreeMap<u64, JobReportRecord>,
+    #[serde(default)]
+    pub report_subscriptions: BTreeMap<u64, ReportSubscriptionRecord>,
+    #[serde(default)]
+    pub report_deliveries: BTreeMap<u64, ReportDeliveryRecord>,
     #[serde(default)]
     pub workers: BTreeMap<String, WorkerRecord>,
     #[serde(default)]
@@ -136,6 +144,51 @@ pub struct JobReportRecord {
     pub created_at: u64,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ReportChannel {
+    Console,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReportSubscriptionRecord {
+    pub id: u64,
+    pub job_id: String,
+    pub channel: ReportChannel,
+    pub target: String,
+    pub notify_on_accepted: bool,
+    pub notify_on_progress: bool,
+    pub notify_on_blocker: bool,
+    pub notify_on_completion: bool,
+    pub notify_on_failure: bool,
+    pub notify_on_digest: bool,
+    pub created_at: u64,
+    pub updated_at: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ReportDeliveryStatus {
+    Queued,
+    Delivered,
+    Failed,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReportDeliveryRecord {
+    pub id: u64,
+    pub report_id: u64,
+    pub job_id: String,
+    pub channel: ReportChannel,
+    pub target: String,
+    pub status: ReportDeliveryStatus,
+    pub attempts: u32,
+    pub created_at: u64,
+    pub updated_at: u64,
+    #[serde(default)]
+    pub last_error: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkerRecord {
     pub id: String,
@@ -196,9 +249,13 @@ impl Default for AppState {
             next_batch_id: default_next_batch_id(),
             next_job_number: default_next_job_number(),
             next_report_number: default_next_report_number(),
+            next_report_subscription_number: default_next_report_subscription_number(),
+            next_report_delivery_number: default_next_report_delivery_number(),
             next_task_number: 1,
             jobs: BTreeMap::new(),
             reports: BTreeMap::new(),
+            report_subscriptions: BTreeMap::new(),
+            report_deliveries: BTreeMap::new(),
             workers: BTreeMap::new(),
             session_history: BTreeMap::new(),
             session_output: BTreeMap::new(),
@@ -300,6 +357,26 @@ impl fmt::Display for JobReportKind {
     }
 }
 
+impl fmt::Display for ReportChannel {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let value = match self {
+            Self::Console => "console",
+        };
+        f.write_str(value)
+    }
+}
+
+impl fmt::Display for ReportDeliveryStatus {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let value = match self {
+            Self::Queued => "queued",
+            Self::Delivered => "delivered",
+            Self::Failed => "failed",
+        };
+        f.write_str(value)
+    }
+}
+
 impl fmt::Display for WorkerStatus {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let value = match self {
@@ -336,6 +413,14 @@ fn default_next_report_number() -> u64 {
     1
 }
 
+fn default_next_report_subscription_number() -> u64 {
+    1
+}
+
+fn default_next_report_delivery_number() -> u64 {
+    1
+}
+
 fn default_job_priority() -> String {
     "normal".to_owned()
 }
@@ -347,8 +432,9 @@ fn default_job_pattern() -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        AppState, BatchStatus, JobPolicy, JobRecord, JobReportKind, JobReportRecord, JobStatus,
-        OrchestrationBatchRecord, WorkerStatus,
+        AppState, BatchStatus, JobPolicy, JobRecord, JobReportKind, JobReportRecord,
+        JobStatus, OrchestrationBatchRecord, ReportChannel, ReportDeliveryRecord,
+        ReportDeliveryStatus, ReportSubscriptionRecord, WorkerStatus,
     };
     use crate::session::{SessionEvent, SessionEventKind};
 
@@ -358,6 +444,8 @@ mod tests {
         state.next_batch_id = 7;
         state.next_job_number = 2;
         state.next_report_number = 4;
+        state.next_report_subscription_number = 2;
+        state.next_report_delivery_number = 3;
         state.jobs.insert(
             "JOB-001".to_owned(),
             JobRecord {
@@ -394,6 +482,38 @@ mod tests {
                 summary: "Planner assigned backend worker".to_owned(),
                 body: "Job is running with one backend worker.".to_owned(),
                 created_at: 125,
+            },
+        );
+        state.report_subscriptions.insert(
+            1,
+            ReportSubscriptionRecord {
+                id: 1,
+                job_id: "JOB-001".to_owned(),
+                channel: ReportChannel::Console,
+                target: "stdout".to_owned(),
+                notify_on_accepted: true,
+                notify_on_progress: true,
+                notify_on_blocker: true,
+                notify_on_completion: true,
+                notify_on_failure: true,
+                notify_on_digest: true,
+                created_at: 119,
+                updated_at: 119,
+            },
+        );
+        state.report_deliveries.insert(
+            2,
+            ReportDeliveryRecord {
+                id: 2,
+                report_id: 3,
+                job_id: "JOB-001".to_owned(),
+                channel: ReportChannel::Console,
+                target: "stdout".to_owned(),
+                status: ReportDeliveryStatus::Delivered,
+                attempts: 1,
+                created_at: 125,
+                updated_at: 126,
+                last_error: None,
             },
         );
         state.workers.insert(
@@ -450,6 +570,8 @@ mod tests {
         assert_eq!(decoded.next_batch_id, 7);
         assert_eq!(decoded.next_job_number, 2);
         assert_eq!(decoded.next_report_number, 4);
+        assert_eq!(decoded.next_report_subscription_number, 2);
+        assert_eq!(decoded.next_report_delivery_number, 3);
         assert_eq!(decoded.jobs["JOB-001"].status, JobStatus::Running);
         assert_eq!(
             decoded.jobs["JOB-001"].policy.pattern,
@@ -457,6 +579,11 @@ mod tests {
         );
         assert_eq!(decoded.reports[&3].kind, JobReportKind::Progress);
         assert_eq!(decoded.reports[&3].job_id, "JOB-001");
+        assert_eq!(decoded.report_subscriptions[&1].channel, ReportChannel::Console);
+        assert_eq!(
+            decoded.report_deliveries[&2].status,
+            ReportDeliveryStatus::Delivered
+        );
         assert_eq!(
             decoded.workers["backend-001"].job_id.as_deref(),
             Some("JOB-001")
@@ -521,6 +648,22 @@ mod tests {
             let raw = serde_json::to_string(&kind).expect("kind should encode");
             let decoded: JobReportKind = serde_json::from_str(&raw).expect("kind should decode");
             assert_eq!(decoded, kind);
+        }
+    }
+
+    #[test]
+    fn report_delivery_status_round_trips_lifecycle_states() {
+        let statuses = [
+            ReportDeliveryStatus::Queued,
+            ReportDeliveryStatus::Delivered,
+            ReportDeliveryStatus::Failed,
+        ];
+
+        for status in statuses {
+            let raw = serde_json::to_string(&status).expect("status should encode");
+            let decoded: ReportDeliveryStatus =
+                serde_json::from_str(&raw).expect("status should decode");
+            assert_eq!(decoded, status);
         }
     }
 }

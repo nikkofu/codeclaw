@@ -11,8 +11,9 @@ use crate::{
     },
     state::{
         now_unix_ts, AppState, BatchStatus, JobPolicy, JobRecord, JobReportKind,
-        JobReportRecord, JobStatus, OrchestrationBatchRecord, SessionStatus, WorkerRecord,
-        WorkerStatus,
+        JobReportRecord, JobStatus, OrchestrationBatchRecord, ReportChannel,
+        ReportDeliveryRecord, ReportDeliveryStatus, ReportSubscriptionRecord, SessionStatus,
+        WorkerRecord, WorkerStatus,
     },
 };
 use anyhow::{anyhow, Context, Result};
@@ -31,6 +32,7 @@ use tokio::sync::{broadcast, oneshot};
 const MASTER_SESSION_ID: &str = "master";
 const DEFAULT_REPORT_CADENCE_SECS: u64 = 900;
 const MAX_JOB_REPORTS_PER_JOB: usize = 32;
+const MAX_JOB_DELIVERIES_PER_JOB: usize = 64;
 
 #[derive(Clone)]
 pub struct Controller {
@@ -133,6 +135,8 @@ pub struct JobSnapshot {
     pub batch_ids: Vec<JobBatchSnapshot>,
     pub workers: Vec<JobWorkerSnapshot>,
     pub reports: Vec<JobReportSnapshot>,
+    pub subscriptions: Vec<JobSubscriptionSnapshot>,
+    pub deliveries: Vec<JobDeliverySnapshot>,
 }
 
 #[derive(Debug, Clone)]
@@ -143,6 +147,25 @@ pub struct JobReportSnapshot {
     pub summary: String,
     pub body: String,
     pub created_at: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct JobSubscriptionSnapshot {
+    pub id: u64,
+    pub channel: String,
+    pub target: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct JobDeliverySnapshot {
+    pub id: u64,
+    pub report_id: u64,
+    pub channel: String,
+    pub target: String,
+    pub status: String,
+    pub attempts: u32,
+    pub updated_at: u64,
+    pub last_error: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -512,6 +535,38 @@ impl Controller {
             reports.drain(0..reports.len() - 12);
         }
 
+        let mut subscriptions = state
+            .report_subscriptions
+            .values()
+            .filter(|subscription| subscription.job_id == job.id)
+            .map(|subscription| JobSubscriptionSnapshot {
+                id: subscription.id,
+                channel: subscription.channel.to_string(),
+                target: subscription.target.clone(),
+            })
+            .collect::<Vec<_>>();
+        subscriptions.sort_by(|left, right| left.id.cmp(&right.id));
+
+        let mut deliveries = state
+            .report_deliveries
+            .values()
+            .filter(|delivery| delivery.job_id == job.id)
+            .map(|delivery| JobDeliverySnapshot {
+                id: delivery.id,
+                report_id: delivery.report_id,
+                channel: delivery.channel.to_string(),
+                target: delivery.target.clone(),
+                status: delivery.status.to_string(),
+                attempts: delivery.attempts,
+                updated_at: delivery.updated_at,
+                last_error: delivery.last_error.clone(),
+            })
+            .collect::<Vec<_>>();
+        deliveries.sort_by(|left, right| left.id.cmp(&right.id));
+        if deliveries.len() > 12 {
+            deliveries.drain(0..deliveries.len() - 12);
+        }
+
         Some(JobSnapshot {
             id: job.id,
             status: job.status.to_string(),
@@ -533,6 +588,8 @@ impl Controller {
             batch_ids: batches,
             workers,
             reports,
+            subscriptions,
+            deliveries,
         })
     }
 
@@ -580,6 +637,7 @@ impl Controller {
         };
 
         self.save_state()?;
+        self.ensure_default_report_subscription(&job)?;
         self.emit_job_report(
             &job.id,
             JobReportKind::Accepted,
@@ -607,6 +665,7 @@ impl Controller {
             tick,
             900,
             dispatched_jobs,
+            Vec::new(),
             Vec::new(),
             last_error,
         );
@@ -641,6 +700,7 @@ impl Controller {
 
         self.reconcile_jobs()?;
         let generated_reports = self.emit_due_job_reports()?;
+        let delivered_notifications = self.deliver_queued_reports()?;
         let snapshot = self.build_service_snapshot(
             ServiceLifecycle::Running,
             started_at,
@@ -648,6 +708,7 @@ impl Controller {
             stall_after_secs,
             dispatched_jobs,
             generated_reports,
+            delivered_notifications,
             None,
         );
         snapshot.write(&self.service_file())?;
@@ -2380,6 +2441,40 @@ impl Controller {
         Ok(emitted)
     }
 
+    fn ensure_default_report_subscription(&self, job: &JobRecord) -> Result<()> {
+        let mut state = self.state.lock().expect("state lock poisoned");
+        if state
+            .report_subscriptions
+            .values()
+            .any(|subscription| subscription.job_id == job.id)
+        {
+            return Ok(());
+        }
+
+        let subscription_id = state.next_report_subscription_number;
+        state.next_report_subscription_number += 1;
+        let now = now_unix_ts();
+        state.report_subscriptions.insert(
+            subscription_id,
+            ReportSubscriptionRecord {
+                id: subscription_id,
+                job_id: job.id.clone(),
+                channel: ReportChannel::Console,
+                target: "stdout".to_owned(),
+                notify_on_accepted: true,
+                notify_on_progress: true,
+                notify_on_blocker: true,
+                notify_on_completion: true,
+                notify_on_failure: true,
+                notify_on_digest: true,
+                created_at: now,
+                updated_at: now,
+            },
+        );
+        drop(state);
+        self.save_state()
+    }
+
     fn job_for_batch(&self, batch_id: u64) -> Option<JobRecord> {
         let state = self.state.lock().expect("state lock poisoned");
         let job_id = state.batches.get(&batch_id)?.job_id.clone()?;
@@ -2394,7 +2489,7 @@ impl Controller {
         body: String,
     ) -> Result<JobReportRecord> {
         let now = now_unix_ts();
-        let report = {
+        let (report, subscriptions) = {
             let mut state = self.state.lock().expect("state lock poisoned");
             let (job_status, report_id) = {
                 let job = state
@@ -2415,6 +2510,15 @@ impl Controller {
             };
             state.reports.insert(report_id, report.clone());
             trim_reports_for_job(&mut state.reports, job_id);
+            let subscriptions = state
+                .report_subscriptions
+                .values()
+                .filter(|subscription| {
+                    subscription.job_id == job_id
+                        && subscription_accepts_report_kind(subscription, &kind)
+                })
+                .cloned()
+                .collect::<Vec<_>>();
             if let Some(job) = state.jobs.get_mut(job_id) {
                 job.latest_report_at = Some(now);
                 job.next_report_due_at = match kind {
@@ -2422,10 +2526,102 @@ impl Controller {
                     _ => Some(now + DEFAULT_REPORT_CADENCE_SECS),
                 };
             }
-            report
+            (report, subscriptions)
         };
+        self.enqueue_report_deliveries(&report, &subscriptions)?;
         self.save_state()?;
         Ok(report)
+    }
+
+    fn enqueue_report_deliveries(
+        &self,
+        report: &JobReportRecord,
+        subscriptions: &[ReportSubscriptionRecord],
+    ) -> Result<()> {
+        if subscriptions.is_empty() {
+            return Ok(());
+        }
+
+        let mut state = self.state.lock().expect("state lock poisoned");
+        let now = now_unix_ts();
+        for subscription in subscriptions {
+            let delivery_id = state.next_report_delivery_number;
+            state.next_report_delivery_number += 1;
+            state.report_deliveries.insert(
+                delivery_id,
+                ReportDeliveryRecord {
+                    id: delivery_id,
+                    report_id: report.id,
+                    job_id: report.job_id.clone(),
+                    channel: subscription.channel.clone(),
+                    target: subscription.target.clone(),
+                    status: ReportDeliveryStatus::Queued,
+                    attempts: 0,
+                    created_at: now,
+                    updated_at: now,
+                    last_error: None,
+                },
+            );
+        }
+        trim_deliveries_for_job(&mut state.report_deliveries, &report.job_id);
+        drop(state);
+        self.save_state()
+    }
+
+    fn deliver_queued_reports(&self) -> Result<Vec<String>> {
+        let delivery_ids = {
+            let state = self.state.lock().expect("state lock poisoned");
+            let mut delivery_ids = state
+                .report_deliveries
+                .values()
+                .filter(|delivery| {
+                    matches!(delivery.status, ReportDeliveryStatus::Queued)
+                        && matches!(delivery.channel, ReportChannel::Console)
+                })
+                .map(|delivery| delivery.id)
+                .collect::<Vec<_>>();
+            delivery_ids.sort_unstable();
+            delivery_ids
+        };
+
+        let mut delivered_messages = Vec::new();
+        for delivery_id in delivery_ids {
+            let message = {
+                let mut state = self.state.lock().expect("state lock poisoned");
+                let Some(report_id) = state
+                    .report_deliveries
+                    .get(&delivery_id)
+                    .map(|delivery| delivery.report_id)
+                else {
+                    continue;
+                };
+                let Some(report) = state.reports.get(&report_id).cloned() else {
+                    let Some(delivery) = state.report_deliveries.get_mut(&delivery_id) else {
+                        continue;
+                    };
+                    delivery.status = ReportDeliveryStatus::Failed;
+                    delivery.updated_at = now_unix_ts();
+                    delivery.attempts += 1;
+                    delivery.last_error = Some("missing report".to_owned());
+                    continue;
+                };
+                let Some(delivery) = state.report_deliveries.get_mut(&delivery_id) else {
+                    continue;
+                };
+
+                delivery.status = ReportDeliveryStatus::Delivered;
+                delivery.updated_at = now_unix_ts();
+                delivery.attempts += 1;
+                delivery.last_error = None;
+                format_report_delivery_message(&report, delivery)
+            };
+            delivered_messages.push(message);
+        }
+
+        if !delivered_messages.is_empty() {
+            self.save_state()?;
+        }
+        Ok(delivered_messages)
     }
 
     fn build_service_snapshot(
@@ -2436,6 +2632,7 @@ impl Controller {
         stall_after_secs: u64,
         dispatched_jobs: Vec<String>,
         generated_reports: Vec<String>,
+        delivered_notifications: Vec<String>,
         last_error: Option<String>,
     ) -> ServiceSnapshot {
         let now = now_unix_ts();
@@ -2448,6 +2645,12 @@ impl Controller {
         let mut completed_jobs = Vec::new();
         let mut failed_jobs = Vec::new();
         let mut stalled_jobs = Vec::new();
+        let mut queued_deliveries = state
+            .report_deliveries
+            .values()
+            .filter(|delivery| matches!(delivery.status, ReportDeliveryStatus::Queued))
+            .map(|delivery| format!("DLY-{:03}", delivery.id))
+            .collect::<Vec<_>>();
 
         for job in state.jobs.values() {
             match job.status {
@@ -2483,6 +2686,7 @@ impl Controller {
         failed_jobs.sort();
         stalled_jobs.sort();
         running_workers.sort();
+        queued_deliveries.sort();
 
         ServiceSnapshot {
             status: lifecycle,
@@ -2500,6 +2704,8 @@ impl Controller {
             running_workers,
             dispatched_jobs,
             generated_reports,
+            queued_deliveries,
+            delivered_notifications,
             last_error,
         }
     }
@@ -3262,6 +3468,49 @@ fn trim_reports_for_job(reports: &mut BTreeMap<u64, JobReportRecord>, job_id: &s
     for report_id in ids.into_iter().take(remove_count) {
         reports.remove(&report_id);
     }
+}
+
+fn trim_deliveries_for_job(deliveries: &mut BTreeMap<u64, ReportDeliveryRecord>, job_id: &str) {
+    let mut ids = deliveries
+        .iter()
+        .filter_map(|(delivery_id, delivery)| (delivery.job_id == job_id).then_some(*delivery_id))
+        .collect::<Vec<_>>();
+    if ids.len() <= MAX_JOB_DELIVERIES_PER_JOB {
+        return;
+    }
+    ids.sort_unstable();
+    let remove_count = ids.len().saturating_sub(MAX_JOB_DELIVERIES_PER_JOB);
+    for delivery_id in ids.into_iter().take(remove_count) {
+        deliveries.remove(&delivery_id);
+    }
+}
+
+fn subscription_accepts_report_kind(
+    subscription: &ReportSubscriptionRecord,
+    kind: &JobReportKind,
+) -> bool {
+    match kind {
+        JobReportKind::Accepted => subscription.notify_on_accepted,
+        JobReportKind::Progress => subscription.notify_on_progress,
+        JobReportKind::Blocker => subscription.notify_on_blocker,
+        JobReportKind::Completion => subscription.notify_on_completion,
+        JobReportKind::Failure => subscription.notify_on_failure,
+        JobReportKind::Digest => subscription.notify_on_digest,
+    }
+}
+
+fn format_report_delivery_message(
+    report: &JobReportRecord,
+    delivery: &ReportDeliveryRecord,
+) -> String {
+    format!(
+        "[{}:{}] {} [{}] {}",
+        delivery.channel,
+        delivery.target,
+        report.job_id,
+        report.kind,
+        report.summary
+    )
 }
 
 fn service_job_intake_prompt(job: &JobRecord) -> String {

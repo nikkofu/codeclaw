@@ -10,6 +10,8 @@
 - added service-side intake for pending jobs so background mode can submit new jobs into the master orchestration loop
 - added persisted job report history with accepted/progress/blocker/completion/failure/digest report kinds
 - extended `job inspect` and `inspect --service` so operators can see recent reports and report cadence state before any gateway integration
+- added a channel-neutral report delivery outbox with per-job subscriptions and delivery records
+- added a first console delivery path in `serve` so queued reports can be proactively emitted without introducing a real IM adapter yet
 
 ## 0.10.0 - 2026-03-12
 

@@ -51,6 +51,10 @@ pub struct ServiceSnapshot {
     #[serde(default)]
     pub generated_reports: Vec<String>,
     #[serde(default)]
+    pub queued_deliveries: Vec<String>,
+    #[serde(default)]
+    pub delivered_notifications: Vec<String>,
+    #[serde(default)]
     pub last_error: Option<String>,
 }
 
@@ -101,6 +105,8 @@ mod tests {
             running_workers: vec!["backend-001".to_owned()],
             dispatched_jobs: vec!["JOB-001".to_owned()],
             generated_reports: vec!["RPT-001".to_owned()],
+            queued_deliveries: vec!["DLY-002".to_owned()],
+            delivered_notifications: vec!["report delivered".to_owned()],
             last_error: None,
         };
 
@@ -112,6 +118,8 @@ mod tests {
         assert_eq!(decoded.pending_jobs, vec!["JOB-001"]);
         assert_eq!(decoded.running_workers, vec!["backend-001"]);
         assert_eq!(decoded.generated_reports, vec!["RPT-001"]);
+        assert_eq!(decoded.queued_deliveries, vec!["DLY-002"]);
+        assert_eq!(decoded.delivered_notifications, vec!["report delivered"]);
         assert_eq!(decoded.tick, 3);
     }
 }

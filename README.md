@@ -38,6 +38,7 @@ This repository now includes a working Rust control-plane prototype with:
 - batch-scoped CLI waiting so `send --to master` only waits for the orchestration it triggered
 - a durable `Job` model above batches and workers, with CLI create/list/inspect flows
 - persisted job report history for accepted, progress, blocker, completion, failure, and digest events
+- a channel-neutral report delivery outbox with per-job subscriptions and delivery records
 - persisted session timeline and orchestration batch history across process restarts
 - persisted rolling live-output tail, including in-flight assistant text, across process restarts
 - a dedicated batch inspection view in the TUI for replaying one orchestration chain across multiple sessions
@@ -147,7 +148,7 @@ Jobs now provide a top-level operating object above batches and workers:
 
 - `codeclaw job create` creates a durable pending job with orchestration policy metadata
 - `codeclaw jobs` lists known jobs with status, batch count, worker count, and pattern
-- `codeclaw job inspect JOB-001` shows the current job summary, report cadence fields, linked batches/workers, and recent reports
+- `codeclaw job inspect JOB-001` shows the current job summary, report cadence fields, linked batches/workers, recent reports, subscriptions, and delivery history
 - `codeclaw send --job ...` and `codeclaw spawn --job ...` attach new work to an existing job
 
 The new `serve` command is the first service-mode skeleton for long-running orchestration:
@@ -155,6 +156,7 @@ The new `serve` command is the first service-mode skeleton for long-running orch
 - `codeclaw serve` runs scheduler ticks without opening the TUI
 - pending jobs with no batches are automatically submitted to the master session for planning
 - due running/blocked jobs now emit persisted digest reports on the service loop cadence
+- queued report deliveries now flow through a channel-neutral outbox and are emitted through a first `console/stdout` delivery path
 - the latest service heartbeat is persisted to `.codeclaw/service.json` so CLI inspection and future gateways can observe background state
 
 ## Requirements
@@ -171,6 +173,7 @@ The new `serve` command is the first service-mode skeleton for long-running orch
 - `master.reasoning_effort` defaults to `high` so CodeClaw can override incompatible global Codex defaults when launching `codex app-server`
 - persisted supervision data currently lives in `.codeclaw/state.json` under `jobs`, `workers`, `session_history`, `session_output`, `session_live_buffers`, and `batches`
 - persisted job reports currently live in `.codeclaw/state.json` under `reports`
+- persisted report delivery subscriptions and outbox records currently live in `.codeclaw/state.json` under `report_subscriptions` and `report_deliveries`
 - persisted service heartbeat currently lives in `.codeclaw/service.json`
 
 ## Known Gaps
