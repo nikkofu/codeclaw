@@ -10,7 +10,14 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use controller::{BatchSnapshot, Controller, PromptTarget};
 use session::{SessionEventKind, SessionKind, SessionSnapshot};
-use std::{env, path::PathBuf};
+use std::{
+    collections::BTreeSet,
+    env,
+    io::{self, Write},
+    path::PathBuf,
+    time::Duration,
+};
+use tokio::sync::watch;
 
 #[derive(Debug, Parser)]
 #[command(name = "codeclaw")]
@@ -110,7 +117,24 @@ async fn run_up(workspace_root: PathBuf) -> Result<()> {
 async fn run_spawn(workspace_root: PathBuf, group: &str, task: &str) -> Result<()> {
     let controller = Controller::start(workspace_root).await?;
     controller.init_workspace()?;
-    let worker = controller.spawn_worker_and_wait(group, task).await?;
+    let existing_workers = controller
+        .list_workers()
+        .into_iter()
+        .map(|worker| worker.id)
+        .collect::<BTreeSet<_>>();
+    eprintln!("spawning worker [{group}] {task}");
+    let (stop_tx, stop_rx) = watch::channel(false);
+    let progress = tokio::spawn(monitor_spawn_progress(
+        controller.clone(),
+        existing_workers,
+        group.to_owned(),
+        task.to_owned(),
+        stop_rx,
+    ));
+    let result = controller.spawn_worker_and_wait(group, task).await;
+    let _ = stop_tx.send(true);
+    let _ = progress.await;
+    let worker = result?;
     println!("worker: {}", worker.id);
     println!("thread: {}", worker.thread_id);
     println!("task file: {}", worker.task_file);
@@ -183,6 +207,146 @@ fn ok(value: bool) -> &'static str {
     }
 }
 
+async fn monitor_spawn_progress(
+    controller: Controller,
+    existing_workers: BTreeSet<String>,
+    group: String,
+    task: String,
+    mut stop_rx: watch::Receiver<bool>,
+) {
+    let mut tick = 0usize;
+    let mut worker_id: Option<String> = None;
+    let mut printed_log_lines = 0usize;
+    let mut last_status_line = String::new();
+    let mut last_status_len = 0usize;
+
+    loop {
+        if *stop_rx.borrow() {
+            break;
+        }
+
+        if worker_id.is_none() {
+            if let Some(worker) = controller
+                .list_workers()
+                .into_iter()
+                .filter(|worker| {
+                    !existing_workers.contains(&worker.id)
+                        && worker.group == group
+                        && worker.task == task
+                })
+                .max_by(|left, right| {
+                    left.created_at
+                        .cmp(&right.created_at)
+                        .then_with(|| left.id.cmp(&right.id))
+                })
+            {
+                worker_id = Some(worker.id.clone());
+                printed_log_lines = 0;
+                eprintln!("\nworker created: {}", worker.id);
+                eprintln!("task file: {}", worker.task_file);
+            }
+        }
+
+        let status_line = if let Some(worker_id) = worker_id.as_deref() {
+            if let Some(session) = controller.session_snapshot(worker_id) {
+                if session.log_lines.len() > printed_log_lines {
+                    clear_progress_line(&mut last_status_len);
+                    for line in session.log_lines.iter().skip(printed_log_lines) {
+                        eprintln!("  {line}");
+                    }
+                    printed_log_lines = session.log_lines.len();
+                }
+
+                let detail = cli_status_detail(&session);
+                format!(
+                    "{} {} [{}] {}",
+                    cli_spinner_frame(tick),
+                    worker_id,
+                    session.status,
+                    detail
+                )
+            } else {
+                format!(
+                    "{} {} [waiting] refreshing session state",
+                    cli_spinner_frame(tick),
+                    worker_id
+                )
+            }
+        } else {
+            format!(
+                "{} creating worker record for [{}] {}",
+                cli_spinner_frame(tick),
+                group,
+                task
+            )
+        };
+
+        if status_line != last_status_line {
+            render_progress_line(&status_line, &mut last_status_len);
+            last_status_line = status_line;
+        }
+        tick = tick.wrapping_add(1);
+
+        tokio::select! {
+            _ = tokio::time::sleep(Duration::from_millis(120)) => {}
+            changed = stop_rx.changed() => {
+                if changed.is_err() || *stop_rx.borrow() {
+                    break;
+                }
+            }
+        }
+    }
+
+    clear_progress_line(&mut last_status_len);
+}
+
+fn cli_spinner_frame(tick: usize) -> &'static str {
+    const FRAMES: [&str; 4] = ["|", "/", "-", "\\"];
+    FRAMES[tick % FRAMES.len()]
+}
+
+fn cli_status_detail(session: &SessionSnapshot) -> String {
+    truncate_cli(
+        &session
+            .lifecycle_note
+            .clone()
+            .or_else(|| session.last_message.clone())
+            .or_else(|| session.summary.clone())
+            .unwrap_or_else(|| "waiting for bootstrap".to_owned()),
+        72,
+    )
+}
+
+fn render_progress_line(line: &str, last_status_len: &mut usize) {
+    let mut stderr = io::stderr();
+    let padded = if line.len() < *last_status_len {
+        format!("{line}{}", " ".repeat(*last_status_len - line.len()))
+    } else {
+        line.to_owned()
+    };
+    let _ = write!(stderr, "\r{padded}");
+    let _ = stderr.flush();
+    *last_status_len = padded.len();
+}
+
+fn clear_progress_line(last_status_len: &mut usize) {
+    if *last_status_len == 0 {
+        return;
+    }
+    let mut stderr = io::stderr();
+    let _ = write!(stderr, "\r{}\r", " ".repeat(*last_status_len));
+    let _ = stderr.flush();
+    *last_status_len = 0;
+}
+
+fn truncate_cli(text: &str, max_len: usize) -> String {
+    if text.len() <= max_len {
+        return text.to_owned();
+    }
+    let keep = max_len.saturating_sub(3);
+    format!("{}...", &text[..keep])
+}
+
 fn print_session_snapshot(session: &SessionSnapshot, max_events: usize, max_output: usize) {
     println!("session: {}", session.id);
     println!("title: {}", session.title);
@@ -213,6 +377,13 @@ fn print_session_snapshot(session: &SessionSnapshot, max_events: usize, max_outp
     println!(
         "summary: {}",
         session.summary.clone().unwrap_or_else(|| "-".to_owned())
+    );
+    println!(
+        "lifecycle note: {}",
+        session
+            .lifecycle_note
+            .clone()
+            .unwrap_or_else(|| "-".to_owned())
     );
     println!(
         "last message: {}",

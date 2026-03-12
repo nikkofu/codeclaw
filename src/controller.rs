@@ -4,7 +4,10 @@ use crate::{
     orchestration::{
         parse_master_response, visible_stream_text, MasterAction, ParsedMasterResponse,
     },
-    session::{SessionEvent, SessionEventKind, SessionSnapshot, SessionView, MAX_TIMELINE_EVENTS},
+    session::{
+        SessionEvent, SessionEventKind, SessionSnapshot, SessionView, MAX_LOG_LINES,
+        MAX_TIMELINE_EVENTS,
+    },
     state::{
         now_unix_ts, AppState, BatchStatus, OrchestrationBatchRecord, SessionStatus, WorkerRecord,
         WorkerStatus,
@@ -313,6 +316,7 @@ impl Controller {
             "idle",
             self.master_last_turn_id(),
             self.master_last_message(),
+            None,
         )?;
         Ok(config_path)
     }
@@ -475,6 +479,7 @@ impl Controller {
                     "idle",
                     self.master_last_turn_id(),
                     self.master_last_message(),
+                    None,
                 )?;
                 return Ok(thread_id);
             }
@@ -498,7 +503,7 @@ impl Controller {
         }
         self.save_state()?;
         self.ensure_master_session(thread_id.clone());
-        self.write_master_status("idle", None, None)?;
+        self.write_master_status("idle", None, None, None)?;
         Ok(thread_id)
     }
 
@@ -756,6 +761,7 @@ impl Controller {
             group: group.to_owned(),
             task: task.to_owned(),
             summary: summary.clone(),
+            lifecycle_note: None,
             task_file: task_file.display().to_string(),
             thread_id: "pending".to_owned(),
             status: WorkerStatus::SpawnRequested,
@@ -775,6 +781,7 @@ impl Controller {
         self.write_role_status(
             &SessionRole::Worker(record.id.clone()),
             "spawn_requested",
+            None,
             None,
             None,
         )?;
@@ -825,6 +832,7 @@ impl Controller {
                     "failed",
                     None,
                     Some(compact_message(&error.to_string())),
+                    Some(compact_message(&error.to_string())),
                 )?;
                 return Err(error);
             }
@@ -836,6 +844,7 @@ impl Controller {
         self.write_role_status(
             &SessionRole::Worker(record.id.clone()),
             "bootstrapping",
+            None,
             None,
             None,
         )?;
@@ -935,7 +944,13 @@ impl Controller {
         wait_for_follow_on: bool,
     ) -> Result<()> {
         let mut receiver = self.client.subscribe();
-        self.write_role_status(&role, active_state_for_turn(&role, &source), None, None)?;
+        self.write_role_status(
+            &role,
+            active_state_for_turn(&role, &source),
+            None,
+            None,
+            None,
+        )?;
         let model_prompt = self.prepare_prompt_for_role(&prompt, &role);
 
         let response: TurnStartResponse = self
@@ -962,6 +977,7 @@ impl Controller {
             &role,
             active_state_for_turn(&role, &source),
             Some(turn_id.clone()),
+            None,
             None,
         )?;
 
@@ -1105,6 +1121,7 @@ impl Controller {
                                 "failed",
                                 Some(turn_id.clone()),
                                 Some(error.message.clone()),
+                                Some(compact_message(&error.message)),
                             )?;
                             if let SessionRole::Worker(worker_id) = &role {
                                 self.publish_worker_runtime_update(
@@ -1145,11 +1162,18 @@ impl Controller {
                         }
 
                         let next_state = completed_state_for_turn(&role, &source, &assistant_text);
+                        let lifecycle_note = match &role {
+                            SessionRole::Worker(_) => {
+                                lifecycle_note_for(next_state, &assistant_text)
+                            }
+                            SessionRole::Master => None,
+                        };
                         self.write_role_status(
                             &role,
                             next_state,
                             Some(turn_id.clone()),
                             last_message,
+                            lifecycle_note,
                         )?;
                         if let SessionRole::Worker(worker_id) = &role {
                             self.publish_worker_runtime_update(
@@ -1286,9 +1310,13 @@ impl Controller {
     fn ensure_master_session(&self, thread_id: String) {
         let summary = self.master_summary();
         let last_message = self.master_last_message();
-        let history = {
+        let (history, output, live_buffer) = {
             let state = self.state.lock().expect("state lock poisoned");
-            state.session_history.get(MASTER_SESSION_ID).cloned()
+            (
+                state.session_history.get(MASTER_SESSION_ID).cloned(),
+                state.session_output.get(MASTER_SESSION_ID).cloned(),
+                state.session_live_buffers.get(MASTER_SESSION_ID).cloned(),
+            )
         };
         let mut sessions = self.sessions.lock().expect("sessions lock poisoned");
         if let Some(session) = sessions.get_mut(MASTER_SESSION_ID) {
@@ -1297,6 +1325,14 @@ impl Controller {
             session.set_last_message(last_message);
             if let Some(history) = &history {
                 session.restore_timeline(history);
+            }
+            if let Some(output) = &output {
+                if session.output_is_empty() {
+                    session.restore_output(output);
+                }
+            }
+            if let Some(live_buffer) = &live_buffer {
+                session.restore_live_buffer(live_buffer);
             }
         } else {
             let mut session = SessionView::master(
@@ -1308,20 +1344,36 @@ impl Controller {
             if let Some(history) = &history {
                 session.restore_timeline(history);
             }
+            if let Some(output) = &output {
+                session.restore_output(output);
+            }
+            if let Some(live_buffer) = &live_buffer {
+                session.restore_live_buffer(live_buffer);
+            }
             sessions.insert(MASTER_SESSION_ID.to_owned(), session);
         }
     }
 
     fn upsert_worker_session(&self, worker: &WorkerRecord) {
-        let history = {
+        let (history, output, live_buffer) = {
             let state = self.state.lock().expect("state lock poisoned");
-            state.session_history.get(&worker.id).cloned()
+            (
+                state.session_history.get(&worker.id).cloned(),
+                state.session_output.get(&worker.id).cloned(),
+                state.session_live_buffers.get(&worker.id).cloned(),
+            )
         };
         let mut sessions = self.sessions.lock().expect("sessions lock poisoned");
         let mut session =
             SessionView::from_worker(worker, self.workspace_root.display().to_string());
         if let Some(history) = history {
             session.restore_timeline(&history);
+        }
+        if let Some(output) = output {
+            session.restore_output(&output);
+        }
+        if let Some(live_buffer) = live_buffer {
+            session.restore_live_buffer(&live_buffer);
         }
         sessions.insert(worker.id.clone(), session);
     }
@@ -1477,11 +1529,25 @@ impl Controller {
     }
 
     fn append_log_line(&self, session_id: &str, line: impl Into<String>) -> Result<()> {
+        let line = line.into();
         let mut sessions = self.sessions.lock().expect("sessions lock poisoned");
         if let Some(session) = sessions.get_mut(session_id) {
-            session.push_line(line);
+            session.push_line(line.clone());
         }
-        Ok(())
+        drop(sessions);
+        self.persist_log_line(session_id, line)
+    }
+
+    fn persist_log_line(&self, session_id: &str, line: String) -> Result<()> {
+        let mut state = self.state.lock().expect("state lock poisoned");
+        let output = state
+            .session_output
+            .entry(session_id.to_owned())
+            .or_default();
+        output.push(line);
+        trim_persisted_log_lines(output);
+        drop(state);
+        self.save_state()
     }
 
     fn append_session_event(
@@ -1530,34 +1596,53 @@ impl Controller {
     }
 
     fn append_live_chunk(&self, session_id: &str, chunk: &str) -> Result<()> {
-        let mut sessions = self.sessions.lock().expect("sessions lock poisoned");
-        if let Some(session) = sessions.get_mut(session_id) {
-            session.append_live_chunk(chunk);
+        {
+            let mut sessions = self.sessions.lock().expect("sessions lock poisoned");
+            if let Some(session) = sessions.get_mut(session_id) {
+                session.append_live_chunk(chunk);
+            }
         }
-        Ok(())
+        self.persist_live_buffer_append(session_id, chunk)
     }
 
     fn set_live_buffer(&self, session_id: &str, content: &str) -> Result<()> {
-        let mut sessions = self.sessions.lock().expect("sessions lock poisoned");
-        if let Some(session) = sessions.get_mut(session_id) {
-            session.set_live_buffer(content);
+        {
+            let mut sessions = self.sessions.lock().expect("sessions lock poisoned");
+            if let Some(session) = sessions.get_mut(session_id) {
+                session.set_live_buffer(content);
+            }
         }
-        Ok(())
+        self.persist_live_buffer_set(session_id, content)
     }
 
     fn commit_live_buffer(&self, session_id: &str) -> Result<Option<String>> {
-        let mut sessions = self.sessions.lock().expect("sessions lock poisoned");
-        Ok(sessions
-            .get_mut(session_id)
-            .and_then(SessionView::commit_live_buffer))
+        let committed = {
+            let mut sessions = self.sessions.lock().expect("sessions lock poisoned");
+            sessions
+                .get_mut(session_id)
+                .and_then(SessionView::commit_live_buffer)
+        };
+        self.persist_committed_live_buffer(session_id, committed.as_deref())?;
+        Ok(committed)
     }
 
     fn replace_last_assistant_line(&self, session_id: &str, text: &str) -> Result<()> {
+        let replacement = format!("assistant> {text}");
         let mut sessions = self.sessions.lock().expect("sessions lock poisoned");
         if let Some(session) = sessions.get_mut(session_id) {
             session.replace_last_assistant_line(text);
         }
-        Ok(())
+        drop(sessions);
+        let mut state = self.state.lock().expect("state lock poisoned");
+        if let Some(lines) = state.session_output.get_mut(session_id) {
+            if let Some(last) = lines.last_mut() {
+                if last.starts_with("assistant> ") {
+                    *last = replacement;
+                }
+            }
+        }
+        drop(state);
+        self.save_state()
     }
 
     fn set_session_status(&self, session_id: &str, status: &str) -> Result<()> {
@@ -1671,6 +1756,14 @@ impl Controller {
         Ok(())
     }
 
+    fn set_session_lifecycle_note(&self, session_id: &str, note: Option<String>) -> Result<()> {
+        let mut sessions = self.sessions.lock().expect("sessions lock poisoned");
+        if let Some(session) = sessions.get_mut(session_id) {
+            session.set_lifecycle_note(note);
+        }
+        Ok(())
+    }
+
     fn set_session_summary(&self, session_id: &str, summary: Option<String>) -> Result<()> {
         let mut sessions = self.sessions.lock().expect("sessions lock poisoned");
         if let Some(session) = sessions.get_mut(session_id) {
@@ -1736,6 +1829,7 @@ impl Controller {
         state: &str,
         last_turn_id: Option<String>,
         last_message: Option<String>,
+        lifecycle_note: Option<String>,
     ) -> Result<()> {
         match role {
             SessionRole::Master => {
@@ -1752,7 +1846,8 @@ impl Controller {
                 self.set_session_status(MASTER_SESSION_ID, state)?;
                 self.set_session_last_turn_id(MASTER_SESSION_ID, last_turn_id.clone())?;
                 self.set_session_last_message(MASTER_SESSION_ID, last_message.clone())?;
-                self.write_master_status(state, last_turn_id, last_message)
+                self.set_session_lifecycle_note(MASTER_SESSION_ID, lifecycle_note.clone())?;
+                self.write_master_status(state, last_turn_id, last_message, lifecycle_note)
             }
             SessionRole::Worker(worker_id) => {
                 let worker = {
@@ -1769,12 +1864,14 @@ impl Controller {
                     if last_message.is_some() {
                         worker.last_message = last_message.clone();
                     }
+                    worker.lifecycle_note = lifecycle_note.clone();
                     worker.clone()
                 };
                 self.save_state()?;
                 self.set_session_status(worker_id, state)?;
                 self.set_session_last_turn_id(worker_id, last_turn_id)?;
                 self.set_session_last_message(worker_id, last_message)?;
+                self.set_session_lifecycle_note(worker_id, lifecycle_note)?;
                 self.set_session_summary(worker_id, worker.summary.clone())?;
                 self.write_worker_status(&worker)
             }
@@ -1786,6 +1883,7 @@ impl Controller {
         state: &str,
         last_turn_id: Option<String>,
         last_message: Option<String>,
+        lifecycle_note: Option<String>,
     ) -> Result<()> {
         let thread_id = self.master_thread_id().unwrap_or_default();
         let status = SessionStatus {
@@ -1796,6 +1894,7 @@ impl Controller {
             summary: self
                 .master_summary()
                 .or_else(|| Some("Primary planner and dispatcher".to_owned())),
+            lifecycle_note,
             last_turn_id,
             last_message,
         };
@@ -1809,6 +1908,7 @@ impl Controller {
             state: worker.status.to_string(),
             updated_at: worker.updated_at,
             summary: worker.summary.clone(),
+            lifecycle_note: worker.lifecycle_note.clone(),
             last_turn_id: worker.last_turn_id.clone(),
             last_message: worker.last_message.clone(),
         };
@@ -1842,7 +1942,7 @@ impl Controller {
             Some(batch_id),
         )?;
         let prompt = format!(
-            "CodeClaw runtime update. This is an internal worker status event, not a direct human message.\n\nWorker id: {worker_id}\nLifecycle state: {worker_state}\nOrigin: {}\nGroup: {}\nTask: {}\nSidebar summary: {}\nLast worker message: {}\n\nInterpret lifecycle states as follows:\n- bootstrapped: the worker completed its initial bootstrap turn and is ready for supervision\n- handed_back: the worker finished a follow-up turn and returned control to the master\n- blocked: the worker reported a blocker and likely needs intervention\n- failed: the worker turn failed unexpectedly\n\nUpdate the operator with a concise coordination response and include the required <codeclaw-actions> block. If no follow-up is needed, return an empty actions list.",
+            "CodeClaw runtime update. This is an internal worker status event, not a direct human message.\n\nWorker id: {worker_id}\nLifecycle state: {worker_state}\nOrigin: {}\nGroup: {}\nTask: {}\nSidebar summary: {}\nLifecycle note: {}\nLast worker message: {}\n\nInterpret lifecycle states as follows:\n- bootstrapped: the worker completed its initial bootstrap turn and is ready for supervision\n- handed_back: the worker finished a follow-up turn and returned control to the master\n- blocked: the worker reported a blocker and likely needs intervention\n- failed: the worker turn failed unexpectedly\n\nUpdate the operator with a concise coordination response and include the required <codeclaw-actions> block. If no follow-up is needed, return an empty actions list.",
             source.runtime_label(),
             worker.group,
             worker.task,
@@ -1850,6 +1950,10 @@ impl Controller {
                 .summary
                 .clone()
                 .unwrap_or_else(|| "not set".to_owned()),
+            worker
+                .lifecycle_note
+                .clone()
+                .unwrap_or_else(|| "none".to_owned()),
             worker
                 .last_message
                 .clone()
@@ -2076,12 +2180,24 @@ fn build_sessions(state: &AppState, workspace_root: &Path) -> BTreeMap<String, S
         if let Some(events) = state.session_history.get(MASTER_SESSION_ID) {
             session.restore_timeline(events);
         }
+        if let Some(lines) = state.session_output.get(MASTER_SESSION_ID) {
+            session.restore_output(lines);
+        }
+        if let Some(live_buffer) = state.session_live_buffers.get(MASTER_SESSION_ID) {
+            session.restore_live_buffer(live_buffer);
+        }
         sessions.insert(MASTER_SESSION_ID.to_owned(), session);
     }
     for worker in state.workers.values() {
         let mut session = SessionView::from_worker(worker, workspace_root.display().to_string());
         if let Some(events) = state.session_history.get(&worker.id) {
             session.restore_timeline(events);
+        }
+        if let Some(lines) = state.session_output.get(&worker.id) {
+            session.restore_output(lines);
+        }
+        if let Some(live_buffer) = state.session_live_buffers.get(&worker.id) {
+            session.restore_live_buffer(live_buffer);
         }
         sessions.insert(worker.id.clone(), session);
     }
@@ -2164,6 +2280,19 @@ fn completed_state_for_turn(
     }
 }
 
+fn lifecycle_note_for(state: &str, assistant_text: &str) -> Option<String> {
+    match state {
+        "blocked" => blocker_reason_from_message(assistant_text)
+            .or_else(|| first_meaningful_line(assistant_text))
+            .or_else(|| Some("worker reported a blocker".to_owned())),
+        "bootstrapped" => first_meaningful_line(assistant_text)
+            .or_else(|| Some("initial handoff ready".to_owned())),
+        "handed_back" => first_meaningful_line(assistant_text)
+            .or_else(|| Some("worker returned control".to_owned())),
+        _ => None,
+    }
+}
+
 fn worker_message_indicates_blocker(message: &str) -> bool {
     let normalized = message.to_ascii_lowercase();
     [
@@ -2179,6 +2308,24 @@ fn worker_message_indicates_blocker(message: &str) -> bool {
     ]
     .iter()
     .any(|needle| normalized.contains(needle))
+}
+
+fn blocker_reason_from_message(message: &str) -> Option<String> {
+    message
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .find(|line| worker_message_indicates_blocker(line))
+        .map(compact_message)
+}
+
+fn first_meaningful_line(message: &str) -> Option<String> {
+    message
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(compact_message)
+        .next()
 }
 
 fn batch_status_text(status: &BatchStatus) -> &'static str {
@@ -2252,6 +2399,58 @@ fn trim_persisted_events(events: &mut Vec<SessionEvent>) {
     }
 }
 
+fn trim_persisted_log_lines(lines: &mut Vec<String>) {
+    if lines.len() > MAX_LOG_LINES {
+        let keep_from = lines.len() - MAX_LOG_LINES;
+        lines.drain(0..keep_from);
+    }
+}
+
+impl Controller {
+    fn persist_live_buffer_append(&self, session_id: &str, chunk: &str) -> Result<()> {
+        let mut state = self.state.lock().expect("state lock poisoned");
+        state
+            .session_live_buffers
+            .entry(session_id.to_owned())
+            .or_default()
+            .push_str(chunk);
+        drop(state);
+        self.save_state()
+    }
+
+    fn persist_live_buffer_set(&self, session_id: &str, content: &str) -> Result<()> {
+        let mut state = self.state.lock().expect("state lock poisoned");
+        if content.is_empty() {
+            state.session_live_buffers.remove(session_id);
+        } else {
+            state
+                .session_live_buffers
+                .insert(session_id.to_owned(), content.to_owned());
+        }
+        drop(state);
+        self.save_state()
+    }
+
+    fn persist_committed_live_buffer(
+        &self,
+        session_id: &str,
+        committed: Option<&str>,
+    ) -> Result<()> {
+        let mut state = self.state.lock().expect("state lock poisoned");
+        state.session_live_buffers.remove(session_id);
+        if let Some(text) = committed {
+            let output = state
+                .session_output
+                .entry(session_id.to_owned())
+                .or_default();
+            output.push(format!("assistant> {text}"));
+            trim_persisted_log_lines(output);
+        }
+        drop(state);
+        self.save_state()
+    }
+}
+
 fn map_broadcast_error(error: broadcast::error::RecvError) -> anyhow::Error {
     anyhow!("app-server notification channel error: {error}")
 }
@@ -2259,8 +2458,8 @@ fn map_broadcast_error(error: broadcast::error::RecvError) -> anyhow::Error {
 #[cfg(test)]
 mod tests {
     use super::{
-        completed_state_for_turn, worker_message_indicates_blocker, worker_status_for, SessionRole,
-        TurnSource,
+        blocker_reason_from_message, completed_state_for_turn, lifecycle_note_for,
+        worker_message_indicates_blocker, worker_status_for, SessionRole, TurnSource,
     };
     use crate::state::WorkerStatus;
 
@@ -2293,6 +2492,13 @@ mod tests {
         assert!(!worker_message_indicates_blocker(
             "Implemented the requested refactor and handed the result back."
         ));
+        assert_eq!(
+            blocker_reason_from_message(
+                "Done with prep.\nWaiting on DBA approval before I can continue."
+            )
+            .as_deref(),
+            Some("Waiting on DBA approval before I can continue.")
+        );
     }
 
     #[test]
@@ -2322,6 +2528,27 @@ mod tests {
                 "Blocked on missing approval."
             ),
             "blocked"
+        );
+    }
+
+    #[test]
+    fn lifecycle_notes_capture_blockers_and_handoffs() {
+        assert_eq!(
+            lifecycle_note_for(
+                "blocked",
+                "Implemented the migration.\nNeed approval from infra before production apply."
+            )
+            .as_deref(),
+            Some("Need approval from infra before production apply.")
+        );
+        assert_eq!(
+            lifecycle_note_for("handed_back", "Implemented API validation and added tests.")
+                .as_deref(),
+            Some("Implemented API validation and added tests.")
+        );
+        assert_eq!(
+            lifecycle_note_for("bootstrapped", "").as_deref(),
+            Some("initial handoff ready")
         );
     }
 }

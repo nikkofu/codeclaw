@@ -2,7 +2,7 @@
 
 ## 0. Implementation Status
 
-As of March 9, 2026, the repository implements a working control-plane prototype, not just a design stub.
+As of March 12, 2026, release `0.10.0` implements a working control-plane prototype, not just a design stub.
 
 Implemented now:
 
@@ -13,7 +13,7 @@ Implemented now:
 - automatic worker completion/failure updates routed back into the master session
 - a structured right-pane timeline for session supervision
 - batch-scoped CLI waiting for the orchestration chain initiated by the active prompt
-- persisted `session_history` and `batches` metadata inside `.codeclaw/state.json`
+- persisted `session_history`, `session_output`, `session_live_buffers`, worker lifecycle notes, and `batches` metadata inside `.codeclaw/state.json`
 - a dedicated batch inspection mode in the TUI, built from persisted batch history
 - color/animation-based task-state cues in the TUI for faster operator scanning
 - right-pane focus filters and colorized live-output rendering for faster supervision triage
@@ -177,7 +177,7 @@ Each worker gets today:
 - a dedicated status file
 - a dedicated Codex thread
 - a persisted timeline history in `.codeclaw/state.json`
-- an in-memory rolling log in the active TUI process
+- a persisted rolling output tail plus in-flight assistant buffer recovery for restart resilience
 
 Planned later:
 

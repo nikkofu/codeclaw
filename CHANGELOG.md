@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.10.0 - 2026-03-12
+
+- persisted a rolling tail of live output per session, including in-flight assistant buffers, so restarts restore more than the timeline
+- restored persisted output into session views and `codeclaw inspect` output
+- persisted worker lifecycle notes so blocker reasons and handoff annotations survive restarts and show up in TUI/CLI inspection
+- synchronized package/version metadata to the GitHub repository release line
+- added a formal delivery documentation set covering handoff, user workflows, operations, and acceptance use cases
+- added visible CLI progress feedback for `spawn`, including spinner updates and streamed worker log lines during bootstrap waits
+
 ## 0.9.0 - 2026-03-10
 
 - added `codeclaw inspect --session ...` and `codeclaw inspect --batch ...` for terminal-side supervision without launching the TUI

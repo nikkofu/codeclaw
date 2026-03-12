@@ -24,6 +24,10 @@ pub struct AppState {
     #[serde(default)]
     pub session_history: BTreeMap<String, Vec<SessionEvent>>,
     #[serde(default)]
+    pub session_output: BTreeMap<String, Vec<String>>,
+    #[serde(default)]
+    pub session_live_buffers: BTreeMap<String, String>,
+    #[serde(default)]
     pub batches: BTreeMap<u64, OrchestrationBatchRecord>,
 }
 
@@ -56,6 +60,8 @@ pub struct WorkerRecord {
     pub task: String,
     #[serde(default)]
     pub summary: Option<String>,
+    #[serde(default)]
+    pub lifecycle_note: Option<String>,
     pub task_file: String,
     pub thread_id: String,
     pub status: WorkerStatus,
@@ -87,6 +93,8 @@ pub struct SessionStatus {
     pub updated_at: u64,
     #[serde(default)]
     pub summary: Option<String>,
+    #[serde(default)]
+    pub lifecycle_note: Option<String>,
     pub last_turn_id: Option<String>,
     pub last_message: Option<String>,
 }
@@ -102,6 +110,8 @@ impl Default for AppState {
             next_task_number: 1,
             workers: BTreeMap::new(),
             session_history: BTreeMap::new(),
+            session_output: BTreeMap::new(),
+            session_live_buffers: BTreeMap::new(),
             batches: BTreeMap::new(),
         }
     }
@@ -197,9 +207,26 @@ mod tests {
     use crate::session::{SessionEvent, SessionEventKind};
 
     #[test]
-    fn app_state_round_trips_session_history_and_batches() {
+    fn app_state_round_trips_session_history_output_workers_and_batches() {
         let mut state = AppState::default();
         state.next_batch_id = 7;
+        state.workers.insert(
+            "backend-001".to_owned(),
+            super::WorkerRecord {
+                id: "backend-001".to_owned(),
+                group: "backend".to_owned(),
+                task: "Investigate API".to_owned(),
+                summary: Some("Investigating".to_owned()),
+                lifecycle_note: Some("Blocked on approval for migration".to_owned()),
+                task_file: ".codeclaw/tasks/TASK-001.md".to_owned(),
+                thread_id: "thread-123".to_owned(),
+                status: WorkerStatus::Blocked,
+                created_at: 121,
+                updated_at: 126,
+                last_turn_id: Some("turn-123".to_owned()),
+                last_message: Some("Blocked: need approval".to_owned()),
+            },
+        );
         state.session_history.insert(
             "master".to_owned(),
             vec![SessionEvent {
@@ -209,6 +236,12 @@ mod tests {
                 text: "started prompt".to_owned(),
             }],
         );
+        state
+            .session_output
+            .insert("master".to_owned(), vec!["assistant> hello".to_owned()]);
+        state
+            .session_live_buffers
+            .insert("master".to_owned(), "partial reply".to_owned());
         state.batches.insert(
             6,
             OrchestrationBatchRecord {
@@ -227,7 +260,13 @@ mod tests {
         let decoded: AppState = serde_json::from_str(&raw).expect("state should decode");
 
         assert_eq!(decoded.next_batch_id, 7);
+        assert_eq!(
+            decoded.workers["backend-001"].lifecycle_note.as_deref(),
+            Some("Blocked on approval for migration")
+        );
         assert_eq!(decoded.session_history["master"][0].batch_id, Some(6));
+        assert_eq!(decoded.session_output["master"][0], "assistant> hello");
+        assert_eq!(decoded.session_live_buffers["master"], "partial reply");
         assert_eq!(decoded.batches[&6].status, BatchStatus::Completed);
     }
 

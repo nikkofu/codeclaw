@@ -2,7 +2,7 @@ use crate::state::{now_unix_ts, WorkerRecord};
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 
-const MAX_LOG_LINES: usize = 512;
+pub const MAX_LOG_LINES: usize = 512;
 pub const MAX_TIMELINE_EVENTS: usize = 128;
 const DEFAULT_MASTER_SUMMARY: &str = "Primary planner and dispatcher";
 
@@ -25,6 +25,7 @@ pub struct SessionSnapshot {
     pub pending_turns: usize,
     pub latest_batch_id: Option<u64>,
     pub summary: Option<String>,
+    pub lifecycle_note: Option<String>,
     pub kind: SessionKind,
     pub status: String,
     pub cwd: String,
@@ -62,6 +63,7 @@ pub struct SessionView {
     thread_id: String,
     title: String,
     summary: Option<String>,
+    lifecycle_note: Option<String>,
     kind: SessionKind,
     status: String,
     pending_turns: usize,
@@ -85,6 +87,7 @@ impl SessionView {
             thread_id,
             title: "master".to_owned(),
             summary: summary.or_else(|| Some(DEFAULT_MASTER_SUMMARY.to_owned())),
+            lifecycle_note: None,
             kind: SessionKind::Master,
             status: "idle".to_owned(),
             pending_turns: 0,
@@ -103,6 +106,7 @@ impl SessionView {
             thread_id: worker.thread_id.clone(),
             title: format!("[{}] {}", worker.group, worker.task),
             summary: worker.summary.clone(),
+            lifecycle_note: worker.lifecycle_note.clone(),
             kind: SessionKind::Worker {
                 group: worker.group.clone(),
                 task: worker.task.clone(),
@@ -152,11 +156,31 @@ impl SessionView {
         }
     }
 
+    pub fn set_lifecycle_note(&mut self, note: Option<String>) {
+        self.lifecycle_note = note;
+    }
+
     pub fn restore_timeline(&mut self, events: &[SessionEvent]) {
         self.timeline_events.clear();
         for event in events.iter().cloned() {
             self.push_timeline_event(event);
         }
+    }
+
+    pub fn restore_output(&mut self, lines: &[String]) {
+        self.lines.clear();
+        for line in lines {
+            self.push_line(line.clone());
+        }
+    }
+
+    pub fn restore_live_buffer(&mut self, content: &str) {
+        self.live_buffer.clear();
+        self.live_buffer.push_str(content);
+    }
+
+    pub fn output_is_empty(&self) -> bool {
+        self.lines.is_empty() && self.live_buffer.is_empty()
     }
 
     pub fn push_timeline_event(&mut self, event: SessionEvent) {
@@ -211,11 +235,20 @@ impl SessionView {
             log_lines.push(format!("assistant> {}", self.live_buffer));
         }
 
-        let subtitle = self
-            .summary
-            .clone()
-            .or_else(|| self.last_message.clone())
-            .unwrap_or_else(|| self.title.clone());
+        let subtitle = match self.status.as_str() {
+            "bootstrapped" | "blocked" | "handed_back" | "failed" => self
+                .lifecycle_note
+                .clone()
+                .or_else(|| self.summary.clone())
+                .or_else(|| self.last_message.clone())
+                .unwrap_or_else(|| self.title.clone()),
+            _ => self
+                .summary
+                .clone()
+                .or_else(|| self.lifecycle_note.clone())
+                .or_else(|| self.last_message.clone())
+                .unwrap_or_else(|| self.title.clone()),
+        };
 
         SessionSnapshot {
             id: self.id.clone(),
@@ -225,6 +258,7 @@ impl SessionView {
             pending_turns: self.pending_turns,
             latest_batch_id: self.latest_batch_id(),
             summary: self.summary.clone(),
+            lifecycle_note: self.lifecycle_note.clone(),
             kind: self.kind.clone(),
             status: self.status.clone(),
             cwd: self.cwd.clone(),
@@ -290,5 +324,34 @@ mod tests {
         session.push_timeline_event(SessionEvent::new(SessionEventKind::User, "batch", Some(42)));
 
         assert_eq!(session.latest_batch_id(), Some(42));
+    }
+
+    #[test]
+    fn snapshot_includes_restored_live_buffer() {
+        let mut session = SessionView::master("thread-1".to_owned(), "/tmp".to_owned(), None, None);
+        session.push_line("assistant> committed");
+        session.restore_live_buffer("streaming");
+
+        let snapshot = session.snapshot();
+
+        assert_eq!(snapshot.log_lines.len(), 2);
+        assert_eq!(snapshot.log_lines[0], "assistant> committed");
+        assert_eq!(snapshot.log_lines[1], "assistant> streaming");
+    }
+
+    #[test]
+    fn blocked_sessions_prefer_lifecycle_note_in_subtitle() {
+        let mut session = SessionView::master("thread-1".to_owned(), "/tmp".to_owned(), None, None);
+        session.set_summary(Some("steady summary".to_owned()));
+        session.set_lifecycle_note(Some("waiting on schema approval".to_owned()));
+        session.set_status("blocked");
+
+        let snapshot = session.snapshot();
+
+        assert_eq!(
+            snapshot.lifecycle_note.as_deref(),
+            Some("waiting on schema approval")
+        );
+        assert_eq!(snapshot.subtitle, "waiting on schema approval");
     }
 }

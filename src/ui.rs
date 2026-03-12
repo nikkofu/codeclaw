@@ -262,7 +262,7 @@ impl App {
         let sections = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Length(11),
+                Constraint::Length(12),
                 Constraint::Length(9),
                 Constraint::Min(7),
             ])
@@ -290,6 +290,7 @@ impl App {
             Line::from(session_queue_line(session)),
             Line::from(session_batch_line(session)),
             Line::from(session_summary_line(session)),
+            Line::from(session_lifecycle_note_line(session)),
             Line::from(session_last_message_line(session)),
             Line::from(format!("thread: {}", session.thread_id)),
             Line::from(session_location_line(session)),
@@ -1542,6 +1543,19 @@ fn session_last_message_line(session: &SessionSnapshot) -> String {
         truncate(
             &session
                 .last_message
+                .clone()
+                .unwrap_or_else(|| "-".to_owned()),
+            47,
+        )
+    )
+}
+
+fn session_lifecycle_note_line(session: &SessionSnapshot) -> String {
+    format!(
+        "note: {}",
+        truncate(
+            &session
+                .lifecycle_note
                 .clone()
                 .unwrap_or_else(|| "-".to_owned()),
             47,
