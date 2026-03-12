@@ -9,8 +9,8 @@ use crate::{
         MAX_TIMELINE_EVENTS,
     },
     state::{
-        now_unix_ts, AppState, BatchStatus, OrchestrationBatchRecord, SessionStatus, WorkerRecord,
-        WorkerStatus,
+        now_unix_ts, AppState, BatchStatus, JobPolicy, JobRecord, JobStatus,
+        OrchestrationBatchRecord, SessionStatus, WorkerRecord, WorkerStatus,
     },
 };
 use anyhow::{anyhow, Context, Result};
@@ -65,6 +65,7 @@ pub struct BatchEventSnapshot {
 #[derive(Debug, Clone)]
 pub struct BatchSnapshot {
     pub id: u64,
+    pub job_id: Option<String>,
     pub root_session_id: String,
     pub root_session_title: String,
     pub root_prompt: String,
@@ -74,6 +75,57 @@ pub struct BatchSnapshot {
     pub sessions: Vec<BatchSessionSnapshot>,
     pub last_event: Option<String>,
     pub events: Vec<BatchEventSnapshot>,
+}
+
+#[derive(Debug, Clone)]
+pub struct CreateJobRequest {
+    pub title: String,
+    pub objective: String,
+    pub source_channel: String,
+    pub requester: Option<String>,
+    pub priority: String,
+    pub pattern: String,
+    pub approval_required: bool,
+    pub context: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct JobWorkerSnapshot {
+    pub id: String,
+    pub group: String,
+    pub task: String,
+    pub status: String,
+    pub summary: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct JobBatchSnapshot {
+    pub id: u64,
+    pub status: String,
+    pub root_session_id: String,
+    pub root_prompt: String,
+    pub updated_at: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct JobSnapshot {
+    pub id: String,
+    pub status: String,
+    pub title: String,
+    pub objective: String,
+    pub source_channel: String,
+    pub requester: Option<String>,
+    pub priority: String,
+    pub pattern: String,
+    pub approval_required: bool,
+    pub created_at: u64,
+    pub updated_at: u64,
+    pub latest_summary: Option<String>,
+    pub escalation_state: Option<String>,
+    pub final_outcome: Option<String>,
+    pub context: Option<String>,
+    pub batch_ids: Vec<JobBatchSnapshot>,
+    pub workers: Vec<JobWorkerSnapshot>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -382,6 +434,117 @@ impl Controller {
         state.workers.values().cloned().collect()
     }
 
+    pub fn list_jobs(&self) -> Vec<JobRecord> {
+        let state = self.state.lock().expect("state lock poisoned");
+        let mut jobs = state.jobs.values().cloned().collect::<Vec<_>>();
+        jobs.sort_by(|left, right| {
+            left.created_at
+                .cmp(&right.created_at)
+                .then_with(|| left.id.cmp(&right.id))
+        });
+        jobs
+    }
+
+    pub fn job_snapshot(&self, job_id: &str) -> Option<JobSnapshot> {
+        let state = self.state.lock().expect("state lock poisoned");
+        let job = state.jobs.get(job_id).cloned()?;
+
+        let mut batches = job
+            .batch_ids
+            .iter()
+            .filter_map(|batch_id| state.batches.get(batch_id))
+            .map(|batch| JobBatchSnapshot {
+                id: batch.id,
+                status: batch_status_text(&batch.status).to_owned(),
+                root_session_id: batch.root_session_id.clone(),
+                root_prompt: batch.root_prompt.clone(),
+                updated_at: batch.updated_at,
+            })
+            .collect::<Vec<_>>();
+        batches.sort_by(|left, right| left.id.cmp(&right.id));
+
+        let mut workers = job
+            .worker_ids
+            .iter()
+            .filter_map(|worker_id| state.workers.get(worker_id))
+            .map(|worker| JobWorkerSnapshot {
+                id: worker.id.clone(),
+                group: worker.group.clone(),
+                task: worker.task.clone(),
+                status: worker.status.to_string(),
+                summary: worker.summary.clone().or(worker.lifecycle_note.clone()),
+            })
+            .collect::<Vec<_>>();
+        workers.sort_by(|left, right| left.id.cmp(&right.id));
+
+        Some(JobSnapshot {
+            id: job.id,
+            status: job.status.to_string(),
+            title: job.title,
+            objective: job.objective,
+            source_channel: job.source_channel,
+            requester: job.requester,
+            priority: job.priority,
+            pattern: job.policy.pattern,
+            approval_required: job.policy.approval_required,
+            created_at: job.created_at,
+            updated_at: job.updated_at,
+            latest_summary: job.latest_summary,
+            escalation_state: job.escalation_state,
+            final_outcome: job.final_outcome,
+            context: job.context,
+            batch_ids: batches,
+            workers,
+        })
+    }
+
+    pub fn create_job(&self, request: CreateJobRequest) -> Result<JobRecord> {
+        let title = request.title.trim();
+        if title.is_empty() {
+            anyhow::bail!("job title must not be empty");
+        }
+
+        let objective = request.objective.trim();
+        if objective.is_empty() {
+            anyhow::bail!("job objective must not be empty");
+        }
+
+        let now = now_unix_ts();
+        let job = {
+            let mut state = self.state.lock().expect("state lock poisoned");
+            let job_number = state.next_job_number;
+            state.next_job_number += 1;
+            let job = JobRecord {
+                id: format!("JOB-{job_number:03}"),
+                source_channel: request.source_channel,
+                requester: request.requester,
+                title: title.to_owned(),
+                objective: objective.to_owned(),
+                context: request.context,
+                status: JobStatus::Pending,
+                priority: request.priority,
+                policy: JobPolicy {
+                    pattern: request.pattern,
+                    approval_required: request.approval_required,
+                },
+                created_at: now,
+                updated_at: now,
+                batch_ids: Vec::new(),
+                worker_ids: Vec::new(),
+                latest_summary: Some("job created".to_owned()),
+                latest_report_at: None,
+                next_report_due_at: None,
+                escalation_state: None,
+                final_outcome: None,
+            };
+            state.jobs.insert(job.id.clone(), job.clone());
+            job
+        };
+
+        self.save_state()?;
+        Ok(job)
+    }
+
     pub fn batch_snapshot(&self, batch_id: u64) -> Option<BatchSnapshot> {
         let (record, events) = {
             let state = self.state.lock().expect("state lock poisoned");
@@ -453,6 +616,7 @@ impl Controller {
 
         Some(BatchSnapshot {
             id: record.id,
+            job_id: record.job_id,
             root_session_id: record.root_session_id,
             root_session_title,
             root_prompt: record.root_prompt,
@@ -508,9 +672,18 @@ impl Controller {
     }
 
     pub async fn submit_prompt(&self, target: PromptTarget, prompt: &str) -> Result<()> {
+        self.submit_prompt_for_job(target, prompt, None).await
+    }
+
+    pub async fn submit_prompt_for_job(
+        &self,
+        target: PromptTarget,
+        prompt: &str,
+        job_id: Option<&str>,
+    ) -> Result<()> {
         let (session_id, thread_id, log_label, role) = self.resolve_prompt_target(target).await?;
         let batch_id = self.allocate_batch_id()?;
-        self.register_batch(&session_id, batch_id, prompt)?;
+        self.register_batch(&session_id, batch_id, prompt, job_id)?;
         self.enqueue_turn(
             batch_id,
             session_id,
@@ -524,9 +697,18 @@ impl Controller {
     }
 
     pub async fn submit_prompt_and_wait(&self, target: PromptTarget, prompt: &str) -> Result<()> {
+        self.submit_prompt_and_wait_for_job(target, prompt, None).await
+    }
+
+    pub async fn submit_prompt_and_wait_for_job(
+        &self,
+        target: PromptTarget,
+        prompt: &str,
+        job_id: Option<&str>,
+    ) -> Result<()> {
         let (session_id, thread_id, log_label, role) = self.resolve_prompt_target(target).await?;
         let batch_id = self.allocate_batch_id()?;
-        self.register_batch(&session_id, batch_id, prompt)?;
+        self.register_batch(&session_id, batch_id, prompt, job_id)?;
         self.enqueue_turn_and_wait(
             batch_id,
             session_id,
@@ -552,7 +734,17 @@ impl Controller {
         Ok(batch_id)
     }
 
-    fn register_batch(&self, session_id: &str, batch_id: u64, prompt: &str) -> Result<()> {
+    fn register_batch(
+        &self,
+        session_id: &str,
+        batch_id: u64,
+        prompt: &str,
+        job_id: Option<&str>,
+    ) -> Result<()> {
+        if let Some(job_id) = job_id {
+            self.ensure_job_exists(job_id)?;
+        }
+
         {
             let mut state = self.state.lock().expect("state lock poisoned");
             state
@@ -562,14 +754,32 @@ impl Controller {
                     id: batch_id,
                     root_session_id: session_id.to_owned(),
                     root_prompt: compact_message(prompt),
+                    job_id: job_id.map(str::to_owned),
                     status: BatchStatus::Running,
                     created_at: now_unix_ts(),
                     updated_at: now_unix_ts(),
                     sessions: vec![session_id.to_owned()],
                     last_event: Some("batch registered".to_owned()),
                 });
+            if let Some(job_id) = job_id {
+                if let Some(batch) = state.batches.get_mut(&batch_id) {
+                    match &batch.job_id {
+                        Some(existing) if existing != job_id => {
+                            anyhow::bail!(
+                                "batch b{batch_id:03} is already linked to job `{existing}`"
+                            );
+                        }
+                        Some(_) => {}
+                        None => batch.job_id = Some(job_id.to_owned()),
+                    }
+                }
+            }
         }
-        self.save_state()
+        self.save_state()?;
+        if let Some(job_id) = job_id {
+            self.link_batch_to_job(job_id, batch_id, prompt)?;
+        }
+        Ok(())
     }
 
     fn enqueue_turn(
@@ -675,22 +885,42 @@ impl Controller {
     }
 
     pub async fn spawn_worker(&self, group: &str, task: &str) -> Result<WorkerRecord> {
+        self.spawn_worker_for_job(group, task, None).await
+    }
+
+    pub async fn spawn_worker_for_job(
+        &self,
+        group: &str,
+        task: &str,
+        job_id: Option<&str>,
+    ) -> Result<WorkerRecord> {
         let batch_id = self.allocate_batch_id()?;
         self.register_batch(
             MASTER_SESSION_ID,
             batch_id,
             &format!("spawn worker [{group}] {task}"),
+            job_id,
         )?;
         self.spawn_worker_with_options(group, task, None, None, false, batch_id)
             .await
     }
 
     pub async fn spawn_worker_and_wait(&self, group: &str, task: &str) -> Result<WorkerRecord> {
+        self.spawn_worker_and_wait_for_job(group, task, None).await
+    }
+
+    pub async fn spawn_worker_and_wait_for_job(
+        &self,
+        group: &str,
+        task: &str,
+        job_id: Option<&str>,
+    ) -> Result<WorkerRecord> {
         let batch_id = self.allocate_batch_id()?;
         self.register_batch(
             MASTER_SESSION_ID,
             batch_id,
             &format!("spawn worker [{group}] {task}"),
+            job_id,
         )?;
         self.spawn_worker_with_options(group, task, None, None, true, batch_id)
             .await
@@ -710,6 +940,9 @@ impl Controller {
         self.save_state()?;
         self.set_session_summary(worker_id, Some(summary.to_owned()))?;
         self.write_worker_status(&worker)?;
+        if let Some(job_id) = worker.job_id.as_deref() {
+            self.refresh_job_tracking(job_id, Some(summary.to_owned()))?;
+        }
         self.append_log_line(worker_id, format!("system> summary updated: {summary}"))?;
         self.append_session_event(
             worker_id,
@@ -734,6 +967,7 @@ impl Controller {
             .group(group)
             .with_context(|| format!("unknown group `{group}`"))?
             .clone();
+        let linked_job = self.job_for_batch(batch_id);
         self.paths.ensure_layout()?;
 
         let task_number = {
@@ -751,7 +985,7 @@ impl Controller {
 
         fs::write(
             &task_file,
-            render_task_file(task_number, task, &group_config.lease_paths),
+            render_task_file(task_number, task, &group_config.lease_paths, linked_job.as_ref()),
         )
         .with_context(|| format!("failed to write {}", task_file.display()))?;
 
@@ -760,6 +994,7 @@ impl Controller {
             id: worker_id.clone(),
             group: group.to_owned(),
             task: task.to_owned(),
+            job_id: linked_job.as_ref().map(|job| job.id.clone()),
             summary: summary.clone(),
             lifecycle_note: None,
             task_file: task_file.display().to_string(),
@@ -776,6 +1011,9 @@ impl Controller {
             state.workers.insert(worker_id.clone(), record.clone());
         }
         self.save_state()?;
+        if let Some(job) = linked_job.as_ref() {
+            self.link_worker_to_job(&job.id, &record.id)?;
+        }
         self.write_worker_status(&record)?;
         self.upsert_worker_session(&record);
         self.write_role_status(
@@ -951,7 +1189,7 @@ impl Controller {
             None,
             None,
         )?;
-        let model_prompt = self.prepare_prompt_for_role(&prompt, &role);
+        let model_prompt = self.prepare_prompt_for_role(&prompt, &role, batch_id);
 
         let response: TurnStartResponse = self
             .client
@@ -1583,6 +1821,7 @@ impl Controller {
                             id: batch_id,
                             root_session_id: session_id.to_owned(),
                             root_prompt: "(implicit batch)".to_owned(),
+                            job_id: None,
                             status: BatchStatus::Running,
                             created_at: now_unix_ts(),
                             updated_at: now_unix_ts(),
@@ -1696,6 +1935,7 @@ impl Controller {
                     id: batch_id,
                     root_session_id: session_id.to_owned(),
                     root_prompt: "(implicit batch)".to_owned(),
+                    job_id: None,
                     status: BatchStatus::Running,
                     created_at: now_unix_ts(),
                     updated_at: now_unix_ts(),
@@ -1708,14 +1948,26 @@ impl Controller {
     }
 
     fn set_batch_status(&self, batch_id: u64, status: BatchStatus) -> Result<()> {
-        {
+        let linked_job_id = {
             let mut state = self.state.lock().expect("state lock poisoned");
             if let Some(batch) = state.batches.get_mut(&batch_id) {
-                batch.status = status;
+                batch.status = status.clone();
                 batch.updated_at = now_unix_ts();
+                batch.job_id.clone()
+            } else {
+                None
             }
+        };
+        self.save_state()?;
+        if let Some(job_id) = linked_job_id.as_deref() {
+            let summary = match status {
+                BatchStatus::Running => None,
+                BatchStatus::Completed => Some(format!("batch b{batch_id:03} completed")),
+                BatchStatus::Failed => Some(format!("batch b{batch_id:03} failed")),
+            };
+            self.refresh_job_tracking(job_id, summary)?;
         }
-        self.save_state()
+        Ok(())
     }
 
     fn refresh_batch_state(&self, batch_id: u64) -> Result<()> {
@@ -1807,6 +2059,115 @@ impl Controller {
         state.save(&self.paths.state_file)
     }
 
+    fn ensure_job_exists(&self, job_id: &str) -> Result<()> {
+        let state = self.state.lock().expect("state lock poisoned");
+        if state.jobs.contains_key(job_id) {
+            Ok(())
+        } else {
+            anyhow::bail!("unknown job `{job_id}`");
+        }
+    }
+
+    fn link_batch_to_job(&self, job_id: &str, batch_id: u64, prompt: &str) -> Result<()> {
+        {
+            let mut state = self.state.lock().expect("state lock poisoned");
+            let batch = state
+                .batches
+                .get_mut(&batch_id)
+                .with_context(|| format!("unknown batch `b{batch_id}`"))?;
+            match &batch.job_id {
+                Some(existing) if existing != job_id => {
+                    anyhow::bail!("batch b{batch_id:03} is already linked to job `{existing}`");
+                }
+                Some(_) => {}
+                None => batch.job_id = Some(job_id.to_owned()),
+            }
+
+            let job = state
+                .jobs
+                .get_mut(job_id)
+                .with_context(|| format!("unknown job `{job_id}`"))?;
+            if !job.batch_ids.contains(&batch_id) {
+                job.batch_ids.push(batch_id);
+                job.batch_ids.sort_unstable();
+            }
+        }
+
+        self.refresh_job_tracking(
+            job_id,
+            Some(format!(
+                "batch b{batch_id:03} started: {}",
+                compact_message(prompt)
+            )),
+        )
+    }
+
+    fn link_worker_to_job(&self, job_id: &str, worker_id: &str) -> Result<()> {
+        {
+            let mut state = self.state.lock().expect("state lock poisoned");
+            let worker = state
+                .workers
+                .get_mut(worker_id)
+                .with_context(|| format!("unknown worker `{worker_id}`"))?;
+            match &worker.job_id {
+                Some(existing) if existing != job_id => {
+                    anyhow::bail!("worker `{worker_id}` is already linked to job `{existing}`");
+                }
+                Some(_) => {}
+                None => worker.job_id = Some(job_id.to_owned()),
+            }
+
+            let job = state
+                .jobs
+                .get_mut(job_id)
+                .with_context(|| format!("unknown job `{job_id}`"))?;
+            if !job.worker_ids.iter().any(|existing| existing == worker_id) {
+                job.worker_ids.push(worker_id.to_owned());
+                job.worker_ids.sort();
+            }
+        }
+
+        self.refresh_job_tracking(job_id, Some(format!("worker assigned: {worker_id}")))
+    }
+
+    fn refresh_job_tracking(&self, job_id: &str, latest_summary: Option<String>) -> Result<()> {
+        {
+            let mut state = self.state.lock().expect("state lock poisoned");
+            let (batch_ids, worker_ids, existing_summary) = {
+                let job = state
+                    .jobs
+                    .get(job_id)
+                    .with_context(|| format!("unknown job `{job_id}`"))?;
+                (
+                    job.batch_ids.clone(),
+                    job.worker_ids.clone(),
+                    job.latest_summary.clone(),
+                )
+            };
+
+            let status = derive_job_status_from_state(&state, &batch_ids, &worker_ids);
+            let next_summary = latest_summary.or(existing_summary);
+            if let Some(job) = state.jobs.get_mut(job_id) {
+                job.status = status.clone();
+                job.updated_at = now_unix_ts();
+                if next_summary.is_some() {
+                    job.latest_summary = next_summary.clone();
+                }
+                job.final_outcome = match status {
+                    JobStatus::Completed | JobStatus::Failed => job.latest_summary.clone(),
+                    _ => None,
+                };
+            }
+        }
+        self.save_state()
+    }
+
+    fn job_for_batch(&self, batch_id: u64) -> Option<JobRecord> {
+        let state = self.state.lock().expect("state lock poisoned");
+        let job_id = state.batches.get(&batch_id)?.job_id.clone()?;
+        state.jobs.get(&job_id).cloned()
+    }
+
     fn log_notification(&self, log_label: &str, notification: &Notification) -> Result<()> {
         let log_path = self.paths.log_dir.join(format!("{log_label}.jsonl"));
         let mut file = OpenOptions::new()
@@ -1868,6 +2229,16 @@ impl Controller {
                     worker.clone()
                 };
                 self.save_state()?;
+                if let Some(job_id) = worker.job_id.as_deref() {
+                    self.refresh_job_tracking(
+                        job_id,
+                        worker
+                            .lifecycle_note
+                            .clone()
+                            .or(worker.summary.clone())
+                            .or(worker.last_message.clone()),
+                    )?;
+                }
                 self.set_session_status(worker_id, state)?;
                 self.set_session_last_turn_id(worker_id, last_turn_id)?;
                 self.set_session_last_message(worker_id, last_message)?;
@@ -1891,6 +2262,7 @@ impl Controller {
             thread_id,
             state: state.to_owned(),
             updated_at: now_unix_ts(),
+            job_id: None,
             summary: self
                 .master_summary()
                 .or_else(|| Some("Primary planner and dispatcher".to_owned())),
@@ -1907,6 +2279,7 @@ impl Controller {
             thread_id: worker.thread_id.clone(),
             state: worker.status.to_string(),
             updated_at: worker.updated_at,
+            job_id: worker.job_id.clone(),
             summary: worker.summary.clone(),
             lifecycle_note: worker.lifecycle_note.clone(),
             last_turn_id: worker.last_turn_id.clone(),
@@ -1979,12 +2352,30 @@ impl Controller {
         )
     }
 
-    fn prepare_prompt_for_role(&self, prompt: &str, role: &SessionRole) -> String {
+    fn prepare_prompt_for_role(&self, prompt: &str, role: &SessionRole, batch_id: u64) -> String {
+        let job_context = self
+            .job_for_batch(batch_id)
+            .map(|job| format_job_context(&job));
+
         match role {
-            SessionRole::Master => format!(
-                "{prompt}\n\nCodeClaw runtime reminder: finish with the required <codeclaw-actions> JSON block."
-            ),
-            SessionRole::Worker(_) => prompt.to_owned(),
+            SessionRole::Master => {
+                if let Some(job_context) = job_context {
+                    format!(
+                        "{job_context}\n\nOperator prompt:\n{prompt}\n\nCodeClaw runtime reminder: finish with the required <codeclaw-actions> JSON block."
+                    )
+                } else {
+                    format!(
+                        "{prompt}\n\nCodeClaw runtime reminder: finish with the required <codeclaw-actions> JSON block."
+                    )
+                }
+            }
+            SessionRole::Worker(_) => {
+                if let Some(job_context) = job_context {
+                    format!("{job_context}\n\nTask prompt:\n{prompt}")
+                } else {
+                    prompt.to_owned()
+                }
+            }
         }
     }
 
@@ -2336,7 +2727,90 @@ fn batch_status_text(status: &BatchStatus) -> &'static str {
     }
 }
 
-fn render_task_file(task_number: u64, task: &str, lease_paths: &[String]) -> String {
+fn derive_job_status_from_state(
+    state: &AppState,
+    batch_ids: &[u64],
+    worker_ids: &[String],
+) -> JobStatus {
+    let has_failed_batch = batch_ids.iter().any(|batch_id| {
+        state
+            .batches
+            .get(batch_id)
+            .map(|batch| matches!(batch.status, BatchStatus::Failed))
+            .unwrap_or(false)
+    });
+    let has_failed_worker = worker_ids.iter().any(|worker_id| {
+        state
+            .workers
+            .get(worker_id)
+            .map(|worker| matches!(worker.status, WorkerStatus::Failed))
+            .unwrap_or(false)
+    });
+    if has_failed_batch || has_failed_worker {
+        return JobStatus::Failed;
+    }
+
+    let has_blocked_worker = worker_ids.iter().any(|worker_id| {
+        state
+            .workers
+            .get(worker_id)
+            .map(|worker| matches!(worker.status, WorkerStatus::Blocked))
+            .unwrap_or(false)
+    });
+    if has_blocked_worker {
+        return JobStatus::Blocked;
+    }
+
+    let has_running_batch = batch_ids.iter().any(|batch_id| {
+        state
+            .batches
+            .get(batch_id)
+            .map(|batch| matches!(batch.status, BatchStatus::Running))
+            .unwrap_or(false)
+    });
+    if has_running_batch {
+        return JobStatus::Running;
+    }
+
+    if batch_ids.is_empty() {
+        JobStatus::Pending
+    } else {
+        JobStatus::Completed
+    }
+}
+
+fn format_job_context(job: &JobRecord) -> String {
+    let requester = job
+        .requester
+        .clone()
+        .unwrap_or_else(|| "unknown".to_owned());
+    let context = job
+        .context
+        .clone()
+        .unwrap_or_else(|| "none".to_owned());
+    format!(
+        "Job context:\n- Job id: {}\n- Title: {}\n- Objective: {}\n- Source channel: {}\n- Requester: {}\n- Priority: {}\n- Pattern: {}\n- Approval required: {}\n- Current summary: {}\n- Context: {}",
+        job.id,
+        job.title,
+        job.objective,
+        job.source_channel,
+        requester,
+        job.priority,
+        job.policy.pattern,
+        if job.policy.approval_required { "yes" } else { "no" },
+        job.latest_summary
+            .clone()
+            .unwrap_or_else(|| "none".to_owned()),
+        context
+    )
+}
+
+fn render_task_file(
+    task_number: u64,
+    task: &str,
+    lease_paths: &[String],
+    job: Option<&JobRecord>,
+) -> String {
     let lease_section = if lease_paths.is_empty() {
         "- (not specified)\n".to_owned()
     } else {
@@ -2345,9 +2819,22 @@ fn render_task_file(task_number: u64, task: &str, lease_paths: &[String]) -> Str
             .map(|path| format!("- {path}\n"))
             .collect::<String>()
     };
+    let job_section = if let Some(job) = job {
+        format!(
+            "## Job Context\n\n- id: {}\n- title: {}\n- objective: {}\n- priority: {}\n- pattern: {}\n- approval required: {}\n\n",
+            job.id,
+            job.title,
+            job.objective,
+            job.priority,
+            job.policy.pattern,
+            if job.policy.approval_required { "yes" } else { "no" }
+        )
+    } else {
+        String::new()
+    };
 
     format!(
-        "# TASK-{task_number:03}\n\n## Goal\n\n{task}\n\n## Acceptance Criteria\n\n- Make concrete progress on the assigned task.\n- Keep changes scoped to the leased area.\n- Report blockers explicitly.\n\n## Leased Paths\n\n{lease_section}"
+        "# TASK-{task_number:03}\n\n## Goal\n\n{task}\n\n{job_section}## Acceptance Criteria\n\n- Make concrete progress on the assigned task.\n- Keep changes scoped to the leased area.\n- Report blockers explicitly.\n\n## Leased Paths\n\n{lease_section}"
     )
 }
 
@@ -2458,10 +2945,11 @@ fn map_broadcast_error(error: broadcast::error::RecvError) -> anyhow::Error {
 #[cfg(test)]
 mod tests {
     use super::{
-        blocker_reason_from_message, completed_state_for_turn, lifecycle_note_for,
-        worker_message_indicates_blocker, worker_status_for, SessionRole, TurnSource,
+        blocker_reason_from_message, completed_state_for_turn, derive_job_status_from_state,
+        lifecycle_note_for, worker_message_indicates_blocker, worker_status_for, SessionRole,
+        TurnSource,
     };
-    use crate::state::WorkerStatus;
+    use crate::state::{AppState, BatchStatus, JobStatus, OrchestrationBatchRecord, WorkerStatus};
 
     #[test]
     fn worker_status_maps_lifecycle_states() {
@@ -2550,5 +3038,70 @@ mod tests {
             lifecycle_note_for("bootstrapped", "").as_deref(),
             Some("initial handoff ready")
         );
+    }
+
+    #[test]
+    fn job_status_prefers_failed_then_blocked_then_running_then_completed() {
+        let mut state = AppState::default();
+        state.batches.insert(
+            1,
+            OrchestrationBatchRecord {
+                id: 1,
+                root_session_id: "master".to_owned(),
+                root_prompt: "root".to_owned(),
+                job_id: Some("JOB-001".to_owned()),
+                status: BatchStatus::Running,
+                created_at: 1,
+                updated_at: 1,
+                sessions: vec!["master".to_owned()],
+                last_event: None,
+            },
+        );
+
+        assert_eq!(
+            derive_job_status_from_state(&state, &[1], &[]),
+            JobStatus::Running
+        );
+
+        state.workers.insert(
+            "backend-001".to_owned(),
+            crate::state::WorkerRecord {
+                id: "backend-001".to_owned(),
+                group: "backend".to_owned(),
+                task: "task".to_owned(),
+                job_id: Some("JOB-001".to_owned()),
+                summary: None,
+                lifecycle_note: None,
+                task_file: "TASK-001.md".to_owned(),
+                thread_id: "thread-1".to_owned(),
+                status: WorkerStatus::Blocked,
+                created_at: 1,
+                updated_at: 1,
+                last_turn_id: None,
+                last_message: None,
+            },
+        );
+        assert_eq!(
+            derive_job_status_from_state(&state, &[1], &["backend-001".to_owned()]),
+            JobStatus::Blocked
+        );
+
+        if let Some(worker) = state.workers.get_mut("backend-001") {
+            worker.status = WorkerStatus::Failed;
+        }
+        assert_eq!(
+            derive_job_status_from_state(&state, &[1], &["backend-001".to_owned()]),
+            JobStatus::Failed
+        );
+
+        state.workers.clear();
+        if let Some(batch) = state.batches.get_mut(&1) {
+            batch.status = BatchStatus::Completed;
+        }
+        assert_eq!(
+            derive_job_status_from_state(&state, &[1], &[]),
+            JobStatus::Completed
+        );
+        assert_eq!(derive_job_status_from_state(&state, &[], &[]), JobStatus::Pending);
     }
 }

@@ -8,7 +8,7 @@ mod ui;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use controller::{BatchSnapshot, Controller, PromptTarget};
+use controller::{BatchSnapshot, Controller, CreateJobRequest, JobSnapshot, PromptTarget};
 use session::{SessionEventKind, SessionKind, SessionSnapshot};
 use std::{
     collections::BTreeSet,
@@ -37,10 +37,14 @@ enum Command {
         group: String,
         #[arg(long)]
         task: String,
+        #[arg(long)]
+        job: Option<String>,
     },
     Send {
         #[arg(long, default_value = "master")]
         to: String,
+        #[arg(long)]
+        job: Option<String>,
         prompt: String,
     },
     Inspect {
@@ -54,6 +58,36 @@ enum Command {
         output: usize,
     },
     List,
+    Jobs,
+    Job {
+        #[command(subcommand)]
+        command: JobCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum JobCommand {
+    Create {
+        #[arg(long)]
+        title: String,
+        #[arg(long)]
+        objective: Option<String>,
+        #[arg(long, default_value = "cli")]
+        channel: String,
+        #[arg(long)]
+        requester: Option<String>,
+        #[arg(long, default_value = "normal")]
+        priority: String,
+        #[arg(long, default_value = "supervisor_worker")]
+        pattern: String,
+        #[arg(long, default_value_t = false)]
+        approval_required: bool,
+        #[arg(long)]
+        context: Option<String>,
+    },
+    Inspect {
+        job_id: String,
+    },
 }
 
 #[tokio::main]
@@ -72,8 +106,12 @@ async fn run() -> Result<()> {
         Command::Init => run_init(workspace_root).await,
         Command::Doctor => run_doctor(workspace_root).await,
         Command::Up => run_up(workspace_root).await,
-        Command::Spawn { group, task } => run_spawn(workspace_root, &group, &task).await,
-        Command::Send { to, prompt } => run_send(workspace_root, &to, &prompt).await,
+        Command::Spawn { group, task, job } => {
+            run_spawn(workspace_root, &group, &task, job.as_deref()).await
+        }
+        Command::Send { to, job, prompt } => {
+            run_send(workspace_root, &to, job.as_deref(), &prompt).await
+        }
         Command::Inspect {
             session,
             batch,
@@ -81,6 +119,8 @@ async fn run() -> Result<()> {
             output,
         } => run_inspect(workspace_root, session, batch, events, output).await,
         Command::List => run_list(workspace_root).await,
+        Command::Jobs => run_jobs(workspace_root).await,
+        Command::Job { command } => run_job(workspace_root, command).await,
     }
 }
 
@@ -114,7 +154,12 @@ async fn run_up(workspace_root: PathBuf) -> Result<()> {
     ui::run(controller).await
 }
 
-async fn run_spawn(workspace_root: PathBuf, group: &str, task: &str) -> Result<()> {
+async fn run_spawn(
+    workspace_root: PathBuf,
+    group: &str,
+    task: &str,
+    job_id: Option<&str>,
+) -> Result<()> {
     let controller = Controller::start(workspace_root).await?;
     controller.init_workspace()?;
     let existing_workers = controller
@@ -131,18 +176,33 @@ async fn run_spawn(workspace_root: PathBuf, group: &str, task: &str) -> Result<(
         task.to_owned(),
         stop_rx,
     ));
-    let result = controller.spawn_worker_and_wait(group, task).await;
+    let result = if let Some(job_id) = job_id {
+        controller
+            .spawn_worker_and_wait_for_job(group, task, Some(job_id))
+            .await
+    } else {
+        controller.spawn_worker_and_wait(group, task).await
+    };
     let _ = stop_tx.send(true);
     let _ = progress.await;
     let worker = result?;
     println!("worker: {}", worker.id);
+    println!(
+        "job: {}",
+        worker.job_id.clone().unwrap_or_else(|| "-".to_owned())
+    );
     println!("thread: {}", worker.thread_id);
     println!("task file: {}", worker.task_file);
     println!("status: {}", worker.status);
     Ok(())
 }
 
-async fn run_send(workspace_root: PathBuf, to: &str, prompt: &str) -> Result<()> {
+async fn run_send(
+    workspace_root: PathBuf,
+    to: &str,
+    job_id: Option<&str>,
+    prompt: &str,
+) -> Result<()> {
     let controller = Controller::start(workspace_root).await?;
     controller.init_workspace()?;
     let target = if to == "master" {
@@ -150,7 +210,13 @@ async fn run_send(workspace_root: PathBuf, to: &str, prompt: &str) -> Result<()>
     } else {
         PromptTarget::Worker(to.to_owned())
     };
-    controller.submit_prompt_and_wait(target, prompt).await?;
+    if let Some(job_id) = job_id {
+        controller
+            .submit_prompt_and_wait_for_job(target, prompt, Some(job_id))
+            .await?;
+    } else {
+        controller.submit_prompt_and_wait(target, prompt).await?;
+    }
     println!("submitted");
     Ok(())
 }
@@ -166,12 +232,92 @@ async fn run_list(workspace_root: PathBuf) -> Result<()> {
 
     for worker in workers {
         println!(
-            "{} [{}] {} :: {}",
-            worker.id, worker.group, worker.status, worker.task
+            "{} [{}] {} :: {} | job={}",
+            worker.id,
+            worker.group,
+            worker.status,
+            worker.task,
+            worker.job_id.unwrap_or_else(|| "-".to_owned())
         );
     }
 
     Ok(())
+}
+
+async fn run_jobs(workspace_root: PathBuf) -> Result<()> {
+    let controller = Controller::start(workspace_root).await?;
+    let jobs = controller.list_jobs();
+
+    if jobs.is_empty() {
+        println!("no jobs registered");
+        return Ok(());
+    }
+
+    for job in jobs {
+        println!(
+            "{} [{}] {} :: batches={} workers={} | pattern={}",
+            job.id,
+            job.status,
+            job.title,
+            job.batch_ids.len(),
+            job.worker_ids.len(),
+            job.policy.pattern
+        );
+    }
+
+    Ok(())
+}
+
+async fn run_job(workspace_root: PathBuf, command: JobCommand) -> Result<()> {
+    let controller = Controller::start(workspace_root).await?;
+
+    match command {
+        JobCommand::Create {
+            title,
+            objective,
+            channel,
+            requester,
+            priority,
+            pattern,
+            approval_required,
+            context,
+        } => {
+            controller.init_workspace()?;
+            let objective = objective.unwrap_or_else(|| title.clone());
+            let job = controller.create_job(CreateJobRequest {
+                title,
+                objective,
+                source_channel: channel,
+                requester,
+                priority,
+                pattern,
+                approval_required,
+                context,
+            })?;
+            println!("job: {}", job.id);
+            println!("status: {}", job.status);
+            println!("title: {}", job.title);
+            println!("objective: {}", job.objective);
+            println!("pattern: {}", job.policy.pattern);
+            println!(
+                "approval required: {}",
+                if job.policy.approval_required {
+                    "yes"
+                } else {
+                    "no"
+                }
+            );
+            println!("next step: use --job {} with `send` or `spawn`", job.id);
+            Ok(())
+        }
+        JobCommand::Inspect { job_id } => {
+            let job = controller
+                .job_snapshot(&job_id)
+                .with_context(|| format!("unknown job `{job_id}`"))?;
+            print_job_snapshot(&job);
+            Ok(())
+        }
+    }
 }
 
 async fn run_inspect(
@@ -349,6 +495,10 @@ fn truncate_cli(text: &str, max_len: usize) -> String {
 
 fn print_session_snapshot(session: &SessionSnapshot, max_events: usize, max_output: usize) {
     println!("session: {}", session.id);
+    println!(
+        "job: {}",
+        session.job_id.clone().unwrap_or_else(|| "-".to_owned())
+    );
     println!("title: {}", session.title);
     println!("status: {}", session.status);
     println!("role: {}", session_role_label(session));
@@ -431,6 +581,10 @@ fn print_session_snapshot(session: &SessionSnapshot, max_events: usize, max_outp
 
 fn print_batch_snapshot(batch: &BatchSnapshot, max_events: usize) {
     println!("batch: b{:03}", batch.id);
+    println!(
+        "job: {}",
+        batch.job_id.clone().unwrap_or_else(|| "-".to_owned())
+    );
     println!("status: {}", batch.status);
     println!(
         "root session: {} ({})",
@@ -469,6 +623,69 @@ fn print_batch_snapshot(batch: &BatchSnapshot, max_events: usize) {
     }
     if batch.events.is_empty() {
         println!("- no events");
+    }
+}
+
+fn print_job_snapshot(job: &JobSnapshot) {
+    println!("job: {}", job.id);
+    println!("status: {}", job.status);
+    println!("title: {}", job.title);
+    println!("objective: {}", job.objective);
+    println!("source channel: {}", job.source_channel);
+    println!(
+        "requester: {}",
+        job.requester.clone().unwrap_or_else(|| "-".to_owned())
+    );
+    println!("priority: {}", job.priority);
+    println!("pattern: {}", job.pattern);
+    println!(
+        "approval required: {}",
+        if job.approval_required { "yes" } else { "no" }
+    );
+    println!("created: {}", job.created_at);
+    println!("updated: {}", job.updated_at);
+    println!(
+        "latest summary: {}",
+        job.latest_summary.clone().unwrap_or_else(|| "-".to_owned())
+    );
+    println!(
+        "escalation state: {}",
+        job.escalation_state
+            .clone()
+            .unwrap_or_else(|| "-".to_owned())
+    );
+    println!(
+        "final outcome: {}",
+        job.final_outcome.clone().unwrap_or_else(|| "-".to_owned())
+    );
+    println!("context: {}", job.context.clone().unwrap_or_else(|| "-".to_owned()));
+
+    println!();
+    println!("batches ({}):", job.batch_ids.len());
+    for batch in &job.batch_ids {
+        println!(
+            "- b{:03} [{}] {} :: {} | updated={}",
+            batch.id, batch.status, batch.root_session_id, batch.root_prompt, batch.updated_at
+        );
+    }
+    if job.batch_ids.is_empty() {
+        println!("- no batches");
+    }
+
+    println!();
+    println!("workers ({}):", job.workers.len());
+    for worker in &job.workers {
+        println!(
+            "- {} [{}] {} :: {}",
+            worker.id, worker.status, worker.group, worker.task
+        );
+        println!(
+            "  summary: {}",
+            worker.summary.clone().unwrap_or_else(|| "-".to_owned())
+        );
+    }
+    if job.workers.is_empty() {
+        println!("- no workers");
     }
 }
 

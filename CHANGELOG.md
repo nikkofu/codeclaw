@@ -4,6 +4,8 @@
 
 - added next-phase planning documents for product strategy, system architecture, technical roadmap, and project plan
 - aligned `README.md`, `docs/architecture.md`, and `docs/roadmap.md` so the current release baseline and next-phase direction are linked clearly
+- added a durable `Job` model with persisted job state, job-aware batch/worker linkage, and CLI commands for `jobs`, `job create`, and `job inspect`
+- added optional `--job` association for `send` and `spawn` so orchestration batches can be tracked under a named job
 
 ## 0.10.0 - 2026-03-12
 

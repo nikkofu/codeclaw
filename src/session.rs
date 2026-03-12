@@ -19,6 +19,7 @@ pub enum SessionKind {
 #[derive(Debug, Clone)]
 pub struct SessionSnapshot {
     pub id: String,
+    pub job_id: Option<String>,
     pub thread_id: String,
     pub title: String,
     pub subtitle: String,
@@ -60,6 +61,7 @@ pub struct SessionEvent {
 #[derive(Debug, Clone)]
 pub struct SessionView {
     id: String,
+    job_id: Option<String>,
     thread_id: String,
     title: String,
     summary: Option<String>,
@@ -84,6 +86,7 @@ impl SessionView {
     ) -> Self {
         Self {
             id: "master".to_owned(),
+            job_id: None,
             thread_id,
             title: "master".to_owned(),
             summary: summary.or_else(|| Some(DEFAULT_MASTER_SUMMARY.to_owned())),
@@ -103,6 +106,7 @@ impl SessionView {
     pub fn from_worker(worker: &WorkerRecord, cwd: String) -> Self {
         Self {
             id: worker.id.clone(),
+            job_id: worker.job_id.clone(),
             thread_id: worker.thread_id.clone(),
             title: format!("[{}] {}", worker.group, worker.task),
             summary: worker.summary.clone(),
@@ -252,6 +256,7 @@ impl SessionView {
 
         SessionSnapshot {
             id: self.id.clone(),
+            job_id: self.job_id.clone(),
             thread_id: self.thread_id.clone(),
             title: self.title.clone(),
             subtitle,
