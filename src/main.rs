@@ -2,6 +2,7 @@ mod app_server;
 mod config;
 mod controller;
 mod orchestration;
+mod service;
 mod session;
 mod state;
 mod ui;
@@ -9,6 +10,7 @@ mod ui;
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use controller::{BatchSnapshot, Controller, CreateJobRequest, JobSnapshot, PromptTarget};
+use service::{ServiceLifecycle, ServiceSnapshot};
 use session::{SessionEventKind, SessionKind, SessionSnapshot};
 use std::{
     collections::BTreeSet,
@@ -32,6 +34,14 @@ enum Command {
     Init,
     Doctor,
     Up,
+    Serve {
+        #[arg(long, default_value_t = 1500)]
+        interval_ms: u64,
+        #[arg(long, default_value_t = 900)]
+        stall_after_secs: u64,
+        #[arg(long, default_value_t = false)]
+        once: bool,
+    },
     Spawn {
         #[arg(long)]
         group: String,
@@ -48,10 +58,12 @@ enum Command {
         prompt: String,
     },
     Inspect {
-        #[arg(long, conflicts_with = "batch")]
+        #[arg(long, conflicts_with_all = ["batch", "service"])]
         session: Option<String>,
-        #[arg(long, conflicts_with = "session")]
+        #[arg(long, conflicts_with_all = ["session", "service"])]
         batch: Option<u64>,
+        #[arg(long, conflicts_with_all = ["session", "batch"])]
+        service: bool,
         #[arg(long, default_value_t = 10)]
         events: usize,
         #[arg(long, default_value_t = 8)]
@@ -106,6 +118,11 @@ async fn run() -> Result<()> {
         Command::Init => run_init(workspace_root).await,
         Command::Doctor => run_doctor(workspace_root).await,
         Command::Up => run_up(workspace_root).await,
+        Command::Serve {
+            interval_ms,
+            stall_after_secs,
+            once,
+        } => run_serve(workspace_root, interval_ms, stall_after_secs, once).await,
         Command::Spawn { group, task, job } => {
             run_spawn(workspace_root, &group, &task, job.as_deref()).await
         }
@@ -115,9 +132,10 @@ async fn run() -> Result<()> {
         Command::Inspect {
             session,
             batch,
+            service,
             events,
             output,
-        } => run_inspect(workspace_root, session, batch, events, output).await,
+        } => run_inspect(workspace_root, session, batch, service, events, output).await,
         Command::List => run_list(workspace_root).await,
         Command::Jobs => run_jobs(workspace_root).await,
         Command::Job { command } => run_job(workspace_root, command).await,
@@ -152,6 +170,74 @@ async fn run_up(workspace_root: PathBuf) -> Result<()> {
     let controller = Controller::start(workspace_root).await?;
     controller.init_workspace()?;
     ui::run(controller).await
+}
+
+async fn run_serve(
+    workspace_root: PathBuf,
+    interval_ms: u64,
+    stall_after_secs: u64,
+    once: bool,
+) -> Result<()> {
+    let controller = Controller::start(workspace_root).await?;
+    controller.init_workspace()?;
+
+    let started_at = state::now_unix_ts();
+    let interval = Duration::from_millis(interval_ms);
+    let mut tick = 0u64;
+
+    println!(
+        "service starting | interval_ms={} stall_after_secs={}",
+        interval_ms, stall_after_secs
+    );
+    controller
+        .write_service_lifecycle(ServiceLifecycle::Starting, started_at, tick, Vec::new(), None)?;
+
+    loop {
+        tick += 1;
+        match controller.service_tick(started_at, tick, stall_after_secs).await {
+            Ok(snapshot) => {
+                print_service_tick(&snapshot);
+            }
+            Err(error) => {
+                controller.write_service_lifecycle(
+                    ServiceLifecycle::Failed,
+                    started_at,
+                    tick,
+                    Vec::new(),
+                    Some(error.to_string()),
+                )?;
+                return Err(error);
+            }
+        }
+
+        if once {
+            controller.write_service_lifecycle(
+                ServiceLifecycle::Stopped,
+                started_at,
+                tick,
+                Vec::new(),
+                None,
+            )?;
+            println!("service stopped | mode=once");
+            return Ok(());
+        }
+
+        tokio::select! {
+            _ = tokio::time::sleep(interval) => {}
+            signal = tokio::signal::ctrl_c() => {
+                signal.context("failed to listen for ctrl-c")?;
+                controller.write_service_lifecycle(
+                    ServiceLifecycle::Stopped,
+                    started_at,
+                    tick,
+                    Vec::new(),
+                    None,
+                )?;
+                println!("service stopped | reason=ctrl-c");
+                return Ok(());
+            }
+        }
+    }
 }
 
 async fn run_spawn(
@@ -324,10 +410,19 @@ async fn run_inspect(
     workspace_root: PathBuf,
     session_id: Option<String>,
     batch_id: Option<u64>,
+    inspect_service: bool,
     events: usize,
     output: usize,
 ) -> Result<()> {
     let controller = Controller::start(workspace_root).await?;
+
+    if inspect_service {
+        let snapshot = controller
+            .service_snapshot()?
+            .context("service snapshot not found")?;
+        print_service_snapshot(&snapshot);
+        return Ok(());
+    }
 
     if let Some(batch_id) = batch_id {
         let batch = controller
@@ -686,6 +781,65 @@ fn print_job_snapshot(job: &JobSnapshot) {
     }
     if job.workers.is_empty() {
         println!("- no workers");
+    }
+}
+
+fn print_service_tick(snapshot: &ServiceSnapshot) {
+    println!(
+        "tick={} status={} pending={} running={} blocked={} completed={} failed={} workers={} dispatched={}",
+        snapshot.tick,
+        snapshot.status,
+        snapshot.pending_jobs.len(),
+        snapshot.running_jobs.len(),
+        snapshot.blocked_jobs.len(),
+        snapshot.completed_jobs.len(),
+        snapshot.failed_jobs.len(),
+        snapshot.running_workers.len(),
+        if snapshot.dispatched_jobs.is_empty() {
+            "-".to_owned()
+        } else {
+            snapshot.dispatched_jobs.join(",")
+        }
+    );
+}
+
+fn print_service_snapshot(snapshot: &ServiceSnapshot) {
+    println!("status: {}", snapshot.status);
+    println!("pid: {}", snapshot.pid);
+    println!("started: {}", snapshot.started_at);
+    println!("updated: {}", snapshot.updated_at);
+    println!("tick: {}", snapshot.tick);
+    println!(
+        "master thread: {}",
+        snapshot
+            .master_thread_id
+            .clone()
+            .unwrap_or_else(|| "-".to_owned())
+    );
+    println!(
+        "last error: {}",
+        snapshot.last_error.clone().unwrap_or_else(|| "-".to_owned())
+    );
+
+    print_named_ids("pending jobs", &snapshot.pending_jobs);
+    print_named_ids("running jobs", &snapshot.running_jobs);
+    print_named_ids("blocked jobs", &snapshot.blocked_jobs);
+    print_named_ids("completed jobs", &snapshot.completed_jobs);
+    print_named_ids("failed jobs", &snapshot.failed_jobs);
+    print_named_ids("stalled jobs", &snapshot.stalled_jobs);
+    print_named_ids("running workers", &snapshot.running_workers);
+    print_named_ids("last dispatched jobs", &snapshot.dispatched_jobs);
+}
+
+fn print_named_ids(label: &str, ids: &[String]) {
+    println!();
+    println!("{label} ({}):", ids.len());
+    if ids.is_empty() {
+        println!("- none");
+        return;
+    }
+    for id in ids {
+        println!("- {id}");
     }
 }
 

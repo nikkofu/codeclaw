@@ -6,6 +6,8 @@
 - aligned `README.md`, `docs/architecture.md`, and `docs/roadmap.md` so the current release baseline and next-phase direction are linked clearly
 - added a durable `Job` model with persisted job state, job-aware batch/worker linkage, and CLI commands for `jobs`, `job create`, and `job inspect`
 - added optional `--job` association for `send` and `spawn` so orchestration batches can be tracked under a named job
+- added `codeclaw serve` as a service-mode skeleton with scheduler ticks, persisted `service.json` heartbeat, and `inspect --service`
+- added service-side intake for pending jobs so background mode can submit new jobs into the master orchestration loop
 
 ## 0.10.0 - 2026-03-12
 

@@ -4,6 +4,7 @@ use crate::{
     orchestration::{
         parse_master_response, visible_stream_text, MasterAction, ParsedMasterResponse,
     },
+    service::{ServiceLifecycle, ServiceSnapshot},
     session::{
         SessionEvent, SessionEventKind, SessionSnapshot, SessionView, MAX_LOG_LINES,
         MAX_TIMELINE_EVENTS,
@@ -543,6 +544,68 @@ impl Controller {
 
         self.save_state()?;
         Ok(job)
+    }
+
+    pub fn service_snapshot(&self) -> Result<Option<ServiceSnapshot>> {
+        ServiceSnapshot::load(&self.service_file())
+    }
+
+    pub fn write_service_lifecycle(
+        &self,
+        lifecycle: ServiceLifecycle,
+        started_at: u64,
+        tick: u64,
+        dispatched_jobs: Vec<String>,
+        last_error: Option<String>,
+    ) -> Result<()> {
+        let snapshot = self.build_service_snapshot(
+            lifecycle,
+            started_at,
+            tick,
+            900,
+            dispatched_jobs,
+            last_error,
+        );
+        snapshot.write(&self.service_file())
+    }
+
+    pub async fn service_tick(
+        &self,
+        started_at: u64,
+        tick: u64,
+        stall_after_secs: u64,
+    ) -> Result<ServiceSnapshot> {
+        self.reconcile_jobs()?;
+
+        let pending_jobs = self.pending_service_jobs();
+        let has_live_jobs = !pending_jobs.is_empty()
+            || self.list_jobs().into_iter().any(|job| {
+                matches!(job.status, JobStatus::Running | JobStatus::Blocked)
+            });
+
+        if has_live_jobs {
+            let _ = self.ensure_master_thread().await?;
+        }
+
+        let mut dispatched_jobs = Vec::new();
+        for job in pending_jobs {
+            let prompt = service_job_intake_prompt(&job);
+            self.submit_prompt_for_job(PromptTarget::Master, &prompt, Some(&job.id))
+                .await?;
+            dispatched_jobs.push(job.id);
+        }
+
+        self.reconcile_jobs()?;
+        let snapshot = self.build_service_snapshot(
+            ServiceLifecycle::Running,
+            started_at,
+            tick,
+            stall_after_secs,
+            dispatched_jobs,
+            None,
+        );
+        snapshot.write(&self.service_file())?;
+        Ok(snapshot)
     }
 
     pub fn batch_snapshot(&self, batch_id: u64) -> Option<BatchSnapshot> {
@@ -2059,6 +2122,10 @@ impl Controller {
         state.save(&self.paths.state_file)
     }
 
+    fn service_file(&self) -> PathBuf {
+        self.paths.root.join("service.json")
+    }
+
     fn ensure_job_exists(&self, job_id: &str) -> Result<()> {
         let state = self.state.lock().expect("state lock poisoned");
         if state.jobs.contains_key(job_id) {
@@ -2162,10 +2229,111 @@ impl Controller {
         self.save_state()
     }
 
+    fn reconcile_jobs(&self) -> Result<()> {
+        let job_ids = {
+            let state = self.state.lock().expect("state lock poisoned");
+            state.jobs.keys().cloned().collect::<Vec<_>>()
+        };
+        for job_id in job_ids {
+            self.refresh_job_tracking(&job_id, None)?;
+        }
+        Ok(())
+    }
+
+    fn pending_service_jobs(&self) -> Vec<JobRecord> {
+        let state = self.state.lock().expect("state lock poisoned");
+        let mut jobs = state
+            .jobs
+            .values()
+            .filter(|job| matches!(job.status, JobStatus::Pending) && job.batch_ids.is_empty())
+            .cloned()
+            .collect::<Vec<_>>();
+        jobs.sort_by(|left, right| {
+            left.created_at
+                .cmp(&right.created_at)
+                .then_with(|| left.id.cmp(&right.id))
+        });
+        jobs
+    }
+
     fn job_for_batch(&self, batch_id: u64) -> Option<JobRecord> {
         let state = self.state.lock().expect("state lock poisoned");
         let job_id = state.batches.get(&batch_id)?.job_id.clone()?;
         state.jobs.get(&job_id).cloned()
+    }
+
+    fn build_service_snapshot(
+        &self,
+        lifecycle: ServiceLifecycle,
+        started_at: u64,
+        tick: u64,
+        stall_after_secs: u64,
+        dispatched_jobs: Vec<String>,
+        last_error: Option<String>,
+    ) -> ServiceSnapshot {
+        let now = now_unix_ts();
+        let current_pid = std::process::id();
+        let state = self.state.lock().expect("state lock poisoned");
+
+        let mut pending_jobs = Vec::new();
+        let mut running_jobs = Vec::new();
+        let mut blocked_jobs = Vec::new();
+        let mut completed_jobs = Vec::new();
+        let mut failed_jobs = Vec::new();
+        let mut stalled_jobs = Vec::new();
+
+        for job in state.jobs.values() {
+            match job.status {
+                JobStatus::Pending => pending_jobs.push(job.id.clone()),
+                JobStatus::Running => running_jobs.push(job.id.clone()),
+                JobStatus::Blocked => blocked_jobs.push(job.id.clone()),
+                JobStatus::Completed => completed_jobs.push(job.id.clone()),
+                JobStatus::Failed => failed_jobs.push(job.id.clone()),
+            }
+            if matches!(job.status, JobStatus::Running)
+                && now.saturating_sub(job.updated_at) >= stall_after_secs
+            {
+                stalled_jobs.push(job.id.clone());
+            }
+        }
+
+        let mut running_workers = state
+            .workers
+            .values()
+            .filter(|worker| {
+                matches!(
+                    worker.status,
+                    WorkerStatus::SpawnRequested | WorkerStatus::Bootstrapping | WorkerStatus::Running
+                )
+            })
+            .map(|worker| worker.id.clone())
+            .collect::<Vec<_>>();
+
+        pending_jobs.sort();
+        running_jobs.sort();
+        blocked_jobs.sort();
+        completed_jobs.sort();
+        failed_jobs.sort();
+        stalled_jobs.sort();
+        running_workers.sort();
+
+        ServiceSnapshot {
+            status: lifecycle,
+            pid: current_pid,
+            started_at,
+            updated_at: now,
+            tick,
+            master_thread_id: state.master_thread_id.clone(),
+            pending_jobs,
+            running_jobs,
+            blocked_jobs,
+            completed_jobs,
+            failed_jobs,
+            stalled_jobs,
+            running_workers,
+            dispatched_jobs,
+            last_error,
+        }
     }
 
     fn log_notification(&self, log_label: &str, notification: &Notification) -> Result<()> {
@@ -2805,6 +2973,23 @@ fn format_job_context(job: &JobRecord) -> String {
     )
 }
 
+fn service_job_intake_prompt(job: &JobRecord) -> String {
+    let context = job
+        .context
+        .clone()
+        .unwrap_or_else(|| "none".to_owned());
+    format!(
+        "New job intake for CodeClaw service mode.\n\nTitle: {}\nObjective: {}\nSource channel: {}\nPriority: {}\nPattern: {}\nApproval required: {}\nContext: {}\n\nPlan the job, keep the coordination summary concise, and dispatch worker actions if the work should start now. Respect the selected orchestration pattern and keep risky work approval-gated when required.",
+        job.title,
+        job.objective,
+        job.source_channel,
+        job.priority,
+        job.policy.pattern,
+        if job.policy.approval_required { "yes" } else { "no" },
+        context
+    )
+}
+
 fn render_task_file(
     task_number: u64,
     task: &str,
@@ -2946,10 +3131,13 @@ fn map_broadcast_error(error: broadcast::error::RecvError) -> anyhow::Error {
 mod tests {
     use super::{
         blocker_reason_from_message, completed_state_for_turn, derive_job_status_from_state,
-        lifecycle_note_for, worker_message_indicates_blocker, worker_status_for, SessionRole,
-        TurnSource,
+        lifecycle_note_for, service_job_intake_prompt, worker_message_indicates_blocker,
+        worker_status_for, SessionRole, TurnSource,
     };
-    use crate::state::{AppState, BatchStatus, JobStatus, OrchestrationBatchRecord, WorkerStatus};
+    use crate::state::{
+        AppState, BatchStatus, JobPolicy, JobRecord, JobStatus, OrchestrationBatchRecord,
+        WorkerStatus,
+    };
 
     #[test]
     fn worker_status_maps_lifecycle_states() {
@@ -3103,5 +3291,37 @@ mod tests {
             JobStatus::Completed
         );
         assert_eq!(derive_job_status_from_state(&state, &[], &[]), JobStatus::Pending);
+    }
+
+    #[test]
+    fn service_job_intake_prompt_carries_policy_context() {
+        let prompt = service_job_intake_prompt(&JobRecord {
+            id: "JOB-001".to_owned(),
+            source_channel: "cli".to_owned(),
+            requester: Some("operator".to_owned()),
+            title: "Payment API refactor".to_owned(),
+            objective: "Refactor payment orchestration".to_owned(),
+            context: Some("Keep rollout low risk".to_owned()),
+            status: JobStatus::Pending,
+            priority: "high".to_owned(),
+            policy: JobPolicy {
+                pattern: "planner_executor_reviewer".to_owned(),
+                approval_required: true,
+            },
+            created_at: 1,
+            updated_at: 1,
+            batch_ids: Vec::new(),
+            worker_ids: Vec::new(),
+            latest_summary: None,
+            latest_report_at: None,
+            next_report_due_at: None,
+            escalation_state: None,
+            final_outcome: None,
+        });
+
+        assert!(prompt.contains("Payment API refactor"));
+        assert!(prompt.contains("planner_executor_reviewer"));
+        assert!(prompt.contains("Approval required: yes"));
+        assert!(prompt.contains("Keep rollout low risk"));
     }
 }
