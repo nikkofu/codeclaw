@@ -35,6 +35,15 @@ Delivered scope in `0.10.0`:
 - acceptance scenarios in [docs/acceptance-use-cases.md](acceptance-use-cases.md)
 - sample configuration in [codeclaw.example.toml](../codeclaw.example.toml)
 
+## Strategic Planning Addendum
+
+The repository also includes a next-phase planning package derived from the `0.10.0` baseline. These documents describe the intended evolution path and do not imply that the capabilities are already delivered in the current release.
+
+- [docs/product-strategy.md](product-strategy.md)
+- [docs/system-architecture-v2.md](system-architecture-v2.md)
+- [docs/technical-roadmap.md](technical-roadmap.md)
+- [docs/project-plan.md](project-plan.md)
+
 ## Runtime Requirements
 
 - Rust toolchain capable of building the workspace

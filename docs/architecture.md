@@ -1,5 +1,14 @@
 # CodeClaw Architecture
 
+This document describes the current implemented architecture in release `0.10.0`.
+
+For the next-stage system direction, see:
+
+- [Product Strategy](product-strategy.md)
+- [System Architecture vNext](system-architecture-v2.md)
+- [Technical Roadmap](technical-roadmap.md)
+- [Project Plan](project-plan.md)
+
 ## 0. Implementation Status
 
 As of March 12, 2026, release `0.10.0` implements a working control-plane prototype, not just a design stub.

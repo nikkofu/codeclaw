@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+- added next-phase planning documents for product strategy, system architecture, technical roadmap, and project plan
+- aligned `README.md`, `docs/architecture.md`, and `docs/roadmap.md` so the current release baseline and next-phase direction are linked clearly
+
 ## 0.10.0 - 2026-03-12
 
 - persisted a rolling tail of live output per session, including in-flight assistant buffers, so restarts restore more than the timeline

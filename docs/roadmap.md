@@ -22,14 +22,27 @@ CodeClaw now has a functioning master-worker control loop:
 
 ## Next Phase
 
-The next engineering target is to harden supervision into long-running operator workflows:
+The next engineering target is to turn CodeClaw into a long-running agentic operations system on top of `codex app-server` rather than a TUI-only local prototype.
 
-- deepen right-pane folding and saved filter presets so operators can keep stable inspection views across long sessions
-- add machine-readable CLI output modes for scripting, dashboards, and external status polling
+Primary next-phase goals:
+
+- introduce a persistent `Job` model above batches and sessions
+- add `codeclaw serve` for 24x7 background orchestration
+- add proactive progress, blocker, and completion reporting
+- add a gateway-ready control plane so IM integration does not distort core orchestration logic
+- support explicit planner/executor/reviewer and approval-gated orchestration patterns as job policy, not ad hoc prompt forks
+- keep provider routing below CodeClaw so Codex runtime configuration can continue to use official or third-party Responses-compatible backends
+
+Detailed next-phase documents:
+
+- [Product Strategy](product-strategy.md)
+- [System Architecture vNext](system-architecture-v2.md)
+- [Technical Roadmap](technical-roadmap.md)
+- [Project Plan](project-plan.md)
 
 ## After That
 
-Once supervision history is stable, CodeClaw should move deeper into workspace isolation:
+Once job orchestration, reporting, and gateway support are stable, CodeClaw should move deeper into workspace isolation:
 
 - per-worker `git worktree` creation
 - branch lifecycle management
@@ -41,7 +54,7 @@ Once supervision history is stable, CodeClaw should move deeper into workspace i
 
 The intended end state remains:
 
-- the user speaks only to the master Codex
-- the master schedules and supervises child Codex workers
-- the UI shows each worker title, status, summary, and live execution state
+- the user or external gateway speaks to one CodeClaw control plane
+- CodeClaw coordinates master and worker Codex sessions over long-running jobs
+- progress, blockers, approvals, and outcomes stay transparent across TUI, CLI, and gateway channels
 - code changes stay isolated and mergeable

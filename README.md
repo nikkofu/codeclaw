@@ -8,12 +8,16 @@ It combines task routing, session management, shared coordination files, and Git
 
 - Version: `0.10.0`
 - Repository: `https://github.com/nikkofu/codeclaw`
-- Delivery package:
+- Delivery and planning package:
   - [Release Notes](RELEASE.md)
   - [Project Delivery](docs/project-delivery.md)
   - [User Guide](docs/user-guide.md)
   - [Operations Guide](docs/operations-guide.md)
   - [Acceptance Use Cases](docs/acceptance-use-cases.md)
+  - [Product Strategy](docs/product-strategy.md)
+  - [System Architecture vNext](docs/system-architecture-v2.md)
+  - [Technical Roadmap](docs/technical-roadmap.md)
+  - [Project Plan](docs/project-plan.md)
 
 ## Current Status
 
@@ -155,6 +159,10 @@ The `spawn` command now also shows terminal-side progress feedback while it wait
 - Changelog: [CHANGELOG.md](CHANGELOG.md)
 - Release notes: [RELEASE.md](RELEASE.md)
 - Architecture notes: [docs/architecture.md](docs/architecture.md)
+- Product strategy: [docs/product-strategy.md](docs/product-strategy.md)
+- System architecture vNext: [docs/system-architecture-v2.md](docs/system-architecture-v2.md)
+- Technical roadmap: [docs/technical-roadmap.md](docs/technical-roadmap.md)
+- Project plan: [docs/project-plan.md](docs/project-plan.md)
 - Project delivery: [docs/project-delivery.md](docs/project-delivery.md)
 - User guide: [docs/user-guide.md](docs/user-guide.md)
 - Operations guide: [docs/operations-guide.md](docs/operations-guide.md)
