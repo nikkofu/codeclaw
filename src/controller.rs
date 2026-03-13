@@ -1,7 +1,7 @@
 use crate::{
     app_server::{AppServerClient, Notification},
     config::{Config, CoordinationPaths, GroupConfig},
-    gateway,
+    gateway, logging,
     orchestration::{
         parse_master_response, visible_stream_text, MasterAction, ParsedMasterResponse,
     },
@@ -21,8 +21,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
     collections::{BTreeMap, VecDeque},
-    fs::{self, OpenOptions},
-    io::Write,
+    fs,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
     time::Duration,
@@ -30,7 +29,9 @@ use std::{
 use tokio::sync::{broadcast, oneshot};
 
 const MASTER_SESSION_ID: &str = "master";
+const ONBOARD_SESSION_ID: &str = "onboard";
 const DEFAULT_REPORT_CADENCE_SECS: u64 = 900;
+const DEFAULT_AUTOMATION_CONTINUE_INTERVAL_SECS: u64 = 300;
 const MAX_JOB_REPORTS_PER_JOB: usize = 32;
 const MAX_JOB_DELIVERIES_PER_JOB: usize = 64;
 
@@ -92,7 +93,23 @@ pub struct CreateJobRequest {
     pub priority: String,
     pub pattern: String,
     pub approval_required: bool,
+    pub auto_approve: bool,
+    pub delegate_to_master_loop: bool,
+    pub continue_for_secs: Option<u64>,
+    pub continue_max_iterations: Option<u32>,
     pub context: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct JobAutomationSnapshot {
+    pub state: String,
+    pub auto_approve: bool,
+    pub delegate_to_master_loop: bool,
+    pub automation_started_at: Option<u64>,
+    pub last_continue_at: Option<u64>,
+    pub continue_iterations: u32,
+    pub remaining_secs: Option<u64>,
+    pub remaining_iterations: Option<u32>,
 }
 
 #[derive(Debug, Clone)]
@@ -124,6 +141,10 @@ pub struct JobSnapshot {
     pub priority: String,
     pub pattern: String,
     pub approval_required: bool,
+    pub auto_approve: bool,
+    pub delegate_to_master_loop: bool,
+    pub continue_for_secs: Option<u64>,
+    pub continue_max_iterations: Option<u32>,
     pub created_at: u64,
     pub updated_at: u64,
     pub latest_summary: Option<String>,
@@ -131,6 +152,7 @@ pub struct JobSnapshot {
     pub next_report_due_at: Option<u64>,
     pub escalation_state: Option<String>,
     pub final_outcome: Option<String>,
+    pub automation: JobAutomationSnapshot,
     pub context: Option<String>,
     pub batch_ids: Vec<JobBatchSnapshot>,
     pub workers: Vec<JobWorkerSnapshot>,
@@ -166,6 +188,35 @@ pub struct JobDeliverySnapshot {
     pub attempts: u32,
     pub updated_at: u64,
     pub last_error: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct OnboardLaneItem {
+    pub job_id: String,
+    pub title: String,
+    pub status: String,
+    pub summary: String,
+    pub workers: usize,
+    pub automation: JobAutomationSnapshot,
+}
+
+#[derive(Debug, Clone)]
+pub struct OnboardSnapshot {
+    pub status: String,
+    pub summary: String,
+    pub service_status: Option<String>,
+    pub service_tick: Option<u64>,
+    pub running_workers: usize,
+    pub queued_deliveries: usize,
+    pub delegated_jobs: usize,
+    pub auto_approve_jobs: usize,
+    pub budget_exhausted_jobs: usize,
+    pub continued_jobs: Vec<String>,
+    pub pending: Vec<OnboardLaneItem>,
+    pub running: Vec<OnboardLaneItem>,
+    pub blocked: Vec<OnboardLaneItem>,
+    pub completed: Vec<OnboardLaneItem>,
+    pub failed: Vec<OnboardLaneItem>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -384,6 +435,9 @@ impl Controller {
                 env!("CARGO_PKG_NAME"),
                 env!("CARGO_PKG_VERSION"),
                 &config.master.reasoning_effort,
+                paths.log_dir.clone(),
+                config.logging.retention_days,
+                config.logging.notification_channel_capacity,
             )
             .await?,
         );
@@ -403,6 +457,7 @@ impl Controller {
     pub fn init_workspace(&self) -> Result<Option<PathBuf>> {
         let config_path = Config::write_default_config_if_missing(&self.workspace_root)?;
         self.paths.ensure_layout()?;
+        self.maintain_logs()?;
         self.save_state()?;
         self.write_master_status(
             "idle",
@@ -418,6 +473,9 @@ impl Controller {
             env!("CARGO_PKG_NAME"),
             env!("CARGO_PKG_VERSION"),
             &self.config.master.reasoning_effort,
+            self.paths.log_dir.clone(),
+            self.config.logging.retention_days,
+            self.config.logging.notification_channel_capacity,
         )
         .await?;
         let response: ThreadStartResponse = client
@@ -456,6 +514,9 @@ impl Controller {
             .values()
             .map(SessionView::snapshot)
             .collect::<Vec<_>>();
+        drop(sessions);
+        snapshots = self.annotate_session_snapshots(snapshots);
+        snapshots.push(self.onboard_session_snapshot());
         snapshots.sort_by(|left, right| {
             session_sort_key(&left.id)
                 .cmp(&session_sort_key(&right.id))
@@ -465,8 +526,193 @@ impl Controller {
     }
 
     pub fn session_snapshot(&self, session_id: &str) -> Option<SessionSnapshot> {
+        if session_id == ONBOARD_SESSION_ID {
+            return Some(self.onboard_session_snapshot());
+        }
         let sessions = self.sessions.lock().expect("sessions lock poisoned");
-        sessions.get(session_id).map(SessionView::snapshot)
+        let snapshot = sessions.get(session_id).map(SessionView::snapshot)?;
+        drop(sessions);
+        Some(self.annotate_session_snapshot(snapshot))
+    }
+
+    pub fn onboard_snapshot(&self) -> OnboardSnapshot {
+        let now = now_unix_ts();
+        let service = self.service_snapshot().ok().flatten();
+        let state = self.state.lock().expect("state lock poisoned");
+
+        let mut pending = Vec::new();
+        let mut running = Vec::new();
+        let mut blocked = Vec::new();
+        let mut completed = Vec::new();
+        let mut failed = Vec::new();
+        let mut delegated_jobs = 0usize;
+        let mut auto_approve_jobs = 0usize;
+        let mut budget_exhausted_jobs = 0usize;
+
+        for job in state.jobs.values() {
+            let automation = job_automation_snapshot(job, now);
+            if job.policy.delegate_to_master_loop {
+                delegated_jobs += 1;
+            }
+            if job.policy.auto_approve {
+                auto_approve_jobs += 1;
+            }
+            if matches!(
+                automation.state.as_str(),
+                "budget_exhausted_time" | "budget_exhausted_iterations"
+            ) {
+                budget_exhausted_jobs += 1;
+            }
+
+            let item = OnboardLaneItem {
+                job_id: job.id.clone(),
+                title: job.title.clone(),
+                status: job.status.to_string(),
+                summary: job
+                    .latest_summary
+                    .clone()
+                    .unwrap_or_else(|| default_summary_for_job_status(&job.status).to_owned()),
+                workers: job.worker_ids.len(),
+                automation,
+            };
+
+            match job.status {
+                JobStatus::Pending => pending.push(item),
+                JobStatus::Running => running.push(item),
+                JobStatus::Blocked => blocked.push(item),
+                JobStatus::Completed => completed.push(item),
+                JobStatus::Failed => failed.push(item),
+            }
+        }
+
+        for lane in [
+            &mut pending,
+            &mut running,
+            &mut blocked,
+            &mut completed,
+            &mut failed,
+        ] {
+            lane.sort_by(|left, right| left.job_id.cmp(&right.job_id));
+        }
+
+        let summary = format!(
+            "{} pending | {} running | {} blocked | {} completed | {} failed",
+            pending.len(),
+            running.len(),
+            blocked.len(),
+            completed.len(),
+            failed.len()
+        );
+        let status = if !blocked.is_empty() {
+            "blocked"
+        } else if !running.is_empty() || !pending.is_empty() {
+            "running"
+        } else if !failed.is_empty() && completed.is_empty() {
+            "failed"
+        } else if !completed.is_empty() {
+            "completed"
+        } else {
+            "idle"
+        }
+        .to_owned();
+
+        OnboardSnapshot {
+            status,
+            summary,
+            service_status: service.as_ref().map(|snapshot| snapshot.status.to_string()),
+            service_tick: service.as_ref().map(|snapshot| snapshot.tick),
+            running_workers: service
+                .as_ref()
+                .map(|snapshot| snapshot.running_workers.len())
+                .unwrap_or_else(|| {
+                    state
+                        .workers
+                        .values()
+                        .filter(|worker| {
+                            matches!(
+                                worker.status,
+                                WorkerStatus::SpawnRequested
+                                    | WorkerStatus::Bootstrapping
+                                    | WorkerStatus::Running
+                            )
+                        })
+                        .count()
+                }),
+            queued_deliveries: service
+                .as_ref()
+                .map(|snapshot| snapshot.queued_deliveries.len())
+                .unwrap_or_else(|| {
+                    state
+                        .report_deliveries
+                        .values()
+                        .filter(|delivery| matches!(delivery.status, ReportDeliveryStatus::Queued))
+                        .count()
+                }),
+            delegated_jobs,
+            auto_approve_jobs,
+            budget_exhausted_jobs,
+            continued_jobs: service
+                .map(|snapshot| snapshot.continued_jobs)
+                .unwrap_or_default(),
+            pending,
+            running,
+            blocked,
+            completed,
+            failed,
+        }
+    }
+
+    fn onboard_session_snapshot(&self) -> SessionSnapshot {
+        let onboard = self.onboard_snapshot();
+        let mut session = SessionView::onboard(
+            self.workspace_root.display().to_string(),
+            Some(onboard.summary.clone()),
+            Some(format!(
+                "delegated={} auto={} exhausted={}",
+                onboard.delegated_jobs, onboard.auto_approve_jobs, onboard.budget_exhausted_jobs
+            )),
+        );
+        session.set_status(onboard.status.clone());
+        session.set_lifecycle_note(Some(format!(
+            "workers={} | queued deliveries={} | continued this tick={}",
+            onboard.running_workers,
+            onboard.queued_deliveries,
+            onboard.continued_jobs.len()
+        )));
+        session.snapshot()
+    }
+
+    fn annotate_session_snapshots(&self, snapshots: Vec<SessionSnapshot>) -> Vec<SessionSnapshot> {
+        snapshots
+            .into_iter()
+            .map(|snapshot| self.annotate_session_snapshot(snapshot))
+            .collect()
+    }
+
+    fn annotate_session_snapshot(&self, mut snapshot: SessionSnapshot) -> SessionSnapshot {
+        let Some(job_id) = snapshot.job_id.as_deref() else {
+            return snapshot;
+        };
+        let state = self.state.lock().expect("state lock poisoned");
+        let Some(job) = state.jobs.get(job_id) else {
+            return snapshot;
+        };
+        let automation = job_automation_snapshot(job, now_unix_ts());
+        let mut badges = Vec::new();
+        if job.policy.delegate_to_master_loop {
+            badges.push(format!("loop:{}", automation.state));
+        }
+        if job.policy.auto_approve {
+            badges.push("auto-approve".to_owned());
+        }
+        if !badges.is_empty() {
+            let note = badges.join(" | ");
+            snapshot.subtitle = format!("{} | {}", note, snapshot.subtitle);
+            if snapshot.lifecycle_note.is_none() {
+                snapshot.lifecycle_note = Some(note);
+            }
+        }
+        snapshot
     }
 
     pub fn list_workers(&self) -> Vec<WorkerRecord> {
@@ -488,6 +734,7 @@ impl Controller {
     pub fn job_snapshot(&self, job_id: &str) -> Option<JobSnapshot> {
         let state = self.state.lock().expect("state lock poisoned");
         let job = state.jobs.get(job_id).cloned()?;
+        let automation = job_automation_snapshot(&job, now_unix_ts());
 
         let mut batches = job
             .batch_ids
@@ -577,6 +824,10 @@ impl Controller {
             priority: job.priority,
             pattern: job.policy.pattern,
             approval_required: job.policy.approval_required,
+            auto_approve: job.policy.auto_approve,
+            delegate_to_master_loop: job.policy.delegate_to_master_loop,
+            continue_for_secs: job.policy.continue_for_secs,
+            continue_max_iterations: job.policy.continue_max_iterations,
             created_at: job.created_at,
             updated_at: job.updated_at,
             latest_summary: job.latest_summary,
@@ -584,6 +835,7 @@ impl Controller {
             next_report_due_at: job.next_report_due_at,
             escalation_state: job.escalation_state,
             final_outcome: job.final_outcome,
+            automation,
             context: job.context,
             batch_ids: batches,
             workers,
@@ -621,6 +873,10 @@ impl Controller {
                 policy: JobPolicy {
                     pattern: request.pattern,
                     approval_required: request.approval_required,
+                    auto_approve: request.auto_approve,
+                    delegate_to_master_loop: request.delegate_to_master_loop,
+                    continue_for_secs: request.continue_for_secs,
+                    continue_max_iterations: request.continue_max_iterations,
                 },
                 created_at: now,
                 updated_at: now,
@@ -631,6 +887,9 @@ impl Controller {
                 next_report_due_at: None,
                 escalation_state: None,
                 final_outcome: None,
+                automation_started_at: None,
+                last_continue_at: None,
+                continue_iterations: 0,
             };
             state.jobs.insert(job.id.clone(), job.clone());
             job
@@ -722,6 +981,7 @@ impl Controller {
             dispatched_jobs,
             Vec::new(),
             Vec::new(),
+            Vec::new(),
             last_error,
         );
         snapshot.write(&self.service_file())
@@ -755,6 +1015,7 @@ impl Controller {
         }
 
         self.reconcile_jobs()?;
+        let continued_jobs = self.continue_automated_jobs().await?;
         let generated_reports = self.emit_due_job_reports()?;
         let delivered_notifications = self.deliver_queued_reports()?;
         let snapshot = self.build_service_snapshot(
@@ -763,6 +1024,7 @@ impl Controller {
             tick,
             stall_after_secs,
             dispatched_jobs,
+            continued_jobs,
             generated_reports,
             delivered_notifications,
             None,
@@ -1456,7 +1718,33 @@ impl Controller {
         let mut final_error: Option<TurnError> = None;
 
         loop {
-            let notification = receiver.recv().await.map_err(map_broadcast_error)?;
+            let notification = match receiver.recv().await {
+                Ok(notification) => notification,
+                Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                    let warning =
+                        format!("app-server notification stream lagged; skipped {skipped} events");
+                    self.append_log_line(&session_id, format!("warn> {warning}"))?;
+                    self.append_session_event(
+                        &session_id,
+                        SessionEventKind::Error,
+                        warning.clone(),
+                        Some(batch_id),
+                    )?;
+                    self.log_runtime_event(
+                        "warn",
+                        "app-server notification stream lagged",
+                        Some(&session_id),
+                        json!({
+                            "thread_id": thread_id,
+                            "turn_id": turn_id,
+                            "skipped": skipped,
+                            "log_label": log_label,
+                        }),
+                    )?;
+                    continue;
+                }
+                Err(error) => return Err(map_broadcast_error(error)),
+            };
             self.log_notification(&log_label, &notification)?;
 
             match notification.method.as_str() {
@@ -2295,6 +2583,46 @@ impl Controller {
         self.paths.root.join("service.json")
     }
 
+    fn maintain_logs(&self) -> Result<()> {
+        let entry = json!({
+            "ts": now_unix_ts(),
+            "level": "info",
+            "source": "controller",
+            "message": "log maintenance",
+        });
+        let _ = logging::append_jsonl(
+            &self.paths.log_dir,
+            self.config.logging.retention_days,
+            "runtime/maintenance",
+            &entry,
+        )?;
+        Ok(())
+    }
+
+    fn log_runtime_event(
+        &self,
+        level: &str,
+        message: &str,
+        session_id: Option<&str>,
+        fields: Value,
+    ) -> Result<()> {
+        let entry = json!({
+            "ts": now_unix_ts(),
+            "level": level,
+            "source": "controller",
+            "session_id": session_id,
+            "message": message,
+            "fields": fields,
+        });
+        logging::append_jsonl(
+            &self.paths.log_dir,
+            self.config.logging.retention_days,
+            "runtime/controller",
+            &entry,
+        )?;
+        Ok(())
+    }
+
     fn ensure_job_exists(&self, job_id: &str) -> Result<()> {
         let state = self.state.lock().expect("state lock poisoned");
         if state.jobs.contains_key(job_id) {
@@ -2465,6 +2793,63 @@ impl Controller {
                 .then_with(|| left.id.cmp(&right.id))
         });
         jobs
+    }
+
+    async fn continue_automated_jobs(&self) -> Result<Vec<String>> {
+        if self.session_is_busy(MASTER_SESSION_ID) {
+            return Ok(Vec::new());
+        }
+
+        let candidate = {
+            let now = now_unix_ts();
+            let state = self.state.lock().expect("state lock poisoned");
+            state
+                .jobs
+                .values()
+                .filter(|job| job_is_eligible_for_master_loop(job, now))
+                .filter(|job| !job_has_active_workers(&state, job))
+                .min_by(|left, right| {
+                    left.last_continue_at
+                        .unwrap_or(0)
+                        .cmp(&right.last_continue_at.unwrap_or(0))
+                        .then_with(|| left.updated_at.cmp(&right.updated_at))
+                        .then_with(|| left.id.cmp(&right.id))
+                })
+                .cloned()
+        };
+
+        let Some(job) = candidate else {
+            return Ok(Vec::new());
+        };
+
+        let automation = job_automation_snapshot(&job, now_unix_ts());
+        let prompt = service_job_continue_prompt(&job, &automation);
+        self.mark_job_continue_dispatch(&job.id)?;
+        self.submit_prompt_for_job(PromptTarget::Master, &prompt, Some(&job.id))
+            .await?;
+        Ok(vec![job.id])
+    }
+
+    fn mark_job_continue_dispatch(&self, job_id: &str) -> Result<()> {
+        let now = now_unix_ts();
+        {
+            let mut state = self.state.lock().expect("state lock poisoned");
+            let job = state
+                .jobs
+                .get_mut(job_id)
+                .with_context(|| format!("unknown job `{job_id}`"))?;
+            if job.automation_started_at.is_none() {
+                job.automation_started_at = Some(now);
+            }
+            job.last_continue_at = Some(now);
+            job.continue_iterations += 1;
+            job.updated_at = now;
+            job.latest_summary = Some(format!(
+                "onboard delegated master loop pass {}",
+                job.continue_iterations
+            ));
+        }
+        self.save_state()
     }
 
     fn emit_due_job_reports(&self) -> Result<Vec<String>> {
@@ -2714,6 +3099,7 @@ impl Controller {
         tick: u64,
         stall_after_secs: u64,
         dispatched_jobs: Vec<String>,
+        continued_jobs: Vec<String>,
         generated_reports: Vec<String>,
         delivered_notifications: Vec<String>,
         last_error: Option<String>,
@@ -2728,6 +3114,9 @@ impl Controller {
         let mut completed_jobs = Vec::new();
         let mut failed_jobs = Vec::new();
         let mut stalled_jobs = Vec::new();
+        let mut delegated_jobs = Vec::new();
+        let mut auto_approve_jobs = Vec::new();
+        let mut budget_exhausted_jobs = Vec::new();
         let mut queued_deliveries = state
             .report_deliveries
             .values()
@@ -2747,6 +3136,18 @@ impl Controller {
                 && now.saturating_sub(job.updated_at) >= stall_after_secs
             {
                 stalled_jobs.push(job.id.clone());
+            }
+            if job.policy.delegate_to_master_loop {
+                delegated_jobs.push(job.id.clone());
+            }
+            if job.policy.auto_approve {
+                auto_approve_jobs.push(job.id.clone());
+            }
+            if matches!(
+                job_automation_snapshot(job, now).state.as_str(),
+                "budget_exhausted_time" | "budget_exhausted_iterations"
+            ) {
+                budget_exhausted_jobs.push(job.id.clone());
             }
         }
 
@@ -2772,6 +3173,9 @@ impl Controller {
         stalled_jobs.sort();
         running_workers.sort();
         queued_deliveries.sort();
+        delegated_jobs.sort();
+        auto_approve_jobs.sort();
+        budget_exhausted_jobs.sort();
 
         ServiceSnapshot {
             status: lifecycle,
@@ -2788,27 +3192,30 @@ impl Controller {
             stalled_jobs,
             running_workers,
             dispatched_jobs,
+            continued_jobs,
             generated_reports,
             queued_deliveries,
             delivered_notifications,
+            delegated_jobs,
+            auto_approve_jobs,
+            budget_exhausted_jobs,
             last_error,
         }
     }
 
     fn log_notification(&self, log_label: &str, notification: &Notification) -> Result<()> {
-        let log_path = self.paths.log_dir.join(format!("{log_label}.jsonl"));
-        let mut file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&log_path)
-            .with_context(|| format!("failed to open {}", log_path.display()))?;
-        let line = serde_json::to_string(&json!({
+        let entry = json!({
             "ts": now_unix_ts(),
             "method": notification.method,
             "params": notification.params,
-        }))
-        .context("failed to encode log entry")?;
-        writeln!(file, "{line}").with_context(|| format!("failed to append {}", log_path.display()))
+        });
+        logging::append_jsonl(
+            &self.paths.log_dir,
+            self.config.logging.retention_days,
+            &format!("sessions/{log_label}"),
+            &entry,
+        )?;
+        Ok(())
     }
 
     fn write_role_status(
@@ -3223,10 +3630,12 @@ fn build_sessions(state: &AppState, workspace_root: &Path) -> BTreeMap<String, S
 }
 
 fn session_sort_key(id: &str) -> (u8, &str) {
-    if id == MASTER_SESSION_ID {
+    if id == ONBOARD_SESSION_ID {
         (0, id)
-    } else {
+    } else if id == MASTER_SESSION_ID {
         (1, id)
+    } else {
+        (2, id)
     }
 }
 
@@ -3412,8 +3821,9 @@ fn format_job_context(job: &JobRecord) -> String {
         .clone()
         .unwrap_or_else(|| "unknown".to_owned());
     let context = job.context.clone().unwrap_or_else(|| "none".to_owned());
+    let automation = job_automation_snapshot(job, now_unix_ts());
     format!(
-        "Job context:\n- Job id: {}\n- Title: {}\n- Objective: {}\n- Source channel: {}\n- Requester: {}\n- Priority: {}\n- Pattern: {}\n- Approval required: {}\n- Current summary: {}\n- Context: {}",
+        "Job context:\n- Job id: {}\n- Title: {}\n- Objective: {}\n- Source channel: {}\n- Requester: {}\n- Priority: {}\n- Pattern: {}\n- Approval required: {}\n- Auto approve: {}\n- Delegate master loop: {}\n- Automation state: {}\n- Current summary: {}\n- Context: {}",
         job.id,
         job.title,
         job.objective,
@@ -3422,6 +3832,9 @@ fn format_job_context(job: &JobRecord) -> String {
         job.priority,
         job.policy.pattern,
         if job.policy.approval_required { "yes" } else { "no" },
+        if job.policy.auto_approve { "yes" } else { "no" },
+        if job.policy.delegate_to_master_loop { "yes" } else { "no" },
+        automation_state_label(&automation.state),
         job.latest_summary
             .clone()
             .unwrap_or_else(|| "none".to_owned()),
@@ -3495,9 +3908,10 @@ fn render_job_report_body(job: &JobRecord, kind: JobReportKind, summary: Option<
         .unwrap_or_else(|| "unknown".to_owned());
     let context = job.context.clone().unwrap_or_else(|| "none".to_owned());
     let next_step = next_step_for_job_status(&job.status, &job.policy.approval_required);
+    let automation = job_automation_snapshot(job, now_unix_ts());
 
     format!(
-        "Job: {}\nKind: {}\nStatus: {}\nSummary: {}\nRequester: {}\nSource channel: {}\nPriority: {}\nPattern: {}\nApproval required: {}\nBatches: {}\nWorkers: {}\nContext: {}\nNext step: {}",
+        "Job: {}\nKind: {}\nStatus: {}\nSummary: {}\nRequester: {}\nSource channel: {}\nPriority: {}\nPattern: {}\nApproval required: {}\nAuto approve: {}\nDelegate master loop: {}\nAutomation state: {}\nContinue budget secs: {}\nContinue budget iterations: {}\nContinue iterations used: {}\nBatches: {}\nWorkers: {}\nContext: {}\nNext step: {}",
         job.id,
         kind,
         job.status,
@@ -3507,6 +3921,18 @@ fn render_job_report_body(job: &JobRecord, kind: JobReportKind, summary: Option<
         job.priority,
         job.policy.pattern,
         if job.policy.approval_required { "yes" } else { "no" },
+        if job.policy.auto_approve { "yes" } else { "no" },
+        if job.policy.delegate_to_master_loop { "yes" } else { "no" },
+        automation_state_label(&automation.state),
+        job.policy
+            .continue_for_secs
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "-".to_owned()),
+        job.policy
+            .continue_max_iterations
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "-".to_owned()),
+        job.continue_iterations,
         job.batch_ids.len(),
         job.worker_ids.len(),
         context,
@@ -3534,6 +3960,112 @@ fn next_step_for_job_status(status: &JobStatus, approval_required: &bool) -> &'s
         JobStatus::Blocked => "operator attention is likely required to unblock work",
         JobStatus::Completed => "deliver completion summary and close the job",
         JobStatus::Failed => "inspect failure details and decide whether to retry or escalate",
+    }
+}
+
+fn job_automation_snapshot(job: &JobRecord, now: u64) -> JobAutomationSnapshot {
+    let remaining_secs = match (job.automation_started_at, job.policy.continue_for_secs) {
+        (_, None) => None,
+        (Some(started_at), Some(limit)) => {
+            Some(limit.saturating_sub(now.saturating_sub(started_at)))
+        }
+        (None, Some(limit)) => Some(limit),
+    };
+    let remaining_iterations = job
+        .policy
+        .continue_max_iterations
+        .map(|limit| limit.saturating_sub(job.continue_iterations));
+
+    let state = if !job.policy.delegate_to_master_loop {
+        "manual"
+    } else if matches!(job.status, JobStatus::Completed | JobStatus::Failed) {
+        "terminal"
+    } else if matches!(remaining_secs, Some(0)) {
+        "budget_exhausted_time"
+    } else if matches!(remaining_iterations, Some(0)) {
+        "budget_exhausted_iterations"
+    } else if matches!(job.status, JobStatus::Blocked)
+        && job.policy.approval_required
+        && !job.policy.auto_approve
+    {
+        "awaiting_manual_approval"
+    } else if job.automation_started_at.is_some() {
+        "active"
+    } else {
+        "armed"
+    };
+
+    JobAutomationSnapshot {
+        state: state.to_owned(),
+        auto_approve: job.policy.auto_approve,
+        delegate_to_master_loop: job.policy.delegate_to_master_loop,
+        automation_started_at: job.automation_started_at,
+        last_continue_at: job.last_continue_at,
+        continue_iterations: job.continue_iterations,
+        remaining_secs,
+        remaining_iterations,
+    }
+}
+
+fn job_is_eligible_for_master_loop(job: &JobRecord, now: u64) -> bool {
+    if !matches!(job.status, JobStatus::Running | JobStatus::Blocked) {
+        return false;
+    }
+
+    let automation = job_automation_snapshot(job, now);
+    if !matches!(automation.state.as_str(), "armed" | "active") {
+        return false;
+    }
+
+    if let Some(last_continue_at) = job.last_continue_at {
+        if now.saturating_sub(last_continue_at) < DEFAULT_AUTOMATION_CONTINUE_INTERVAL_SECS {
+            return false;
+        }
+    }
+
+    true
+}
+
+fn job_has_active_workers(state: &AppState, job: &JobRecord) -> bool {
+    job.worker_ids.iter().any(|worker_id| {
+        state
+            .workers
+            .get(worker_id)
+            .map(|worker| {
+                matches!(
+                    worker.status,
+                    WorkerStatus::SpawnRequested
+                        | WorkerStatus::Bootstrapping
+                        | WorkerStatus::Running
+                )
+            })
+            .unwrap_or(false)
+    })
+}
+
+fn automation_state_label(state: &str) -> &'static str {
+    match state {
+        "manual" => "manual",
+        "armed" => "armed",
+        "active" => "active",
+        "awaiting_manual_approval" => "awaiting approval",
+        "budget_exhausted_time" => "time exhausted",
+        "budget_exhausted_iterations" => "loop exhausted",
+        "terminal" => "terminal",
+        _ => "unknown",
+    }
+}
+
+fn format_duration_compact(total_secs: u64) -> String {
+    let hours = total_secs / 3600;
+    let minutes = (total_secs % 3600) / 60;
+    let seconds = total_secs % 60;
+    if hours > 0 {
+        format!("{hours}h{minutes:02}m")
+    } else if minutes > 0 {
+        format!("{minutes}m{seconds:02}s")
+    } else {
+        format!("{seconds}s")
     }
 }
 
@@ -3598,6 +4130,38 @@ fn service_job_intake_prompt(job: &JobRecord) -> String {
         job.priority,
         job.policy.pattern,
         if job.policy.approval_required { "yes" } else { "no" },
+        context
+    )
+}
+
+fn service_job_continue_prompt(job: &JobRecord, automation: &JobAutomationSnapshot) -> String {
+    let remaining_secs = automation
+        .remaining_secs
+        .map(format_duration_compact)
+        .unwrap_or_else(|| "unbounded".to_owned());
+    let remaining_iterations = automation
+        .remaining_iterations
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "unbounded".to_owned());
+    let context = job.context.clone().unwrap_or_else(|| "none".to_owned());
+
+    format!(
+        "Onboard supervision loop for CodeClaw service mode.\n\nJob id: {}\nTitle: {}\nObjective: {}\nCurrent status: {}\nCurrent summary: {}\nPriority: {}\nApproval required: {}\nAuto approve: {}\nDelegate master loop: {}\nAutomation state: {}\nRemaining automation time: {}\nRemaining automation iterations: {}\nContinue iterations used: {}\nContext: {}\n\nDecide whether this job should continue now. If more work is needed, plan the next safe step and dispatch workers as needed. If the job should pause, say why. Respect approval boundaries and avoid infinite loops.",
+        job.id,
+        job.title,
+        job.objective,
+        job.status,
+        job.latest_summary
+            .clone()
+            .unwrap_or_else(|| default_summary_for_job_status(&job.status).to_owned()),
+        job.priority,
+        if job.policy.approval_required { "yes" } else { "no" },
+        if job.policy.auto_approve { "yes" } else { "no" },
+        if job.policy.delegate_to_master_loop { "yes" } else { "no" },
+        automation_state_label(&automation.state),
+        remaining_secs,
+        remaining_iterations,
+        job.continue_iterations,
         context
     )
 }
@@ -3742,10 +4306,11 @@ fn map_broadcast_error(error: broadcast::error::RecvError) -> anyhow::Error {
 #[cfg(test)]
 mod tests {
     use super::{
-        blocker_reason_from_message, completed_state_for_turn, derive_job_status_from_state,
+        automation_state_label, blocker_reason_from_message, completed_state_for_turn,
+        derive_job_status_from_state, job_automation_snapshot, job_is_eligible_for_master_loop,
         lifecycle_note_for, render_job_report_body, report_kind_for_job_update,
-        report_summary_for_job_update, service_job_intake_prompt, worker_message_indicates_blocker,
-        worker_status_for, SessionRole, TurnSource,
+        report_summary_for_job_update, service_job_continue_prompt, service_job_intake_prompt,
+        worker_message_indicates_blocker, worker_status_for, SessionRole, TurnSource,
     };
     use crate::state::{
         AppState, BatchStatus, JobPolicy, JobRecord, JobReportKind, JobStatus,
@@ -3923,6 +4488,10 @@ mod tests {
             policy: JobPolicy {
                 pattern: "planner_executor_reviewer".to_owned(),
                 approval_required: true,
+                auto_approve: false,
+                delegate_to_master_loop: false,
+                continue_for_secs: None,
+                continue_max_iterations: None,
             },
             created_at: 1,
             updated_at: 1,
@@ -3933,6 +4502,9 @@ mod tests {
             next_report_due_at: None,
             escalation_state: None,
             final_outcome: None,
+            automation_started_at: None,
+            last_continue_at: None,
+            continue_iterations: 0,
         };
         let prompt = service_job_intake_prompt(&job);
 
@@ -3989,5 +4561,91 @@ mod tests {
         assert!(body.contains("Kind: blocker"));
         assert!(body.contains("Status: blocked"));
         assert!(body.contains("Next step: operator attention is likely required"));
+    }
+
+    #[test]
+    fn automation_snapshot_marks_budget_exhaustion_and_manual_approval() {
+        let blocked_job = JobRecord {
+            id: "JOB-009".to_owned(),
+            source_channel: "cli".to_owned(),
+            requester: None,
+            title: "Blocked rollout".to_owned(),
+            objective: "Continue only when safe".to_owned(),
+            context: None,
+            status: JobStatus::Blocked,
+            priority: "high".to_owned(),
+            policy: JobPolicy {
+                pattern: "supervisor_worker".to_owned(),
+                approval_required: true,
+                auto_approve: false,
+                delegate_to_master_loop: true,
+                continue_for_secs: Some(3600),
+                continue_max_iterations: Some(5),
+            },
+            created_at: 10,
+            updated_at: 10,
+            batch_ids: vec![1],
+            worker_ids: vec![],
+            latest_summary: Some("waiting on approval".to_owned()),
+            latest_report_at: None,
+            next_report_due_at: None,
+            escalation_state: None,
+            final_outcome: None,
+            automation_started_at: Some(100),
+            last_continue_at: Some(200),
+            continue_iterations: 2,
+        };
+
+        let blocked = job_automation_snapshot(&blocked_job, 250);
+        assert_eq!(blocked.state, "awaiting_manual_approval");
+        assert_eq!(automation_state_label(&blocked.state), "awaiting approval");
+
+        let exhausted_job = JobRecord {
+            continue_iterations: 5,
+            ..blocked_job
+        };
+        let exhausted = job_automation_snapshot(&exhausted_job, 250);
+        assert_eq!(exhausted.state, "budget_exhausted_iterations");
+    }
+
+    #[test]
+    fn delegated_jobs_are_eligible_only_after_cooldown_and_with_budget() {
+        let job = JobRecord {
+            id: "JOB-010".to_owned(),
+            source_channel: "cli".to_owned(),
+            requester: None,
+            title: "Loop me".to_owned(),
+            objective: "Keep going".to_owned(),
+            context: None,
+            status: JobStatus::Running,
+            priority: "normal".to_owned(),
+            policy: JobPolicy {
+                pattern: "supervisor_worker".to_owned(),
+                approval_required: false,
+                auto_approve: true,
+                delegate_to_master_loop: true,
+                continue_for_secs: Some(7200),
+                continue_max_iterations: Some(3),
+            },
+            created_at: 10,
+            updated_at: 10,
+            batch_ids: vec![1],
+            worker_ids: vec![],
+            latest_summary: Some("continue".to_owned()),
+            latest_report_at: None,
+            next_report_due_at: None,
+            escalation_state: None,
+            final_outcome: None,
+            automation_started_at: Some(100),
+            last_continue_at: Some(350),
+            continue_iterations: 1,
+        };
+
+        assert!(!job_is_eligible_for_master_loop(&job, 400));
+        assert!(job_is_eligible_for_master_loop(&job, 700));
+
+        let prompt = service_job_continue_prompt(&job, &job_automation_snapshot(&job, 700));
+        assert!(prompt.contains("Auto approve: yes"));
+        assert!(prompt.contains("Remaining automation iterations: 2"));
     }
 }

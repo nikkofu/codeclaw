@@ -32,6 +32,10 @@ lock_file = ".codeclaw/locks/paths.json"
 decision_dir = ".codeclaw/decisions"
 log_dir = ".codeclaw/logs"
 
+[logging]
+retention_days = 30
+notification_channel_capacity = 2048
+
 [[groups]]
 id = "backend"
 label = "Backend"

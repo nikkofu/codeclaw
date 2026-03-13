@@ -2,7 +2,7 @@
 
 ## Purpose
 
-This guide describes installation, deployment, backup, upgrade, and troubleshooting practices for CodeClaw `0.11.0`.
+This guide describes installation, deployment, backup, upgrade, and troubleshooting practices for CodeClaw `0.12.0`.
 
 Repository: `https://github.com/nikkofu/codeclaw`
 
@@ -51,12 +51,15 @@ Required components:
 - baseline configuration source: [codeclaw.example.toml](../codeclaw.example.toml)
 - active runtime configuration: `codeclaw.toml`
 - coordination root: `.codeclaw/`
+- archived logs: `.codeclaw/logs/archive/YYYY-MM-DD/`
 
 Recommended practice:
 
 - review group definitions before production use
 - align `lease_paths` with actual repository ownership boundaries
 - keep approval/sandbox settings consistent with the intended operating model
+- keep `[logging].retention_days` at or above 30 unless there is a formal storage policy requiring shorter retention
+- increase `[logging].notification_channel_capacity` if the runtime still sees bursty event lag in large sessions
 
 ## Health Checks
 
@@ -74,6 +77,7 @@ Healthy baseline indicators:
 - master session can be initialized or resumed
 - `.codeclaw/status/master.json` is updated during runtime
 - gateway capability output matches the intended downstream integration assumptions
+- `cargo run -- inspect --service` shows sane delegated, auto-approve, and exhausted-budget counts when automation is enabled
 
 ## Persistence and Backup
 
@@ -86,12 +90,14 @@ Backup priorities:
 3. `.codeclaw/tasks/`
 4. `.codeclaw/logs/`
 5. `.codeclaw/gateway/`
+6. `.codeclaw/logs/archive/`
 
 Backup guidance:
 
 - preserve `.codeclaw/` before upgrades if historical supervision data matters
 - include `.codeclaw/tasks/` in incident evidence capture
 - retain `.codeclaw/logs/*.jsonl` for runtime event reconstruction
+- retain `.codeclaw/logs/archive/YYYY-MM-DD/runtime/*.jsonl` for controller and app-server incident analysis
 - retain `.codeclaw/gateway/mock-outbox.jsonl` when validating delivery flows or auditing IM relay behavior
 
 ## Upgrade Procedure
@@ -107,6 +113,44 @@ Recommended upgrade path for same-workspace deployments:
 7. run `cargo run -- gateway schema`
 8. restart with `cargo run -- up`
 9. confirm session restoration with `inspect --session master`
+
+## 7x24 Supervision Controls
+
+CodeClaw now supports bounded master-loop delegation at the job level.
+
+Recommended policy fields during job creation:
+
+- `--delegate-master-loop` enables service-side continuation through the master session
+- `--continue-for-secs <n>` limits how long the job may keep auto-continuing
+- `--continue-max-iterations <n>` limits how many delegated loop passes are allowed
+- `--auto-approve` allows blocked jobs to keep moving through CodeClaw-side approval checkpoints without waiting for a manual operator
+
+Operational guidance:
+
+- always set either a time budget, an iteration budget, or both for 7x24 jobs
+- prefer small first budgets such as `3600` seconds or `10` iterations while tuning
+- monitor `budget exhausted jobs` in `inspect --service`
+- treat `auto_approve` as an explicit operational risk decision and keep it visible in runbooks
+
+## Logging and Retention
+
+CodeClaw now archives logs by day automatically.
+
+Layout:
+
+- `.codeclaw/logs/archive/YYYY-MM-DD/sessions/*.jsonl`
+- `.codeclaw/logs/archive/YYYY-MM-DD/runtime/*.jsonl`
+
+Defaults:
+
+- retention: 30 days
+- app-server notification buffer: 2048
+
+Operators should review:
+
+- runtime/controller logs for lag warnings and service-side automation events
+- runtime/app-server logs for stderr output, parse failures, and stdout closure
+- session logs for raw notification timelines when replaying an incident
 
 ## Rollback Procedure
 
@@ -143,6 +187,12 @@ If the issue is specifically `spawn` looking silent, also check:
 - whether stderr is being captured or suppressed
 - whether newline-based progress lines are now appearing instead of a single animated spinner
 
+If the issue is specifically `channel lagged by N`, also check:
+
+- `.codeclaw/logs/archive/YYYY-MM-DD/runtime/controller.jsonl`
+- whether `[logging].notification_channel_capacity` is large enough for the workload
+- whether the terminal or service was under heavy event burst load rather than a true session failure
+
 ### Worker appears blocked
 
 Check:
@@ -151,6 +201,12 @@ Check:
 - session `last message`
 - task file in `.codeclaw/tasks/`
 - recent timeline/output in `inspect --session <worker-id>`
+
+If the job is delegated but not moving, also check:
+
+- whether the job has exhausted its time or iteration budget
+- whether the job is waiting on manual approval because `auto_approve` is not enabled
+- whether the service cooldown window has elapsed since the last delegated continue
 
 ### Restart recovery looks incomplete
 
@@ -170,6 +226,15 @@ Check:
 - `.codeclaw/gateway/mock-outbox.jsonl` when using `mock_file`
 - [docs/gateway-protocol.md](gateway-protocol.md) for expected capability downgrade behavior
 
+### 7x24 delegated jobs stop unexpectedly
+
+Check:
+
+- `cargo run -- job inspect <job-id>` for `automation state`
+- `cargo run -- inspect --service` for `last continued jobs` and `budget exhausted jobs`
+- whether `--continue-for-secs` or `--continue-max-iterations` was too small
+- whether the job is blocked and still waiting for manual approval
+
 ## Support Boundaries
 
 This release does not yet provide:
@@ -179,4 +244,4 @@ This release does not yet provide:
 - full PTY replay for worker terminals
 - hard path-lease enforcement
 
-These items should be treated as planned follow-up work, not as operational defects in `0.11.0`.
+These items should be treated as planned follow-up work, not as operational defects in `0.12.0`.

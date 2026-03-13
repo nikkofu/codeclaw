@@ -5,9 +5,11 @@ use std::collections::VecDeque;
 pub const MAX_LOG_LINES: usize = 512;
 pub const MAX_TIMELINE_EVENTS: usize = 128;
 const DEFAULT_MASTER_SUMMARY: &str = "Primary planner and dispatcher";
+const DEFAULT_ONBOARD_SUMMARY: &str = "Supervises jobs, loop budgets, and session health";
 
 #[derive(Debug, Clone)]
 pub enum SessionKind {
+    Onboard,
     Master,
     Worker {
         group: String,
@@ -78,6 +80,26 @@ pub struct SessionView {
 }
 
 impl SessionView {
+    pub fn onboard(cwd: String, summary: Option<String>, last_message: Option<String>) -> Self {
+        Self {
+            id: "onboard".to_owned(),
+            job_id: None,
+            thread_id: "virtual".to_owned(),
+            title: "onboard".to_owned(),
+            summary: summary.or_else(|| Some(DEFAULT_ONBOARD_SUMMARY.to_owned())),
+            lifecycle_note: None,
+            kind: SessionKind::Onboard,
+            status: "idle".to_owned(),
+            pending_turns: 0,
+            cwd,
+            last_turn_id: None,
+            last_message,
+            timeline_events: VecDeque::new(),
+            lines: VecDeque::new(),
+            live_buffer: String::new(),
+        }
+    }
+
     pub fn master(
         thread_id: String,
         cwd: String,
@@ -320,6 +342,14 @@ mod tests {
         assert_eq!(snapshot.timeline_events[0].text, "event-12");
         assert_eq!(snapshot.timeline_events[127].text, "event-139");
         assert!(matches!(snapshot.kind, SessionKind::Master));
+    }
+
+    #[test]
+    fn onboard_sessions_use_virtual_runtime_identity() {
+        let session = SessionView::onboard("/tmp".to_owned(), None, None).snapshot();
+        assert_eq!(session.id, "onboard");
+        assert_eq!(session.thread_id, "virtual");
+        assert!(matches!(session.kind, SessionKind::Onboard));
     }
 
     #[test]

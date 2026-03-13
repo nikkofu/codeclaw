@@ -2,7 +2,7 @@
 
 ## 1. Planning Assumption
 
-This plan assumes the next development phase starts from release `0.11.0` and focuses on making CodeClaw an always-on orchestration product rather than only a local terminal prototype.
+This plan assumes the next development phase starts from release `0.12.0` and focuses on making CodeClaw an always-on orchestration product rather than only a local terminal prototype.
 
 ## 2. Project Objective
 

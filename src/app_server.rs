@@ -1,8 +1,10 @@
+use crate::logging;
 use anyhow::{anyhow, Context, Result};
 use serde::de::DeserializeOwned;
 use serde_json::{json, Value};
 use std::{
     collections::HashMap,
+    path::PathBuf,
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc,
@@ -35,6 +37,9 @@ impl AppServerClient {
         client_name: &str,
         client_version: &str,
         reasoning_effort: &str,
+        log_dir: PathBuf,
+        log_retention_days: u64,
+        notification_channel_capacity: usize,
     ) -> Result<Self> {
         let mut command = Command::new("codex");
         command
@@ -63,10 +68,16 @@ impl AppServerClient {
             .context("failed to capture app-server stderr")?;
 
         let pending: PendingMap = Arc::new(Mutex::new(HashMap::new()));
-        let (notifications, _) = broadcast::channel(256);
+        let (notifications, _) = broadcast::channel(notification_channel_capacity);
 
-        spawn_stdout_reader(stdout, Arc::clone(&pending), notifications.clone());
-        spawn_stderr_reader(stderr);
+        spawn_stdout_reader(
+            stdout,
+            Arc::clone(&pending),
+            notifications.clone(),
+            log_dir.clone(),
+            log_retention_days,
+        );
+        spawn_stderr_reader(stderr, log_dir, log_retention_days);
 
         let client = Self {
             child: Arc::new(Mutex::new(child)),
@@ -148,6 +159,8 @@ fn spawn_stdout_reader(
     stdout: tokio::process::ChildStdout,
     pending: PendingMap,
     notifications: broadcast::Sender<Notification>,
+    log_dir: PathBuf,
+    log_retention_days: u64,
 ) {
     tokio::spawn(async move {
         let mut lines = BufReader::new(stdout).lines();
@@ -160,6 +173,16 @@ fn spawn_stdout_reader(
             let message = match serde_json::from_str::<Value>(line) {
                 Ok(message) => message,
                 Err(error) => {
+                    let _ = append_runtime_log(
+                        &log_dir,
+                        log_retention_days,
+                        "error",
+                        "failed to parse app-server message",
+                        json!({
+                            "error": error.to_string(),
+                            "raw": line,
+                        }),
+                    );
                     eprintln!("[codeclaw] failed to parse app-server message: {error}");
                     continue;
                 }
@@ -191,10 +214,21 @@ fn spawn_stdout_reader(
 
             if let Some(method) = message.get("method").and_then(Value::as_str) {
                 let params = message.get("params").cloned().unwrap_or(Value::Null);
-                let _ = notifications.send(Notification {
+                if let Err(error) = notifications.send(Notification {
                     method: method.to_owned(),
                     params,
-                });
+                }) {
+                    let _ = append_runtime_log(
+                        &log_dir,
+                        log_retention_days,
+                        "warn",
+                        "notification dropped because no receivers were available",
+                        json!({
+                            "method": method,
+                            "dropped_notification_method": error.0.method,
+                        }),
+                    );
+                }
             }
         }
 
@@ -202,10 +236,21 @@ fn spawn_stdout_reader(
         for (_, sender) in pending.drain() {
             let _ = sender.send(Err(anyhow!("app-server stdout closed")));
         }
+        let _ = append_runtime_log(
+            &log_dir,
+            log_retention_days,
+            "error",
+            "app-server stdout closed",
+            Value::Null,
+        );
     });
 }
 
-fn spawn_stderr_reader(stderr: tokio::process::ChildStderr) {
+fn spawn_stderr_reader(
+    stderr: tokio::process::ChildStderr,
+    log_dir: PathBuf,
+    log_retention_days: u64,
+) {
     tokio::spawn(async move {
         let mut lines = BufReader::new(stderr).lines();
         while let Ok(Some(line)) = lines.next_line().await {
@@ -213,7 +258,26 @@ fn spawn_stderr_reader(stderr: tokio::process::ChildStderr) {
             if line.is_empty() {
                 continue;
             }
+            let _ = append_runtime_log(&log_dir, log_retention_days, "stderr", line, Value::Null);
             eprintln!("[codex] {line}");
         }
     });
+}
+
+fn append_runtime_log(
+    log_dir: &PathBuf,
+    log_retention_days: u64,
+    level: &str,
+    message: &str,
+    fields: Value,
+) -> Result<()> {
+    let entry = json!({
+        "ts": logging::now_unix_ts(),
+        "level": level,
+        "source": "app_server",
+        "message": message,
+        "fields": fields,
+    });
+    logging::append_jsonl(log_dir, log_retention_days, "runtime/app-server", &entry)?;
+    Ok(())
 }

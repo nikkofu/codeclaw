@@ -4,6 +4,17 @@
 
 - no entries yet
 
+## 0.12.0 - 2026-03-13
+
+- added a default virtual `onboard` supervision session with a kanban-like board for pending, running, blocked, completed, and failed jobs
+- added bounded master-loop delegation controls for jobs, including `delegate_to_master_loop`, `continue_for_secs`, `continue_max_iterations`, and explicit `auto_approve` visibility
+- extended `codeclaw serve` so delegated jobs can continue through the master session under cooldown, time-budget, and iteration-budget protections
+- changed app-server notification lag from a fatal turn error into a logged warning so transient broadcast backlog no longer fails the session by default
+- increased app-server notification buffer capacity and made it configurable through `[logging].notification_channel_capacity`
+- added daily archived JSONL logging under `.codeclaw/logs/archive/YYYY-MM-DD/` with configurable retention, defaulting to 30 days
+- added runtime log coverage for app-server stderr, parse failures, stdout-closed conditions, and controller-side lag warnings
+- refreshed release notes, usage documentation, operations guidance, and acceptance criteria for the `0.12.0` release
+
 ## 0.11.0 - 2026-03-13
 
 - added a normalized gateway compatibility layer for text, markdown, links, image, audio, video, file, typing, and raw `type/event/hook` semantics

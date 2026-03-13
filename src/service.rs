@@ -49,11 +49,19 @@ pub struct ServiceSnapshot {
     #[serde(default)]
     pub dispatched_jobs: Vec<String>,
     #[serde(default)]
+    pub continued_jobs: Vec<String>,
+    #[serde(default)]
     pub generated_reports: Vec<String>,
     #[serde(default)]
     pub queued_deliveries: Vec<String>,
     #[serde(default)]
     pub delivered_notifications: Vec<String>,
+    #[serde(default)]
+    pub delegated_jobs: Vec<String>,
+    #[serde(default)]
+    pub auto_approve_jobs: Vec<String>,
+    #[serde(default)]
+    pub budget_exhausted_jobs: Vec<String>,
     #[serde(default)]
     pub last_error: Option<String>,
 }
@@ -105,9 +113,13 @@ mod tests {
             stalled_jobs: vec!["JOB-004".to_owned()],
             running_workers: vec!["backend-001".to_owned()],
             dispatched_jobs: vec!["JOB-001".to_owned()],
+            continued_jobs: vec!["JOB-002".to_owned()],
             generated_reports: vec!["RPT-001".to_owned()],
             queued_deliveries: vec!["DLY-002".to_owned()],
             delivered_notifications: vec!["report delivered".to_owned()],
+            delegated_jobs: vec!["JOB-001".to_owned(), "JOB-002".to_owned()],
+            auto_approve_jobs: vec!["JOB-002".to_owned()],
+            budget_exhausted_jobs: vec!["JOB-004".to_owned()],
             last_error: None,
         };
 
@@ -117,9 +129,12 @@ mod tests {
         assert_eq!(decoded.status, ServiceLifecycle::Running);
         assert_eq!(decoded.pending_jobs, vec!["JOB-001"]);
         assert_eq!(decoded.running_workers, vec!["backend-001"]);
+        assert_eq!(decoded.continued_jobs, vec!["JOB-002"]);
         assert_eq!(decoded.generated_reports, vec!["RPT-001"]);
         assert_eq!(decoded.queued_deliveries, vec!["DLY-002"]);
         assert_eq!(decoded.delivered_notifications, vec!["report delivered"]);
+        assert_eq!(decoded.auto_approve_jobs, vec!["JOB-002"]);
+        assert_eq!(decoded.budget_exhausted_jobs, vec!["JOB-004"]);
         assert_eq!(decoded.tick, 3);
     }
 }

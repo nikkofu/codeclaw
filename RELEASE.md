@@ -1,39 +1,41 @@
-# CodeClaw Release `v0.11.0`
+# CodeClaw Release `v0.12.0`
 
 Repository: `https://github.com/nikkofu/codeclaw`  
 Release date: `2026-03-13`
 
 ## Suggested Git Tag
 
-`v0.11.0`
+`v0.12.0`
 
 ## Suggested GitHub Release Title
 
-`CodeClaw v0.11.0`
+`CodeClaw v0.12.0`
 
 ## GitHub Release Body
 
 ```md
-CodeClaw `v0.11.0` turns the current reporting and remote-control direction into a concrete, compatible gateway baseline.
+CodeClaw `v0.12.0` focuses on stable long-running supervision.
 
-This release adds a formal IM/webhook compatibility contract, integrates a gateway-backed delivery path, and exposes the protocol through CLI inspection and subscription commands. It keeps `codex app-server` as the execution runtime while making CodeClaw more transparent, more integration-ready, and easier to operate in long-running service mode.
+This release adds a default `onboard` supervisor session, bounded 7x24 continuation controls, daily archived logging, and a non-fatal recovery path for app-server notification lag. The goal is simple: operators should be able to understand what the system is doing, why it stopped, and how to keep it running safely without silent failures.
 
 ## Highlights
 
-- added a normalized gateway protocol for text, markdown, links, image, audio, video, file, typing, and raw `type/event/hook` semantics
-- integrated queued report delivery through one gateway abstraction instead of a controller-local console-only path
-- added a delivery-safe `mock_file` channel for schema validation, IM adapter development, and outbox replay
-- added `gateway schema`, `gateway capabilities`, and `gateway subscribe` CLI commands for operator visibility and control
-- improved `spawn` progress rendering so non-TTY environments now print visible status updates instead of appearing silent
-- synchronized release metadata and delivery documentation to `0.11.0`
+- added a default virtual `onboard` supervision session with a kanban-like board for pending, running, blocked, completed, and failed jobs
+- added bounded master-loop delegation controls with `delegate-master-loop`, `continue-for-secs`, `continue-max-iterations`, and visible `auto-approve` markers
+- changed `app-server notification channel error: channel lagged by N` from a fatal turn error into a logged warning with continued processing
+- increased app-server notification buffer capacity and made it configurable through `[logging].notification_channel_capacity`
+- added daily archived JSONL logs under `.codeclaw/logs/archive/YYYY-MM-DD/` with configurable retention, defaulting to 30 days
+- added runtime log coverage for controller-side lag warnings, app-server stderr, parse failures, and stdout-closed conditions
+- refreshed README, user guide, operations guide, acceptance cases, and release metadata for `0.12.0`
 
 ## Included In This Release
 
 - terminal-first `codeclaw` CLI and TUI control plane
 - master/worker orchestration over `codex app-server`
-- durable jobs, reports, subscriptions, and delivery outbox state
-- service-mode heartbeat and queued report dispatch
-- channel-neutral gateway protocol and compatibility documentation
+- onboard supervision board for 7x24 oversight
+- bounded delegated continuation through `codeclaw serve`
+- channel-neutral gateway protocol and report delivery
+- daily archived runtime and session logs
 
 ## Delivery Documentation
 
@@ -49,20 +51,20 @@ This release adds a formal IM/webhook compatibility contract, integrates a gatew
 ```bash
 cargo run -- init
 cargo run -- doctor
-cargo run -- serve --once
-cargo run -- gateway schema
-cargo run -- gateway capabilities --channel mock-file
-cargo run -- gateway subscribe --job JOB-001 --channel mock-file
-cargo run -- spawn --group backend --task "Payment API refactor"
+cargo run -- up
+cargo run -- serve
 cargo run -- inspect --service
+cargo run -- job create --title "Nightly backlog sweep" --delegate-master-loop --continue-for-secs 3600 --continue-max-iterations 10
+cargo run -- job create --title "Auto recovery" --delegate-master-loop --continue-for-secs 3600 --continue-max-iterations 10 --auto-approve
+cargo run -- gateway schema
 ```
 
 ## Upgrade Notes
 
-- package version is now `0.11.0` in `Cargo.toml` and `Cargo.lock`
-- preserve `.codeclaw/` before upgrading if supervision history or queued delivery state must be retained
+- package version is now `0.12.0` in `Cargo.toml` and `Cargo.lock`
+- preserve `.codeclaw/` before upgrading if supervision history, queued deliveries, or archived logs must be retained
 - validate the environment with `cargo run -- doctor` after pulling the release
-- use `cargo run -- gateway schema` and `cargo run -- gateway capabilities --channel ...` to validate downstream IM compatibility assumptions
+- review `[logging]` in `codeclaw.toml` to confirm retention and notification buffer settings
 
 ## Verification
 
@@ -86,8 +88,8 @@ This release does not yet include:
 
 ## Release Maintainer Checklist
 
-1. Confirm `Cargo.toml` and `Cargo.lock` both show `0.11.0`.
-2. Confirm `CHANGELOG.md`, `README.md`, and `docs/gateway-protocol.md` match the release scope.
+1. Confirm `Cargo.toml` and `Cargo.lock` both show `0.12.0`.
+2. Confirm `CHANGELOG.md`, `README.md`, `docs/user-guide.md`, and `docs/operations-guide.md` match the release scope.
 3. Run:
 
    ```bash
@@ -98,16 +100,16 @@ This release does not yet include:
 4. Create the tag:
 
    ```bash
-   git tag v0.11.0
+   git tag v0.12.0
    ```
 
 5. Push the tag:
 
    ```bash
-   git push origin v0.11.0
+   git push origin v0.12.0
    ```
 
-6. Create a GitHub Release with title `CodeClaw v0.11.0`.
+6. Create a GitHub Release with title `CodeClaw v0.12.0`.
 7. Paste the `GitHub Release Body` block above into the release description.
 
 ## Related Files

@@ -88,6 +88,14 @@ pub struct JobPolicy {
     pub pattern: String,
     #[serde(default)]
     pub approval_required: bool,
+    #[serde(default)]
+    pub auto_approve: bool,
+    #[serde(default)]
+    pub delegate_to_master_loop: bool,
+    #[serde(default)]
+    pub continue_for_secs: Option<u64>,
+    #[serde(default)]
+    pub continue_max_iterations: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -121,6 +129,12 @@ pub struct JobRecord {
     pub escalation_state: Option<String>,
     #[serde(default)]
     pub final_outcome: Option<String>,
+    #[serde(default)]
+    pub automation_started_at: Option<u64>,
+    #[serde(default)]
+    pub last_continue_at: Option<u64>,
+    #[serde(default)]
+    pub continue_iterations: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -328,6 +342,10 @@ impl Default for JobPolicy {
         Self {
             pattern: default_job_pattern(),
             approval_required: false,
+            auto_approve: false,
+            delegate_to_master_loop: false,
+            continue_for_secs: None,
+            continue_max_iterations: None,
         }
     }
 }
@@ -475,6 +493,10 @@ mod tests {
                 policy: JobPolicy {
                     pattern: "planner_executor_reviewer".to_owned(),
                     approval_required: true,
+                    auto_approve: true,
+                    delegate_to_master_loop: true,
+                    continue_for_secs: Some(3600),
+                    continue_max_iterations: Some(8),
                 },
                 created_at: 119,
                 updated_at: 126,
@@ -485,6 +507,9 @@ mod tests {
                 next_report_due_at: Some(180),
                 escalation_state: Some("none".to_owned()),
                 final_outcome: None,
+                automation_started_at: Some(121),
+                last_continue_at: Some(126),
+                continue_iterations: 2,
             },
         );
         state.reports.insert(
@@ -592,6 +617,9 @@ mod tests {
             decoded.jobs["JOB-001"].policy.pattern,
             "planner_executor_reviewer"
         );
+        assert!(decoded.jobs["JOB-001"].policy.auto_approve);
+        assert!(decoded.jobs["JOB-001"].policy.delegate_to_master_loop);
+        assert_eq!(decoded.jobs["JOB-001"].continue_iterations, 2);
         assert_eq!(decoded.reports[&3].kind, JobReportKind::Progress);
         assert_eq!(decoded.reports[&3].job_id, "JOB-001");
         assert_eq!(

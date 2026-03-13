@@ -1,6 +1,6 @@
 # CodeClaw Architecture
 
-This document describes the current implemented architecture in release `0.11.0`.
+This document describes the current implemented architecture in release `0.12.0`.
 
 For the next-stage system direction, see:
 
@@ -12,7 +12,7 @@ For the next-stage system direction, see:
 
 ## 0. Implementation Status
 
-As of March 13, 2026, release `0.11.0` implements a working control-plane prototype, not just a design stub.
+As of March 13, 2026, release `0.12.0` implements a working control-plane prototype, not just a design stub.
 
 Implemented now:
 
@@ -33,6 +33,9 @@ Implemented now:
 - durable jobs, reports, subscriptions, and delivery outbox state
 - a gateway-backed delivery path with `console` and `mock_file` channels
 - a normalized IM/webhook compatibility contract for markdown, links, media, typing, and raw `type/event/hook`
+- a virtual `onboard` supervision session for kanban-style control-plane oversight
+- bounded delegated continuation with time and iteration safeguards
+- daily archived runtime and session logs with configurable retention
 
 Not implemented yet:
 

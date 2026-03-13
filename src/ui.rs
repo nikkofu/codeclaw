@@ -1,6 +1,7 @@
 use crate::{
     controller::{
-        BatchEventSnapshot, BatchSessionSnapshot, BatchSnapshot, Controller, PromptTarget,
+        BatchEventSnapshot, BatchSessionSnapshot, BatchSnapshot, Controller, OnboardLaneItem,
+        OnboardSnapshot, PromptTarget,
     },
     session::{SessionEvent, SessionEventKind, SessionKind, SessionSnapshot},
 };
@@ -76,7 +77,7 @@ impl App {
     fn new(controller: Controller) -> Self {
         Self {
             controller,
-            selected_id: "master".to_owned(),
+            selected_id: "onboard".to_owned(),
             selected_batch_id: None,
             detail_mode: DetailMode::Session,
             focus_filter: FocusFilter::All,
@@ -84,7 +85,7 @@ impl App {
             input_mode: InputMode::Normal,
             input_buffer: String::new(),
             status_message:
-                "Press `i` to talk to master, `n` to spawn a worker, `f` to focus panels, `b` to inspect batches.".to_owned(),
+                "Press `o` for onboard, `i` to talk to master, `n` to spawn a worker, `f` to focus panels, `b` to inspect batches.".to_owned(),
             last_title: String::new(),
         }
     }
@@ -246,6 +247,10 @@ impl App {
             frame.render_widget(empty, area);
             return;
         };
+        if matches!(session.kind, SessionKind::Onboard) {
+            self.draw_onboard_view(frame, area);
+            return;
+        }
         let accent = session_accent_color(session);
         let border_style = panel_border_style(&session.status, accent, self.animation_tick);
         let visible_timeline = session
@@ -400,6 +405,186 @@ impl App {
             )
             .wrap(Wrap { trim: false });
         frame.render_widget(detail, sections[2]);
+    }
+
+    fn draw_onboard_view(&self, frame: &mut Frame<'_>, area: Rect) {
+        let onboard = self.controller.onboard_snapshot();
+        let accent = Color::Rgb(201, 216, 117);
+        let sections = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(8),
+                Constraint::Min(10),
+                Constraint::Length(8),
+            ])
+            .split(area);
+
+        let meta = Paragraph::new(Text::from(vec![
+            Line::from(vec![
+                Span::styled(
+                    animated_status_badge(&onboard.status, self.animation_tick),
+                    status_badge_style(&onboard.status, self.animation_tick),
+                ),
+                Span::raw(" "),
+                Span::styled(
+                    "onboard",
+                    Style::default().fg(accent).add_modifier(Modifier::BOLD),
+                ),
+                Span::raw("  "),
+                Span::styled(
+                    format!(
+                        "service={} tick={}",
+                        onboard
+                            .service_status
+                            .clone()
+                            .unwrap_or_else(|| "unknown".to_owned()),
+                        onboard
+                            .service_tick
+                            .map(|tick| tick.to_string())
+                            .unwrap_or_else(|| "-".to_owned())
+                    ),
+                    Style::default().fg(Color::DarkGray),
+                ),
+            ]),
+            Line::from(format!("summary: {}", onboard.summary)),
+            Line::from(format!(
+                "workers running: {} | queued deliveries: {}",
+                onboard.running_workers, onboard.queued_deliveries
+            )),
+            Line::from(format!(
+                "delegated loops: {} | auto approve: {} | budget exhausted: {}",
+                onboard.delegated_jobs, onboard.auto_approve_jobs, onboard.budget_exhausted_jobs
+            )),
+            Line::from(format!(
+                "continued this tick: {}",
+                if onboard.continued_jobs.is_empty() {
+                    "-".to_owned()
+                } else {
+                    onboard.continued_jobs.join(", ")
+                }
+            )),
+        ]))
+        .block(
+            Block::default()
+                .title("Onboard")
+                .borders(Borders::ALL)
+                .border_style(panel_border_style(
+                    &onboard.status,
+                    accent,
+                    self.animation_tick,
+                )),
+        )
+        .wrap(Wrap { trim: false });
+        frame.render_widget(meta, sections[0]);
+
+        let board = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([
+                Constraint::Ratio(1, 3),
+                Constraint::Ratio(1, 3),
+                Constraint::Ratio(1, 3),
+            ])
+            .split(sections[1]);
+
+        let backlog = onboard
+            .pending
+            .iter()
+            .chain(onboard.completed.iter())
+            .cloned()
+            .collect::<Vec<_>>();
+        let blocked_failed = blocked_and_failed(&onboard);
+        self.draw_onboard_lane(frame, board[0], "Pending / Completed", &backlog, accent);
+        self.draw_onboard_lane(frame, board[1], "Running", &onboard.running, accent);
+        self.draw_onboard_lane(frame, board[2], "Blocked / Failed", &blocked_failed, accent);
+
+        let footer = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Ratio(1, 2), Constraint::Ratio(1, 2)])
+            .split(sections[2]);
+        let completed = Paragraph::new(onboard_lane_text(
+            "Completed",
+            &onboard.completed,
+            footer[0].width.saturating_sub(4) as usize,
+            footer[0].height.saturating_sub(2) as usize,
+        ))
+        .block(
+            Block::default()
+                .title("Completed")
+                .borders(Borders::ALL)
+                .border_style(secondary_panel_border_style(
+                    accent,
+                    "completed",
+                    self.animation_tick,
+                )),
+        )
+        .wrap(Wrap { trim: false });
+        frame.render_widget(completed, footer[0]);
+
+        let controls = Paragraph::new(Text::from(vec![
+            Line::from("markers: AUTO = auto approve"),
+            Line::from("markers: LOOP = delegated master loop"),
+            Line::from("budget: time/iterations remaining when bounded"),
+            Line::from(format!(
+                "manual jobs: {}",
+                onboard
+                    .pending
+                    .iter()
+                    .chain(onboard.running.iter())
+                    .chain(onboard.blocked.iter())
+                    .filter(|item| item.automation.state == "manual")
+                    .count()
+            )),
+            Line::from(format!("failed jobs: {}", onboard.failed.len())),
+        ]))
+        .block(
+            Block::default()
+                .title("Controls")
+                .borders(Borders::ALL)
+                .border_style(secondary_panel_border_style(
+                    accent,
+                    &onboard.status,
+                    self.animation_tick,
+                )),
+        )
+        .wrap(Wrap { trim: false });
+        frame.render_widget(controls, footer[1]);
+    }
+
+    fn draw_onboard_lane(
+        &self,
+        frame: &mut Frame<'_>,
+        area: Rect,
+        title: &str,
+        items: &[OnboardLaneItem],
+        accent: Color,
+    ) {
+        let lane = Paragraph::new(onboard_lane_text(
+            title,
+            items,
+            area.width.saturating_sub(4) as usize,
+            area.height.saturating_sub(2) as usize,
+        ))
+        .block(
+            Block::default()
+                .title(title)
+                .borders(Borders::ALL)
+                .border_style(secondary_panel_border_style(
+                    accent,
+                    if items
+                        .iter()
+                        .any(|item| item.status == "blocked" || item.status == "failed")
+                    {
+                        "blocked"
+                    } else if items.iter().any(|item| item.status == "running") {
+                        "running"
+                    } else {
+                        "completed"
+                    },
+                    self.animation_tick,
+                )),
+        )
+        .wrap(Wrap { trim: false });
+        frame.render_widget(lane, area);
     }
 
     fn draw_batch_view(&self, frame: &mut Frame<'_>, area: Rect, sessions: &[SessionSnapshot]) {
@@ -581,7 +766,7 @@ impl App {
                         .unwrap_or_else(|| "batch=-".to_owned()),
                 };
                 format!(
-                    "selected={} | status={} | queued={} | batch={} | view={} | focus={} | target={} | keys: ↑↓ switch  i master  e worker  n spawn  f focus  b batch  [ ] cycle  g master  q quit",
+                    "selected={} | status={} | queued={} | batch={} | view={} | focus={} | target={} | keys: ↑↓ switch  o onboard  i master  e worker  n spawn  f focus  b batch  [ ] cycle  g master  q quit",
                     session.title,
                     status_caption(&session.status, self.animation_tick),
                     session.pending_turns,
@@ -701,6 +886,10 @@ impl App {
                 self.focus_session("master".to_owned(), sessions);
                 self.status_message = "focused master".to_owned();
             }
+            KeyCode::Char('o') => {
+                self.focus_session("onboard".to_owned(), sessions);
+                self.status_message = "focused onboard".to_owned();
+            }
             KeyCode::Char('f') => {
                 self.focus_filter = self.focus_filter.next();
                 self.status_message = format!(
@@ -717,9 +906,10 @@ impl App {
                 self.status_message = "composing prompt to master".to_owned();
             }
             KeyCode::Char('e') => {
-                if self.selected_id == "master" {
+                if self.selected_id == "master" || self.selected_id == "onboard" {
                     self.status_message =
-                        "selected session is master; use `i` to send input".to_owned();
+                        "selected session is not a worker; use `i` to send input to master"
+                            .to_owned();
                 } else {
                     self.input_mode = InputMode::WorkerPrompt(self.selected_id.clone());
                     self.input_buffer.clear();
@@ -1183,6 +1373,7 @@ fn is_busy_status(status: &str) -> bool {
 
 fn session_accent_color(session: &SessionSnapshot) -> Color {
     match &session.kind {
+        SessionKind::Onboard => Color::Rgb(201, 216, 117),
         SessionKind::Master => Color::Rgb(232, 190, 92),
         SessionKind::Worker { group, .. } => match group.as_str() {
             "backend" => Color::Rgb(96, 165, 250),
@@ -1190,6 +1381,97 @@ fn session_accent_color(session: &SessionSnapshot) -> Color {
             "infra" => Color::Rgb(244, 162, 97),
             _ => Color::Rgb(167, 139, 250),
         },
+    }
+}
+
+fn blocked_and_failed(onboard: &OnboardSnapshot) -> Vec<OnboardLaneItem> {
+    onboard
+        .blocked
+        .iter()
+        .chain(onboard.failed.iter())
+        .cloned()
+        .collect()
+}
+
+fn onboard_lane_text(
+    _title: &str,
+    items: &[OnboardLaneItem],
+    width: usize,
+    max_lines: usize,
+) -> Text<'static> {
+    if max_lines == 0 {
+        return Text::default();
+    }
+    if items.is_empty() {
+        return Text::from(Line::from("No jobs"));
+    }
+
+    let body_width = width.saturating_sub(2).max(16);
+    let take = items.len().min(max_lines);
+    let start = items.len().saturating_sub(take);
+    let lines = items[start..]
+        .iter()
+        .flat_map(|item| {
+            let mut badges = Vec::new();
+            if item.automation.auto_approve {
+                badges.push("AUTO".to_owned());
+            }
+            if item.automation.delegate_to_master_loop {
+                badges.push("LOOP".to_owned());
+            }
+            if let Some(remaining) = item.automation.remaining_iterations {
+                badges.push(format!("n={remaining}"));
+            }
+            if let Some(remaining) = item.automation.remaining_secs {
+                badges.push(format!("t={}", onboard_duration_compact(remaining)));
+            }
+            let badge_text = if badges.is_empty() {
+                "-".to_owned()
+            } else {
+                badges.join(" ")
+            };
+            vec![
+                Line::from(vec![
+                    Span::styled(
+                        truncate(&item.job_id, 10),
+                        Style::default()
+                            .fg(status_color(&item.status, 0))
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::raw(" "),
+                    Span::styled(
+                        truncate(&item.title, body_width.saturating_sub(12)),
+                        Style::default().fg(Color::White),
+                    ),
+                ]),
+                Line::from(vec![
+                    Span::styled(
+                        truncate(&format!("{} | {}", badge_text, item.summary), body_width),
+                        Style::default().fg(Color::DarkGray),
+                    ),
+                    Span::raw(" "),
+                    Span::styled(
+                        format!("w{}", item.workers),
+                        Style::default().fg(Color::Gray),
+                    ),
+                ]),
+            ]
+        })
+        .take(max_lines)
+        .collect::<Vec<_>>();
+    Text::from(lines)
+}
+
+fn onboard_duration_compact(total_secs: u64) -> String {
+    let hours = total_secs / 3600;
+    let minutes = (total_secs % 3600) / 60;
+    let seconds = total_secs % 60;
+    if hours > 0 {
+        format!("{hours}h{minutes:02}m")
+    } else if minutes > 0 {
+        format!("{minutes}m{seconds:02}s")
+    } else {
+        format!("{seconds}s")
     }
 }
 
@@ -1201,6 +1483,7 @@ fn session_title_style(session: &SessionSnapshot) -> Style {
 
 fn session_kind_badge(session: &SessionSnapshot) -> &'static str {
     match &session.kind {
+        SessionKind::Onboard => "BRD",
         SessionKind::Master => "MSTR",
         SessionKind::Worker { group, .. } => match group.as_str() {
             "backend" => "BACK",
@@ -1487,6 +1770,7 @@ fn input_target_label(mode: &InputMode, session: &SessionSnapshot) -> String {
         InputMode::WorkerPrompt(worker_id) => worker_id.clone(),
         InputMode::SpawnWorker => "spawn".to_owned(),
         InputMode::Normal => match &session.kind {
+            SessionKind::Onboard => "master".to_owned(),
             SessionKind::Master => "master".to_owned(),
             SessionKind::Worker { .. } => "master".to_owned(),
         },
@@ -1503,6 +1787,7 @@ fn session_list_subtitle(session: &SessionSnapshot) -> String {
 
 fn session_identity_line(session: &SessionSnapshot) -> String {
     match &session.kind {
+        SessionKind::Onboard => "role: onboard supervisor".to_owned(),
         SessionKind::Master => "role: master".to_owned(),
         SessionKind::Worker { group, task, .. } => {
             format!("group: {group} | task: {}", truncate(task, 28))
@@ -1565,6 +1850,7 @@ fn session_lifecycle_note_line(session: &SessionSnapshot) -> String {
 
 fn session_location_line(session: &SessionSnapshot) -> String {
     match &session.kind {
+        SessionKind::Onboard => format!("control root: {}", truncate(&session.cwd, 39)),
         SessionKind::Master => format!("workspace: {}", truncate(&session.cwd, 39)),
         SessionKind::Worker { task_file, .. } => {
             format!("task file: {}", truncate(task_file, 39))

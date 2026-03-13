@@ -6,7 +6,7 @@ It combines task routing, session management, shared coordination files, and Git
 
 ## Release Information
 
-- Version: `0.11.0`
+- Version: `0.12.0`
 - Repository: `https://github.com/nikkofu/codeclaw`
 - Delivery and planning package:
   - [Release Notes](RELEASE.md)
@@ -45,9 +45,14 @@ This repository now includes a working Rust control-plane prototype with:
 - persisted session timeline and orchestration batch history across process restarts
 - persisted rolling live-output tail, including in-flight assistant text, across process restarts
 - a dedicated batch inspection view in the TUI for replaying one orchestration chain across multiple sessions
+- a default virtual `onboard` supervision session with a kanban-like job board for pending, running, blocked, completed, and failed work
 - color-coded and animated status cues across the sidebar, panels, status bar, and terminal title
 - right-pane focus filters and colorized log rendering for summary, command, and error inspection
 - explicit worker lifecycle supervision for spawn request, bootstrap, blocker, and handoff states
+- bounded master-loop delegation for 7x24 service mode, with time-based and iteration-based continue guards
+- explicit auto-approve and delegated-loop markers across jobs, sessions, and service inspection
+- daily archived JSONL logs under `.codeclaw/logs/archive/YYYY-MM-DD/` with configurable retention, defaulting to 30 days
+- runtime log coverage for app-server stderr, parse failures, stdout-closed conditions, and lag warnings
 - persisted lifecycle notes for blocker and handoff context across restarts
 - persisted master summary and last-message status across restarts
 - a `serve` mode skeleton with background scheduler ticks and persisted service heartbeat in `.codeclaw/service.json`
@@ -68,6 +73,8 @@ cargo run -- inspect --batch 3 --events 12
 cargo run -- inspect --service
 cargo run -- jobs
 cargo run -- job create --title "Payment API refactor"
+cargo run -- job create --title "Nightly refactor" --delegate-master-loop --continue-for-secs 3600 --continue-max-iterations 10
+cargo run -- job create --title "Auto recovery" --delegate-master-loop --continue-for-secs 3600 --continue-max-iterations 10 --auto-approve
 cargo run -- job inspect JOB-001
 cargo run -- gateway schema
 cargo run -- gateway capabilities --channel mock-file
@@ -79,7 +86,7 @@ cargo run -- list
 
 ```text
 left: session list
-right: selected session overview + timeline + live output
+right: selected session overview, onboard kanban, or timeline/live output
 bottom: status + input area
 ```
 
@@ -87,6 +94,7 @@ Current TUI keybindings:
 
 ```text
 ↑ / ↓   switch sessions
+o       focus onboard
 i       send a prompt to master
 e       send a prompt to the selected worker
 n       spawn a worker using "group: task"
@@ -98,6 +106,8 @@ q       quit
 ```
 
 The sidebar now also reflects per-session queue depth with `qN` prefixes when a session has pending turns.
+
+The first session is now a virtual `onboard` supervisor board. It aggregates job state, service status, running workers, queued deliveries, delegated loop counts, auto-approve counts, and budget exhaustion signals so one operator can supervise long-running work without drilling into every worker first.
 
 The right pane now separates supervision metadata from execution noise:
 
@@ -155,14 +165,18 @@ When the current terminal does not expose an interactive TTY, CodeClaw now falls
 Jobs now provide a top-level operating object above batches and workers:
 
 - `codeclaw job create` creates a durable pending job with orchestration policy metadata
+- `codeclaw job create --delegate-master-loop --continue-for-secs 3600 --continue-max-iterations 10` arms a job for bounded 7x24 master-loop continuation
+- `codeclaw job create --auto-approve` marks that automation-visible approvals can proceed without waiting for a manual operator checkpoint
 - `codeclaw jobs` lists known jobs with status, batch count, worker count, and pattern
-- `codeclaw job inspect JOB-001` shows the current job summary, report cadence fields, linked batches/workers, recent reports, subscriptions, and delivery history
+- `codeclaw job inspect JOB-001` shows the current job summary, automation state, remaining loop budget, linked batches/workers, recent reports, subscriptions, and delivery history
 - `codeclaw send --job ...` and `codeclaw spawn --job ...` attach new work to an existing job
 
 The new `serve` command is the first service-mode skeleton for long-running orchestration:
 
 - `codeclaw serve` runs scheduler ticks without opening the TUI
 - pending jobs with no batches are automatically submitted to the master session for planning
+- delegated jobs can now be continued through the master session automatically when cooldown and budget guards allow it
+- blocked jobs that still require manual approval are intentionally not auto-continued unless the job is marked `auto_approve`
 - due running/blocked jobs now emit persisted digest reports on the service loop cadence
 - queued report deliveries now flow through a channel-neutral outbox and are emitted through a first `console/stdout` delivery path
 - the latest service heartbeat is persisted to `.codeclaw/service.json` so CLI inspection and future gateways can observe background state
@@ -173,6 +187,13 @@ Gateway compatibility is now explicitly defined for future IM integrations:
 - `codeclaw gateway capabilities --channel ...` prints per-channel support for markdown, media, typing, and raw `type/event/hook`
 - `codeclaw gateway subscribe --job ... --channel mock-file` adds a durable report subscription for integration testing or external delivery relays
 - [docs/gateway-protocol.md](docs/gateway-protocol.md) defines the compatibility contract that future Slack, Telegram, WeCom, Feishu, Discord, or webhook adapters should follow
+
+Logging and error visibility are now treated as first-class runtime concerns:
+
+- session event logs are archived daily under `.codeclaw/logs/archive/YYYY-MM-DD/sessions/`
+- controller and app-server runtime logs are archived daily under `.codeclaw/logs/archive/YYYY-MM-DD/runtime/`
+- retention defaults to 30 days and is configurable through `[logging].retention_days`
+- app-server notification lag is now logged as a warning and surfaced in session output instead of immediately failing the turn
 
 ## Requirements
 
@@ -185,12 +206,14 @@ Gateway compatibility is now explicitly defined for future IM integrations:
 - Example configuration: [codeclaw.example.toml](codeclaw.example.toml)
 - Local runtime config generated by `codeclaw init`: `codeclaw.toml`
 - Coordination state root: `.codeclaw/`
+- Logging config: `[logging]` in `codeclaw.toml`
 - `master.reasoning_effort` defaults to `high` so CodeClaw can override incompatible global Codex defaults when launching `codex app-server`
 - persisted supervision data currently lives in `.codeclaw/state.json` under `jobs`, `workers`, `session_history`, `session_output`, `session_live_buffers`, and `batches`
 - persisted job reports currently live in `.codeclaw/state.json` under `reports`
 - persisted report delivery subscriptions and outbox records currently live in `.codeclaw/state.json` under `report_subscriptions` and `report_deliveries`
 - persisted service heartbeat currently lives in `.codeclaw/service.json`
 - default mock gateway outbox lives in `.codeclaw/gateway/mock-outbox.jsonl`
+- daily archived logs live under `.codeclaw/logs/archive/YYYY-MM-DD/`
 
 ## Known Gaps
 
@@ -200,6 +223,7 @@ Gateway compatibility is now explicitly defined for future IM integrations:
 - path leases are documented but not yet hard-enforced at dispatch time
 - merge gating and integration-branch automation are still ahead
 - `serve` mode is an early skeleton; it persists heartbeat and auto-intakes pending jobs, but does not yet resume in-flight turns after process restart
+- auto-approve currently governs CodeClaw-side continuation policy and visibility; it does not replace Codex runtime approval semantics for destructive commands
 
 ## References
 

@@ -2,6 +2,7 @@ mod app_server;
 mod config;
 mod controller;
 mod gateway;
+mod logging;
 mod orchestration;
 mod service;
 mod session;
@@ -102,6 +103,14 @@ enum JobCommand {
         pattern: String,
         #[arg(long, default_value_t = false)]
         approval_required: bool,
+        #[arg(long, default_value_t = false)]
+        auto_approve: bool,
+        #[arg(long, default_value_t = false)]
+        delegate_master_loop: bool,
+        #[arg(long)]
+        continue_for_secs: Option<u64>,
+        #[arg(long)]
+        continue_max_iterations: Option<u32>,
         #[arg(long)]
         context: Option<String>,
     },
@@ -400,6 +409,10 @@ async fn run_job(workspace_root: PathBuf, command: JobCommand) -> Result<()> {
             priority,
             pattern,
             approval_required,
+            auto_approve,
+            delegate_master_loop,
+            continue_for_secs,
+            continue_max_iterations,
             context,
         } => {
             controller.init_workspace()?;
@@ -412,6 +425,10 @@ async fn run_job(workspace_root: PathBuf, command: JobCommand) -> Result<()> {
                 priority,
                 pattern,
                 approval_required,
+                auto_approve,
+                delegate_to_master_loop: delegate_master_loop,
+                continue_for_secs,
+                continue_max_iterations,
                 context,
             })?;
             println!("job: {}", job.id);
@@ -426,6 +443,32 @@ async fn run_job(workspace_root: PathBuf, command: JobCommand) -> Result<()> {
                 } else {
                     "no"
                 }
+            );
+            println!(
+                "auto approve: {}",
+                if job.policy.auto_approve { "yes" } else { "no" }
+            );
+            println!(
+                "delegate master loop: {}",
+                if job.policy.delegate_to_master_loop {
+                    "yes"
+                } else {
+                    "no"
+                }
+            );
+            println!(
+                "continue budget secs: {}",
+                job.policy
+                    .continue_for_secs
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "-".to_owned())
+            );
+            println!(
+                "continue max iterations: {}",
+                job.policy
+                    .continue_max_iterations
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "-".to_owned())
             );
             println!("next step: use --job {} with `send` or `spawn`", job.id);
             Ok(())
@@ -883,6 +926,30 @@ fn print_job_snapshot(job: &JobSnapshot) {
         "approval required: {}",
         if job.approval_required { "yes" } else { "no" }
     );
+    println!(
+        "auto approve: {}",
+        if job.auto_approve { "yes" } else { "no" }
+    );
+    println!(
+        "delegate master loop: {}",
+        if job.delegate_to_master_loop {
+            "yes"
+        } else {
+            "no"
+        }
+    );
+    println!(
+        "continue budget secs: {}",
+        job.continue_for_secs
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "-".to_owned())
+    );
+    println!(
+        "continue max iterations: {}",
+        job.continue_max_iterations
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "-".to_owned())
+    );
     println!("created: {}", job.created_at);
     println!("updated: {}", job.updated_at);
     println!(
@@ -910,6 +977,39 @@ fn print_job_snapshot(job: &JobSnapshot) {
     println!(
         "final outcome: {}",
         job.final_outcome.clone().unwrap_or_else(|| "-".to_owned())
+    );
+    println!("automation state: {}", job.automation.state);
+    println!(
+        "automation started: {}",
+        job.automation
+            .automation_started_at
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "-".to_owned())
+    );
+    println!(
+        "last continue: {}",
+        job.automation
+            .last_continue_at
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "-".to_owned())
+    );
+    println!(
+        "continue iterations used: {}",
+        job.automation.continue_iterations
+    );
+    println!(
+        "remaining budget secs: {}",
+        job.automation
+            .remaining_secs
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "-".to_owned())
+    );
+    println!(
+        "remaining budget iterations: {}",
+        job.automation
+            .remaining_iterations
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "-".to_owned())
     );
     println!(
         "context: {}",
@@ -998,7 +1098,7 @@ fn print_job_snapshot(job: &JobSnapshot) {
 
 fn print_service_tick(snapshot: &ServiceSnapshot) {
     println!(
-        "tick={} status={} pending={} running={} blocked={} completed={} failed={} workers={} dispatched={} reports={} queued_deliveries={} delivered={}",
+        "tick={} status={} pending={} running={} blocked={} completed={} failed={} workers={} dispatched={} continued={} reports={} queued_deliveries={} delivered={} auto_approve={} delegated={} exhausted={}",
         snapshot.tick,
         snapshot.status,
         snapshot.pending_jobs.len(),
@@ -1012,6 +1112,11 @@ fn print_service_tick(snapshot: &ServiceSnapshot) {
         } else {
             snapshot.dispatched_jobs.join(",")
         },
+        if snapshot.continued_jobs.is_empty() {
+            "-".to_owned()
+        } else {
+            snapshot.continued_jobs.join(",")
+        },
         if snapshot.generated_reports.is_empty() {
             "-".to_owned()
         } else {
@@ -1022,7 +1127,10 @@ fn print_service_tick(snapshot: &ServiceSnapshot) {
             "-".to_owned()
         } else {
             snapshot.delivered_notifications.join(" | ")
-        }
+        },
+        snapshot.auto_approve_jobs.len(),
+        snapshot.delegated_jobs.len(),
+        snapshot.budget_exhausted_jobs.len()
     );
 }
 
@@ -1055,8 +1163,12 @@ fn print_service_snapshot(snapshot: &ServiceSnapshot) {
     print_named_ids("stalled jobs", &snapshot.stalled_jobs);
     print_named_ids("running workers", &snapshot.running_workers);
     print_named_ids("last dispatched jobs", &snapshot.dispatched_jobs);
+    print_named_ids("last continued jobs", &snapshot.continued_jobs);
     print_named_ids("last generated reports", &snapshot.generated_reports);
     print_named_ids("queued deliveries", &snapshot.queued_deliveries);
+    print_named_ids("delegated jobs", &snapshot.delegated_jobs);
+    print_named_ids("auto approve jobs", &snapshot.auto_approve_jobs);
+    print_named_ids("budget exhausted jobs", &snapshot.budget_exhausted_jobs);
     print_named_ids(
         "last delivered notifications",
         &snapshot.delivered_notifications,
@@ -1077,6 +1189,7 @@ fn print_named_ids(label: &str, ids: &[String]) {
 
 fn session_role_label(session: &SessionSnapshot) -> String {
     match &session.kind {
+        SessionKind::Onboard => "onboard".to_owned(),
         SessionKind::Master => "master".to_owned(),
         SessionKind::Worker { group, task, .. } => format!("worker:{group} :: {task}"),
     }
@@ -1084,6 +1197,7 @@ fn session_role_label(session: &SessionSnapshot) -> String {
 
 fn session_location(session: &SessionSnapshot) -> String {
     match &session.kind {
+        SessionKind::Onboard => session.cwd.clone(),
         SessionKind::Master => session.cwd.clone(),
         SessionKind::Worker { task_file, .. } => task_file.clone(),
     }

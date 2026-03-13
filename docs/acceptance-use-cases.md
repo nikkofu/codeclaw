@@ -2,7 +2,7 @@
 
 ## Scope
 
-This document defines recommended acceptance scenarios for release `0.11.0`.
+This document defines recommended acceptance scenarios for release `0.12.0`.
 
 Repository: `https://github.com/nikkofu/codeclaw`
 
@@ -63,6 +63,7 @@ Start the TUI and confirm the master session is available.
 - TUI opens successfully
 - master session is selectable
 - UI reacts to navigation keys
+- the default `onboard` session is visible and can be selected
 
 ## UC-04 Master Dispatch Creates Worker
 
@@ -168,6 +169,55 @@ Confirm the gateway contract and delivery path are usable for formal integration
 - the report is delivered to `.codeclaw/gateway/mock-outbox.jsonl`
 - the delivery is visible in `cargo run -- job inspect <job-id>`
 
+## UC-10 Bounded Master-Loop Delegation
+
+**Objective**  
+Confirm long-running automation can continue safely without unbounded looping.
+
+**Steps**
+
+1. Create a job with:
+
+   ```bash
+   cargo run -- job create \
+     --title "Nightly backlog sweep" \
+     --delegate-master-loop \
+     --continue-for-secs 3600 \
+     --continue-max-iterations 3
+   ```
+
+2. Start `cargo run -- serve`.
+3. Inspect `onboard` in the TUI or run `cargo run -- inspect --service`.
+4. Verify the job is marked as delegated and the remaining budget decreases over time or iterations.
+5. Repeat with `--auto-approve` for a scenario that would otherwise wait for manual approval.
+
+**Expected results**
+
+- the job is clearly marked as delegated to the master loop
+- `onboard` shows delegated and auto-approve markers distinctly
+- service inspection shows continued jobs and budget-exhausted jobs
+- the job stops auto-continuing after the configured time or iteration budget is exhausted
+- blocked jobs remain visible instead of looping forever when approval is still required
+
+## UC-11 Runtime Logging and Retention
+
+**Objective**  
+Confirm runtime errors and session notifications are archived daily and retained by policy.
+
+**Steps**
+
+1. Run `cargo run -- doctor` or another command that starts the app-server path.
+2. Inspect `.codeclaw/logs/archive/<today>/runtime/`.
+3. Inspect `.codeclaw/logs/archive/<today>/sessions/`.
+4. Confirm `[logging].retention_days` exists in `codeclaw.toml`.
+
+**Expected results**
+
+- runtime logs exist for controller and/or app-server activity
+- session notification logs are written under the current day archive
+- log paths are day-partitioned rather than one unbounded flat file
+- retention and notification buffer are configurable from `codeclaw.toml`
+
 ## Sign-off Recommendation
 
 Formal delivery sign-off should record:
@@ -177,4 +227,6 @@ Formal delivery sign-off should record:
 - evidence of one worker lifecycle transition
 - evidence of restart recovery
 - evidence of one gateway delivery
+- evidence of one bounded delegated-loop run
+- evidence of archived runtime logs for the acceptance day
 - any approved known-gap exceptions for the current release

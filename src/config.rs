@@ -16,6 +16,8 @@ pub struct Config {
     pub ui: UiConfig,
     pub coordination: CoordinationConfig,
     #[serde(default)]
+    pub logging: LoggingConfig,
+    #[serde(default)]
     pub groups: Vec<GroupConfig>,
 }
 
@@ -62,6 +64,14 @@ pub struct CoordinationConfig {
     pub lock_file: String,
     pub decision_dir: String,
     pub log_dir: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LoggingConfig {
+    #[serde(default = "default_log_retention_days")]
+    pub retention_days: u64,
+    #[serde(default = "default_notification_channel_capacity")]
+    pub notification_channel_capacity: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -135,6 +145,23 @@ impl Config {
 
 fn default_reasoning_effort() -> String {
     "high".to_owned()
+}
+
+fn default_log_retention_days() -> u64 {
+    30
+}
+
+fn default_notification_channel_capacity() -> usize {
+    2048
+}
+
+impl Default for LoggingConfig {
+    fn default() -> Self {
+        Self {
+            retention_days: default_log_retention_days(),
+            notification_channel_capacity: default_notification_channel_capacity(),
+        }
+    }
 }
 
 impl CoordinationPaths {
