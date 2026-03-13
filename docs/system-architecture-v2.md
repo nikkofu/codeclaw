@@ -17,6 +17,7 @@ The architecture adds:
 - a persistent `Job` model
 - long-running service mode
 - gateway adapters for remote control
+- a normalized gateway compatibility contract
 - proactive reporting
 - watchdog and escalation loops
 
@@ -62,6 +63,10 @@ Responsibilities:
 - accept commands and job requests
 - normalize channel input into a shared job schema
 - route responses and reports back to the origin channel
+
+Compatibility rule:
+
+- adapters must preserve platform-specific `type`, `event`, and `hook` semantics while mapping them into one normalized contract
 
 ### 4.2 Job Control Plane
 
@@ -277,6 +282,36 @@ Suggested command style:
 /resume <job-id>
 /report <job-id>
 ```
+
+## 8.1 Compatibility Contract
+
+The gateway layer should standardize a compatibility-first message contract across IM systems.
+
+Required compatibility primitives:
+
+- text
+- markdown
+- links
+- image
+- audio
+- video
+- file
+- typing indicators
+- raw `type`
+- raw `event`
+- raw `hook`
+
+Design rules:
+
+- one canonical inbound event shape
+- one canonical outbound envelope shape
+- explicit capability declaration per adapter
+- graceful downgrade when a platform lacks media or markdown support
+- mandatory fallback text for every outbound message
+
+Reference document:
+
+- [Gateway Protocol](gateway-protocol.md)
 
 ## 9. Proactive Reporting
 

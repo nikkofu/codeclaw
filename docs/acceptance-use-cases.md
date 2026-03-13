@@ -2,7 +2,7 @@
 
 ## Scope
 
-This document defines recommended acceptance scenarios for release `0.10.0`.
+This document defines recommended acceptance scenarios for release `0.11.0`.
 
 Repository: `https://github.com/nikkofu/codeclaw`
 
@@ -147,6 +147,27 @@ Confirm CLI worker creation works without the TUI.
 - worker appears in `list`
 - worker task file and status file are created
 
+## UC-09 Gateway Compatibility and Delivery
+
+**Objective**  
+Confirm the gateway contract and delivery path are usable for formal integration work.
+
+**Steps**
+
+1. Run `cargo run -- gateway schema`.
+2. Run `cargo run -- gateway capabilities --channel mock-file`.
+3. Create or reuse a job.
+4. Run `cargo run -- gateway subscribe --job <job-id> --channel mock-file`.
+5. Trigger at least one report for that job.
+
+**Expected results**
+
+- the CLI prints normalized inbound and outbound JSON examples
+- capability output explicitly covers markdown, links, media, typing, and raw `type/event/hook`
+- the subscription is persisted under `report_subscriptions`
+- the report is delivered to `.codeclaw/gateway/mock-outbox.jsonl`
+- the delivery is visible in `cargo run -- job inspect <job-id>`
+
 ## Sign-off Recommendation
 
 Formal delivery sign-off should record:
@@ -155,4 +176,5 @@ Formal delivery sign-off should record:
 - command outputs for `init`, `doctor`, and at least one `inspect`
 - evidence of one worker lifecycle transition
 - evidence of restart recovery
+- evidence of one gateway delivery
 - any approved known-gap exceptions for the current release

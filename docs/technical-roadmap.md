@@ -80,6 +80,7 @@ Objective:
 Deliverables:
 
 - gateway interface abstraction
+- normalized compatibility schema for text, markdown, links, image, audio, video, file, typing, and raw `type/event/hook`
 - one concrete IM adapter
 - job creation and status query over IM
 - approval and resume controls over IM
@@ -89,6 +90,7 @@ Exit criteria:
 
 - operator can create and track jobs from IM
 - CodeClaw can push blocker/completion messages back to IM
+- adapter capability downgrade behavior is documented and testable
 
 ### Milestone E: Review and Escalation
 
@@ -140,6 +142,7 @@ Priority additions:
 - `report_subscriptions`
 - `gateway_events`
 - richer scheduler metadata
+- gateway capability metadata
 
 ### 3.2 Runtime Stability
 
@@ -202,6 +205,7 @@ Risk:
 Mitigation:
 
 - define one channel-neutral job control API first
+- define one compatibility-first gateway protocol before adding multiple platform adapters
 
 ### 4.4 Premature Direct Provider Support
 

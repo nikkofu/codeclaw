@@ -1,6 +1,7 @@
 use crate::{
     app_server::{AppServerClient, Notification},
     config::{Config, CoordinationPaths, GroupConfig},
+    gateway,
     orchestration::{
         parse_master_response, visible_stream_text, MasterAction, ParsedMasterResponse,
     },
@@ -10,10 +11,9 @@ use crate::{
         MAX_TIMELINE_EVENTS,
     },
     state::{
-        now_unix_ts, AppState, BatchStatus, JobPolicy, JobRecord, JobReportKind,
-        JobReportRecord, JobStatus, OrchestrationBatchRecord, ReportChannel,
-        ReportDeliveryRecord, ReportDeliveryStatus, ReportSubscriptionRecord, SessionStatus,
-        WorkerRecord, WorkerStatus,
+        now_unix_ts, AppState, BatchStatus, JobPolicy, JobRecord, JobReportKind, JobReportRecord,
+        JobStatus, OrchestrationBatchRecord, ReportChannel, ReportDeliveryRecord,
+        ReportDeliveryStatus, ReportSubscriptionRecord, SessionStatus, WorkerRecord, WorkerStatus,
     },
 };
 use anyhow::{anyhow, Context, Result};
@@ -647,6 +647,61 @@ impl Controller {
         Ok(job)
     }
 
+    pub fn add_report_subscription(
+        &self,
+        job_id: &str,
+        channel: ReportChannel,
+        target: Option<String>,
+    ) -> Result<ReportSubscriptionRecord> {
+        self.ensure_job_exists(job_id)?;
+
+        let resolved_target = target
+            .map(|value| value.trim().to_owned())
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| gateway::default_target_for_channel(&channel, &self.paths.root));
+        let now = now_unix_ts();
+
+        let subscription = {
+            let mut state = self.state.lock().expect("state lock poisoned");
+            if let Some(existing) = state
+                .report_subscriptions
+                .values()
+                .find(|subscription| {
+                    subscription.job_id == job_id
+                        && subscription.channel == channel
+                        && subscription.target == resolved_target
+                })
+                .cloned()
+            {
+                existing
+            } else {
+                let subscription_id = state.next_report_subscription_number;
+                state.next_report_subscription_number += 1;
+                let subscription = ReportSubscriptionRecord {
+                    id: subscription_id,
+                    job_id: job_id.to_owned(),
+                    channel,
+                    target: resolved_target,
+                    notify_on_accepted: true,
+                    notify_on_progress: true,
+                    notify_on_blocker: true,
+                    notify_on_completion: true,
+                    notify_on_failure: true,
+                    notify_on_digest: true,
+                    created_at: now,
+                    updated_at: now,
+                };
+                state
+                    .report_subscriptions
+                    .insert(subscription_id, subscription.clone());
+                subscription
+            }
+        };
+
+        self.save_state()?;
+        Ok(subscription)
+    }
+
     pub fn service_snapshot(&self) -> Result<Option<ServiceSnapshot>> {
         ServiceSnapshot::load(&self.service_file())
     }
@@ -682,9 +737,10 @@ impl Controller {
 
         let pending_jobs = self.pending_service_jobs();
         let has_live_jobs = !pending_jobs.is_empty()
-            || self.list_jobs().into_iter().any(|job| {
-                matches!(job.status, JobStatus::Running | JobStatus::Blocked)
-            });
+            || self
+                .list_jobs()
+                .into_iter()
+                .any(|job| matches!(job.status, JobStatus::Running | JobStatus::Blocked));
 
         if has_live_jobs {
             let _ = self.ensure_master_thread().await?;
@@ -867,7 +923,8 @@ impl Controller {
     }
 
     pub async fn submit_prompt_and_wait(&self, target: PromptTarget, prompt: &str) -> Result<()> {
-        self.submit_prompt_and_wait_for_job(target, prompt, None).await
+        self.submit_prompt_and_wait_for_job(target, prompt, None)
+            .await
     }
 
     pub async fn submit_prompt_and_wait_for_job(
@@ -1155,7 +1212,12 @@ impl Controller {
 
         fs::write(
             &task_file,
-            render_task_file(task_number, task, &group_config.lease_paths, linked_job.as_ref()),
+            render_task_file(
+                task_number,
+                task,
+                &group_config.lease_paths,
+                linked_job.as_ref(),
+            ),
         )
         .with_context(|| format!("failed to write {}", task_file.display()))?;
 
@@ -2324,7 +2386,8 @@ impl Controller {
             let next_status = derive_job_status_from_state(&state, &batch_ids, &worker_ids);
             let next_summary = latest_summary.or(existing_summary);
             let changed = previous_status != next_status
-                || next_summary.as_deref().map(str::trim) != job_record.latest_summary.as_deref().map(str::trim);
+                || next_summary.as_deref().map(str::trim)
+                    != job_record.latest_summary.as_deref().map(str::trim);
             let mut report_job = job_record.clone();
             report_job.status = next_status.clone();
             if next_summary.is_some() {
@@ -2433,7 +2496,8 @@ impl Controller {
                 job.latest_summary.as_deref(),
                 &job.status,
             );
-            let body = render_job_report_body(&job, JobReportKind::Digest, job.latest_summary.as_deref());
+            let body =
+                render_job_report_body(&job, JobReportKind::Digest, job.latest_summary.as_deref());
             let report = self.emit_job_report(&job.id, JobReportKind::Digest, summary, body)?;
             emitted.push(format!("RPT-{:03}", report.id));
         }
@@ -2460,7 +2524,10 @@ impl Controller {
                 id: subscription_id,
                 job_id: job.id.clone(),
                 channel: ReportChannel::Console,
-                target: "stdout".to_owned(),
+                target: gateway::default_target_for_channel(
+                    &ReportChannel::Console,
+                    &self.paths.root,
+                ),
                 notify_on_accepted: true,
                 notify_on_progress: true,
                 notify_on_blocker: true,
@@ -2569,56 +2636,72 @@ impl Controller {
     }
 
     fn deliver_queued_reports(&self) -> Result<Vec<String>> {
-        let delivery_ids = {
+        let deliveries = {
             let state = self.state.lock().expect("state lock poisoned");
-            let mut delivery_ids = state
+            let mut deliveries = state
                 .report_deliveries
                 .values()
-                .filter(|delivery| {
-                    matches!(delivery.status, ReportDeliveryStatus::Queued)
-                        && matches!(delivery.channel, ReportChannel::Console)
-                })
-                .map(|delivery| delivery.id)
+                .filter(|delivery| matches!(delivery.status, ReportDeliveryStatus::Queued))
+                .cloned()
                 .collect::<Vec<_>>();
-            delivery_ids.sort_unstable();
-            delivery_ids
+            deliveries.sort_by(|left, right| left.id.cmp(&right.id));
+            deliveries
         };
 
         let mut delivered_messages = Vec::new();
-        for delivery_id in delivery_ids {
-            let message = {
+        let mut state_changed = false;
+        for delivery in deliveries {
+            let Some(report) = ({
+                let state = self.state.lock().expect("state lock poisoned");
+                state.reports.get(&delivery.report_id).cloned()
+            }) else {
                 let mut state = self.state.lock().expect("state lock poisoned");
-                let Some(report_id) = state
-                    .report_deliveries
-                    .get(&delivery_id)
-                    .map(|delivery| delivery.report_id)
-                else {
+                let Some(stored_delivery) = state.report_deliveries.get_mut(&delivery.id) else {
                     continue;
                 };
-                let Some(report) = state.reports.get(&report_id).cloned() else {
-                    let Some(delivery) = state.report_deliveries.get_mut(&delivery_id) else {
+                stored_delivery.status = ReportDeliveryStatus::Failed;
+                stored_delivery.updated_at = now_unix_ts();
+                stored_delivery.attempts += 1;
+                stored_delivery.last_error = Some("missing report".to_owned());
+                state_changed = true;
+                continue;
+            };
+
+            match gateway::deliver_report(
+                &delivery.channel,
+                &delivery.target,
+                &self.paths.root,
+                &report,
+            ) {
+                Ok(delivered_to) => {
+                    let mut state = self.state.lock().expect("state lock poisoned");
+                    let Some(stored_delivery) = state.report_deliveries.get_mut(&delivery.id)
+                    else {
                         continue;
                     };
-                    delivery.status = ReportDeliveryStatus::Failed;
-                    delivery.updated_at = now_unix_ts();
-                    delivery.attempts += 1;
-                    delivery.last_error = Some("missing report".to_owned());
-                    continue;
-                };
-                let Some(delivery) = state.report_deliveries.get_mut(&delivery_id) else {
-                    continue;
-                };
-
-                delivery.status = ReportDeliveryStatus::Delivered;
-                delivery.updated_at = now_unix_ts();
-                delivery.attempts += 1;
-                delivery.last_error = None;
-                format_report_delivery_message(&report, delivery)
+                    stored_delivery.status = ReportDeliveryStatus::Delivered;
+                    stored_delivery.updated_at = now_unix_ts();
+                    stored_delivery.attempts += 1;
+                    stored_delivery.last_error = None;
+                    state_changed = true;
+                    delivered_messages.push(format_report_delivery_message(&report, &delivered_to));
+                }
+                Err(error) => {
+                    let mut state = self.state.lock().expect("state lock poisoned");
+                    let Some(stored_delivery) = state.report_deliveries.get_mut(&delivery.id)
+                    else {
+                        continue;
+                    };
+                    stored_delivery.status = ReportDeliveryStatus::Failed;
+                    stored_delivery.updated_at = now_unix_ts();
+                    stored_delivery.attempts += 1;
+                    stored_delivery.last_error = Some(error.to_string());
+                    state_changed = true;
+                }
             };
-            delivered_messages.push(message);
         }
 
-        if !delivered_messages.is_empty() {
+        if state_changed {
             self.save_state()?;
         }
         Ok(delivered_messages)
@@ -2673,7 +2756,9 @@ impl Controller {
             .filter(|worker| {
                 matches!(
                     worker.status,
-                    WorkerStatus::SpawnRequested | WorkerStatus::Bootstrapping | WorkerStatus::Running
+                    WorkerStatus::SpawnRequested
+                        | WorkerStatus::Bootstrapping
+                        | WorkerStatus::Running
                 )
             })
             .map(|worker| worker.id.clone())
@@ -3326,10 +3411,7 @@ fn format_job_context(job: &JobRecord) -> String {
         .requester
         .clone()
         .unwrap_or_else(|| "unknown".to_owned());
-    let context = job
-        .context
-        .clone()
-        .unwrap_or_else(|| "none".to_owned());
+    let context = job.context.clone().unwrap_or_else(|| "none".to_owned());
     format!(
         "Job context:\n- Job id: {}\n- Title: {}\n- Objective: {}\n- Source channel: {}\n- Requester: {}\n- Priority: {}\n- Pattern: {}\n- Approval required: {}\n- Current summary: {}\n- Context: {}",
         job.id,
@@ -3363,8 +3445,12 @@ fn report_kind_for_job_update(
         };
     }
 
-    let previous_summary = previous_summary.map(str::trim).filter(|value| !value.is_empty());
-    let next_summary = next_summary.map(str::trim).filter(|value| !value.is_empty());
+    let previous_summary = previous_summary
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let next_summary = next_summary
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
     if previous_summary == next_summary {
         return None;
     }
@@ -3398,11 +3484,7 @@ fn report_summary_for_job_update(
     }
 }
 
-fn render_job_report_body(
-    job: &JobRecord,
-    kind: JobReportKind,
-    summary: Option<&str>,
-) -> String {
+fn render_job_report_body(job: &JobRecord, kind: JobReportKind, summary: Option<&str>) -> String {
     let summary = summary
         .map(str::trim)
         .filter(|value| !value.is_empty())
@@ -3499,25 +3581,15 @@ fn subscription_accepts_report_kind(
     }
 }
 
-fn format_report_delivery_message(
-    report: &JobReportRecord,
-    delivery: &ReportDeliveryRecord,
-) -> String {
+fn format_report_delivery_message(report: &JobReportRecord, endpoint: &str) -> String {
     format!(
-        "[{}:{}] {} [{}] {}",
-        delivery.channel,
-        delivery.target,
-        report.job_id,
-        report.kind,
-        report.summary
+        "[{}] {} [{}] {}",
+        endpoint, report.job_id, report.kind, report.summary
     )
 }
 
 fn service_job_intake_prompt(job: &JobRecord) -> String {
-    let context = job
-        .context
-        .clone()
-        .unwrap_or_else(|| "none".to_owned());
+    let context = job.context.clone().unwrap_or_else(|| "none".to_owned());
     format!(
         "New job intake for CodeClaw service mode.\n\nTitle: {}\nObjective: {}\nSource channel: {}\nPriority: {}\nPattern: {}\nApproval required: {}\nContext: {}\n\nPlan the job, keep the coordination summary concise, and dispatch worker actions if the work should start now. Respect the selected orchestration pattern and keep risky work approval-gated when required.",
         job.title,
@@ -3671,8 +3743,8 @@ fn map_broadcast_error(error: broadcast::error::RecvError) -> anyhow::Error {
 mod tests {
     use super::{
         blocker_reason_from_message, completed_state_for_turn, derive_job_status_from_state,
-        lifecycle_note_for, report_kind_for_job_update, report_summary_for_job_update,
-        render_job_report_body, service_job_intake_prompt, worker_message_indicates_blocker,
+        lifecycle_note_for, render_job_report_body, report_kind_for_job_update,
+        report_summary_for_job_update, service_job_intake_prompt, worker_message_indicates_blocker,
         worker_status_for, SessionRole, TurnSource,
     };
     use crate::state::{
@@ -3831,7 +3903,10 @@ mod tests {
             derive_job_status_from_state(&state, &[1], &[]),
             JobStatus::Completed
         );
-        assert_eq!(derive_job_status_from_state(&state, &[], &[]), JobStatus::Pending);
+        assert_eq!(
+            derive_job_status_from_state(&state, &[], &[]),
+            JobStatus::Pending
+        );
     }
 
     #[test]

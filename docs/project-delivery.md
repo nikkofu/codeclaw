@@ -5,8 +5,8 @@
 | Item | Value |
 | --- | --- |
 | Product | CodeClaw |
-| Version | `0.10.0` |
-| Delivery date | `2026-03-12` |
+| Version | `0.11.0` |
+| Delivery date | `2026-03-13` |
 | Repository | `https://github.com/nikkofu/codeclaw` |
 | Primary package | `codeclaw` |
 | Language/runtime | Rust 2021 CLI/TUI application |
@@ -16,7 +16,7 @@
 
 This delivery provides a terminal-first control plane for supervising one master Codex session and multiple worker sessions in a shared repository. The current release is suitable for controlled pilot delivery and operator-guided use in a real repository.
 
-Delivered scope in `0.10.0`:
+Delivered scope in `0.11.0`:
 
 - master and worker orchestration over `codex app-server`
 - CLI commands for initialization, health checks, worker creation, prompt dispatch, and inspection
@@ -24,6 +24,9 @@ Delivered scope in `0.10.0`:
 - persisted coordination state under `.codeclaw/`
 - persisted supervision history including timeline, output tail, live buffer recovery, and lifecycle notes
 - batch-level orchestration inspection for one full master-to-worker execution chain
+- durable job reports, subscriptions, and delivery outbox state
+- a gateway compatibility contract for future IM and webhook adapters
+- a delivery-safe `mock_file` gateway path for integration validation
 
 ## Included Artifacts
 
@@ -33,11 +36,12 @@ Delivered scope in `0.10.0`:
 - operator instructions in [docs/user-guide.md](user-guide.md)
 - deployment and support instructions in [docs/operations-guide.md](operations-guide.md)
 - acceptance scenarios in [docs/acceptance-use-cases.md](acceptance-use-cases.md)
+- gateway protocol contract in [docs/gateway-protocol.md](gateway-protocol.md)
 - sample configuration in [codeclaw.example.toml](../codeclaw.example.toml)
 
 ## Strategic Planning Addendum
 
-The repository also includes a next-phase planning package derived from the `0.10.0` baseline. These documents describe the intended evolution path and do not imply that the capabilities are already delivered in the current release.
+The repository also includes a next-phase planning package derived from the `0.11.0` baseline. These documents describe the intended evolution path and do not imply that the capabilities are already delivered in the current release.
 
 - [docs/product-strategy.md](product-strategy.md)
 - [docs/system-architecture-v2.md](system-architecture-v2.md)
@@ -71,6 +75,8 @@ The expected baseline workflow is:
 - queue-aware prompt routing for busy sessions
 - restart recovery for recent timeline and output context
 - CLI inspection without launching the TUI
+- explicit gateway schema visibility and per-channel capability inspection
+- durable report subscription management for remote delivery paths
 
 ### Operational outputs
 
@@ -78,6 +84,7 @@ The expected baseline workflow is:
 - `.codeclaw/status/*.json` for per-session status snapshots
 - `.codeclaw/tasks/` for worker task files
 - `.codeclaw/logs/*.jsonl` for event logging
+- `.codeclaw/gateway/mock-outbox.jsonl` for mock gateway delivery replay
 
 ## Acceptance Summary
 
@@ -90,6 +97,8 @@ The recommended delivery acceptance set is captured in [docs/acceptance-use-case
 - blocker propagation
 - restart recovery of supervision data
 - CLI inspection output
+- gateway schema and capability inspection
+- mock gateway delivery emission
 
 ## Known Delivery Boundaries
 

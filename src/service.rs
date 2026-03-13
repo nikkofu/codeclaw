@@ -66,8 +66,8 @@ impl ServiceSnapshot {
 
         let raw = fs::read_to_string(path)
             .with_context(|| format!("failed to read {}", path.display()))?;
-        let snapshot =
-            serde_json::from_str(&raw).with_context(|| format!("failed to parse {}", path.display()))?;
+        let snapshot = serde_json::from_str(&raw)
+            .with_context(|| format!("failed to parse {}", path.display()))?;
         Ok(Some(snapshot))
     }
 
@@ -77,7 +77,8 @@ impl ServiceSnapshot {
                 .with_context(|| format!("failed to create {}", parent.display()))?;
         }
 
-        let raw = serde_json::to_string_pretty(self).context("failed to encode service snapshot")?;
+        let raw =
+            serde_json::to_string_pretty(self).context("failed to encode service snapshot")?;
         fs::write(path, format!("{raw}\n"))
             .with_context(|| format!("failed to write {}", path.display()))
     }
@@ -111,8 +112,7 @@ mod tests {
         };
 
         let raw = serde_json::to_string(&snapshot).expect("snapshot should encode");
-        let decoded: ServiceSnapshot =
-            serde_json::from_str(&raw).expect("snapshot should decode");
+        let decoded: ServiceSnapshot = serde_json::from_str(&raw).expect("snapshot should decode");
 
         assert_eq!(decoded.status, ServiceLifecycle::Running);
         assert_eq!(decoded.pending_jobs, vec!["JOB-001"]);

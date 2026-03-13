@@ -2,16 +2,17 @@
 
 ## Unreleased
 
-- added next-phase planning documents for product strategy, system architecture, technical roadmap, and project plan
-- aligned `README.md`, `docs/architecture.md`, and `docs/roadmap.md` so the current release baseline and next-phase direction are linked clearly
-- added a durable `Job` model with persisted job state, job-aware batch/worker linkage, and CLI commands for `jobs`, `job create`, and `job inspect`
-- added optional `--job` association for `send` and `spawn` so orchestration batches can be tracked under a named job
-- added `codeclaw serve` as a service-mode skeleton with scheduler ticks, persisted `service.json` heartbeat, and `inspect --service`
-- added service-side intake for pending jobs so background mode can submit new jobs into the master orchestration loop
-- added persisted job report history with accepted/progress/blocker/completion/failure/digest report kinds
-- extended `job inspect` and `inspect --service` so operators can see recent reports and report cadence state before any gateway integration
-- added a channel-neutral report delivery outbox with per-job subscriptions and delivery records
-- added a first console delivery path in `serve` so queued reports can be proactively emitted without introducing a real IM adapter yet
+- no entries yet
+
+## 0.11.0 - 2026-03-13
+
+- added a normalized gateway compatibility layer for text, markdown, links, image, audio, video, file, typing, and raw `type/event/hook` semantics
+- integrated `src/gateway.rs` into the report delivery path so queued notifications now flow through a single gateway-backed dispatch function
+- extended report channels with `mock_file` for safe IM adapter prototyping and delivery replay via `.codeclaw/gateway/mock-outbox.jsonl`
+- added `codeclaw gateway schema`, `codeclaw gateway capabilities`, and `codeclaw gateway subscribe` for protocol visibility and operator control
+- added a dedicated `docs/gateway-protocol.md` delivery document covering compatibility rules and adapter mapping guidance
+- improved CLI spawn progress rendering so non-TTY environments still receive visible status-line updates instead of a silent wait
+- synchronized release metadata, README references, and delivery documents to repository version `0.11.0`
 
 ## 0.10.0 - 2026-03-12
 

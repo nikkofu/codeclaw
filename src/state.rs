@@ -5,6 +5,7 @@ use std::{
     collections::BTreeMap,
     fmt, fs,
     path::{Path, PathBuf},
+    str::FromStr,
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -148,6 +149,7 @@ pub struct JobReportRecord {
 #[serde(rename_all = "snake_case")]
 pub enum ReportChannel {
     Console,
+    MockFile,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -361,8 +363,21 @@ impl fmt::Display for ReportChannel {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let value = match self {
             Self::Console => "console",
+            Self::MockFile => "mock_file",
         };
         f.write_str(value)
+    }
+}
+
+impl FromStr for ReportChannel {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "console" => Ok(Self::Console),
+            "mock-file" | "mock_file" | "mockfile" => Ok(Self::MockFile),
+            other => Err(format!("unsupported report channel `{other}`")),
+        }
     }
 }
 
@@ -432,9 +447,9 @@ fn default_job_pattern() -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        AppState, BatchStatus, JobPolicy, JobRecord, JobReportKind, JobReportRecord,
-        JobStatus, OrchestrationBatchRecord, ReportChannel, ReportDeliveryRecord,
-        ReportDeliveryStatus, ReportSubscriptionRecord, WorkerStatus,
+        AppState, BatchStatus, JobPolicy, JobRecord, JobReportKind, JobReportRecord, JobStatus,
+        OrchestrationBatchRecord, ReportChannel, ReportDeliveryRecord, ReportDeliveryStatus,
+        ReportSubscriptionRecord, WorkerStatus,
     };
     use crate::session::{SessionEvent, SessionEventKind};
 
@@ -579,7 +594,10 @@ mod tests {
         );
         assert_eq!(decoded.reports[&3].kind, JobReportKind::Progress);
         assert_eq!(decoded.reports[&3].job_id, "JOB-001");
-        assert_eq!(decoded.report_subscriptions[&1].channel, ReportChannel::Console);
+        assert_eq!(
+            decoded.report_subscriptions[&1].channel,
+            ReportChannel::Console
+        );
         assert_eq!(
             decoded.report_deliveries[&2].status,
             ReportDeliveryStatus::Delivered
@@ -665,5 +683,27 @@ mod tests {
                 serde_json::from_str(&raw).expect("status should decode");
             assert_eq!(decoded, status);
         }
+    }
+
+    #[test]
+    fn report_channel_from_str_accepts_cli_friendly_aliases() {
+        assert_eq!(
+            "console"
+                .parse::<ReportChannel>()
+                .expect("console should parse"),
+            ReportChannel::Console
+        );
+        assert_eq!(
+            "mock-file"
+                .parse::<ReportChannel>()
+                .expect("mock-file should parse"),
+            ReportChannel::MockFile
+        );
+        assert_eq!(
+            "mock_file"
+                .parse::<ReportChannel>()
+                .expect("mock_file should parse"),
+            ReportChannel::MockFile
+        );
     }
 }

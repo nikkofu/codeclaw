@@ -2,7 +2,7 @@
 
 ## 1. Planning Assumption
 
-This plan assumes the next development phase starts from release `0.10.0` and focuses on making CodeClaw an always-on orchestration product rather than only a local terminal prototype.
+This plan assumes the next development phase starts from release `0.11.0` and focuses on making CodeClaw an always-on orchestration product rather than only a local terminal prototype.
 
 ## 2. Project Objective
 
@@ -73,6 +73,7 @@ Primary outputs:
 - remote job creation
 - remote job inspection
 - remote approval and resume
+- one normalized gateway protocol that can be reused across IM platforms
 
 ### Workstream E: UX and Operations
 
@@ -149,11 +150,13 @@ Goals:
 
 - first gateway adapter
 - remote command and report flow
+- compatibility definition for media, typing, markdown, links, and raw event semantics
 
 Definition of done:
 
 - job creation and status retrieval work remotely
 - completion and blocker reports reach the gateway
+- adapter behavior is bounded by an explicit compatibility contract instead of per-platform special cases
 
 ## 5. Exit Criteria for the Next Development Cycle
 

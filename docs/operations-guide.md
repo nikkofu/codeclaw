@@ -2,7 +2,7 @@
 
 ## Purpose
 
-This guide describes installation, deployment, backup, upgrade, and troubleshooting practices for CodeClaw `0.10.0`.
+This guide describes installation, deployment, backup, upgrade, and troubleshooting practices for CodeClaw `0.11.0`.
 
 Repository: `https://github.com/nikkofu/codeclaw`
 
@@ -65,6 +65,7 @@ Primary operational checks:
 - `cargo run -- doctor`
 - `cargo run -- list`
 - `cargo run -- inspect --session master`
+- `cargo run -- gateway capabilities --channel mock-file`
 
 Healthy baseline indicators:
 
@@ -72,6 +73,7 @@ Healthy baseline indicators:
 - `codex app-server` responds
 - master session can be initialized or resumed
 - `.codeclaw/status/master.json` is updated during runtime
+- gateway capability output matches the intended downstream integration assumptions
 
 ## Persistence and Backup
 
@@ -83,12 +85,14 @@ Backup priorities:
 2. `.codeclaw/status/`
 3. `.codeclaw/tasks/`
 4. `.codeclaw/logs/`
+5. `.codeclaw/gateway/`
 
 Backup guidance:
 
 - preserve `.codeclaw/` before upgrades if historical supervision data matters
 - include `.codeclaw/tasks/` in incident evidence capture
 - retain `.codeclaw/logs/*.jsonl` for runtime event reconstruction
+- retain `.codeclaw/gateway/mock-outbox.jsonl` when validating delivery flows or auditing IM relay behavior
 
 ## Upgrade Procedure
 
@@ -100,8 +104,9 @@ Recommended upgrade path for same-workspace deployments:
 4. verify `Cargo.toml` version and `CHANGELOG.md`
 5. run `cargo test`
 6. run `cargo run -- doctor`
-7. restart with `cargo run -- up`
-8. confirm session restoration with `inspect --session master`
+7. run `cargo run -- gateway schema`
+8. restart with `cargo run -- up`
+9. confirm session restoration with `inspect --session master`
 
 ## Rollback Procedure
 
@@ -132,6 +137,12 @@ Check:
 - `.codeclaw/status/*.json`
 - approval/sandbox settings in `codeclaw.toml`
 
+If the issue is specifically `spawn` looking silent, also check:
+
+- whether the terminal wrapper is non-interactive
+- whether stderr is being captured or suppressed
+- whether newline-based progress lines are now appearing instead of a single animated spinner
+
 ### Worker appears blocked
 
 Check:
@@ -149,6 +160,16 @@ Check:
 - the process had permission to persist updates during runtime
 - the needed data falls within the rolling retention window
 
+### Gateway delivery does not appear
+
+Check:
+
+- `cargo run -- gateway capabilities --channel <channel>`
+- `cargo run -- job inspect <job-id>`
+- `.codeclaw/state.json` for `report_subscriptions` and `report_deliveries`
+- `.codeclaw/gateway/mock-outbox.jsonl` when using `mock_file`
+- [docs/gateway-protocol.md](gateway-protocol.md) for expected capability downgrade behavior
+
 ## Support Boundaries
 
 This release does not yet provide:
@@ -158,4 +179,4 @@ This release does not yet provide:
 - full PTY replay for worker terminals
 - hard path-lease enforcement
 
-These items should be treated as planned follow-up work, not as operational defects in `0.10.0`.
+These items should be treated as planned follow-up work, not as operational defects in `0.11.0`.

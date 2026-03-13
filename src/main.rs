@@ -1,6 +1,7 @@
 mod app_server;
 mod config;
 mod controller;
+mod gateway;
 mod orchestration;
 mod service;
 mod session;
@@ -10,12 +11,15 @@ mod ui;
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use controller::{BatchSnapshot, Controller, CreateJobRequest, JobSnapshot, PromptTarget};
+use gateway::{capabilities_for_channel, sample_inbound_event, sample_outbound_envelope};
+use serde_json::to_string_pretty;
 use service::{ServiceLifecycle, ServiceSnapshot};
 use session::{SessionEventKind, SessionKind, SessionSnapshot};
+use state::ReportChannel;
 use std::{
     collections::BTreeSet,
     env,
-    io::{self, Write},
+    io::{self, IsTerminal, Write},
     path::PathBuf,
     time::Duration,
 };
@@ -75,6 +79,10 @@ enum Command {
         #[command(subcommand)]
         command: JobCommand,
     },
+    Gateway {
+        #[command(subcommand)]
+        command: GatewayCommand,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -99,6 +107,23 @@ enum JobCommand {
     },
     Inspect {
         job_id: String,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum GatewayCommand {
+    Capabilities {
+        #[arg(long, default_value = "console")]
+        channel: String,
+    },
+    Schema,
+    Subscribe {
+        #[arg(long)]
+        job: String,
+        #[arg(long)]
+        channel: String,
+        #[arg(long)]
+        target: Option<String>,
     },
 }
 
@@ -139,6 +164,7 @@ async fn run() -> Result<()> {
         Command::List => run_list(workspace_root).await,
         Command::Jobs => run_jobs(workspace_root).await,
         Command::Job { command } => run_job(workspace_root, command).await,
+        Command::Gateway { command } => run_gateway(workspace_root, command).await,
     }
 }
 
@@ -189,12 +215,20 @@ async fn run_serve(
         "service starting | interval_ms={} stall_after_secs={}",
         interval_ms, stall_after_secs
     );
-    controller
-        .write_service_lifecycle(ServiceLifecycle::Starting, started_at, tick, Vec::new(), None)?;
+    controller.write_service_lifecycle(
+        ServiceLifecycle::Starting,
+        started_at,
+        tick,
+        Vec::new(),
+        None,
+    )?;
 
     loop {
         tick += 1;
-        match controller.service_tick(started_at, tick, stall_after_secs).await {
+        match controller
+            .service_tick(started_at, tick, stall_after_secs)
+            .await
+        {
             Ok(snapshot) => {
                 print_service_tick(&snapshot);
             }
@@ -406,6 +440,98 @@ async fn run_job(workspace_root: PathBuf, command: JobCommand) -> Result<()> {
     }
 }
 
+async fn run_gateway(workspace_root: PathBuf, command: GatewayCommand) -> Result<()> {
+    let controller = Controller::start(workspace_root).await?;
+
+    match command {
+        GatewayCommand::Capabilities { channel } => {
+            let channel = parse_report_channel(&channel)?;
+            let capabilities = capabilities_for_channel(&channel);
+
+            println!("channel: {}", channel);
+            println!(
+                "default target: {}",
+                gateway::default_target_for_channel(&channel, &controller.paths.root)
+            );
+            println!("platform: {}", capabilities.platform);
+            println!("supports text: {}", yes_no(capabilities.supports_text));
+            println!(
+                "supports markdown: {}",
+                yes_no(capabilities.supports_markdown)
+            );
+            println!("supports links: {}", yes_no(capabilities.supports_links));
+            println!("supports images: {}", yes_no(capabilities.supports_images));
+            println!("supports audio: {}", yes_no(capabilities.supports_audio));
+            println!("supports video: {}", yes_no(capabilities.supports_video));
+            println!("supports files: {}", yes_no(capabilities.supports_files));
+            println!("supports typing: {}", yes_no(capabilities.supports_typing));
+            println!(
+                "supports raw type: {}",
+                yes_no(capabilities.supports_raw_type)
+            );
+            println!(
+                "supports raw event: {}",
+                yes_no(capabilities.supports_raw_event)
+            );
+            println!(
+                "supports raw hook: {}",
+                yes_no(capabilities.supports_raw_hook)
+            );
+            println!();
+            println!(
+                "inbound event kinds: {}",
+                capabilities
+                    .inbound_event_kinds
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+            println!(
+                "outbound content kinds: {}",
+                capabilities
+                    .outbound_content_kinds
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+            Ok(())
+        }
+        GatewayCommand::Schema => {
+            let inbound = sample_inbound_event();
+            let outbound = sample_outbound_envelope();
+
+            println!("normalized gateway compatibility contract");
+            println!("supports: text, markdown, links, image, audio, video, file, typing");
+            println!("raw fields: type, event, hook");
+            println!();
+            println!("sample inbound event:");
+            println!("{}", to_string_pretty(&inbound)?);
+            println!();
+            println!("sample outbound envelope:");
+            println!("{}", to_string_pretty(&outbound)?);
+            Ok(())
+        }
+        GatewayCommand::Subscribe {
+            job,
+            channel,
+            target,
+        } => {
+            controller.init_workspace()?;
+            let channel = parse_report_channel(&channel)?;
+            let subscription = controller.add_report_subscription(&job, channel, target)?;
+
+            println!("subscription: SUB-{:03}", subscription.id);
+            println!("job: {}", subscription.job_id);
+            println!("channel: {}", subscription.channel);
+            println!("target: {}", subscription.target);
+            println!("notify kinds: accepted, progress, blocker, completion, failure, digest");
+            Ok(())
+        }
+    }
+}
+
 async fn run_inspect(
     workspace_root: PathBuf,
     session_id: Option<String>,
@@ -448,6 +574,18 @@ fn ok(value: bool) -> &'static str {
     }
 }
 
+fn yes_no(value: bool) -> &'static str {
+    if value {
+        "yes"
+    } else {
+        "no"
+    }
+}
+
+fn parse_report_channel(value: &str) -> Result<ReportChannel> {
+    value.parse::<ReportChannel>().map_err(anyhow::Error::msg)
+}
+
 async fn monitor_spawn_progress(
     controller: Controller,
     existing_workers: BTreeSet<String>,
@@ -455,6 +593,7 @@ async fn monitor_spawn_progress(
     task: String,
     mut stop_rx: watch::Receiver<bool>,
 ) {
+    let interactive = io::stderr().is_terminal();
     let mut tick = 0usize;
     let mut worker_id: Option<String> = None;
     let mut printed_log_lines = 0usize;
@@ -491,7 +630,7 @@ async fn monitor_spawn_progress(
         let status_line = if let Some(worker_id) = worker_id.as_deref() {
             if let Some(session) = controller.session_snapshot(worker_id) {
                 if session.log_lines.len() > printed_log_lines {
-                    clear_progress_line(&mut last_status_len);
+                    clear_progress_line(interactive, &mut last_status_len);
                     for line in session.log_lines.iter().skip(printed_log_lines) {
                         eprintln!("  {line}");
                     }
@@ -523,7 +662,7 @@ async fn monitor_spawn_progress(
         };
 
         if status_line != last_status_line {
-            render_progress_line(&status_line, &mut last_status_len);
+            render_progress_line(&status_line, interactive, &mut last_status_len);
             last_status_line = status_line;
         }
         tick = tick.wrapping_add(1);
@@ -538,7 +677,7 @@ async fn monitor_spawn_progress(
         }
     }
 
-    clear_progress_line(&mut last_status_len);
+    clear_progress_line(interactive, &mut last_status_len);
 }
 
 fn cli_spinner_frame(tick: usize) -> &'static str {
@@ -558,7 +697,11 @@ fn cli_status_detail(session: &SessionSnapshot) -> String {
     )
 }
 
-fn render_progress_line(line: &str, last_status_len: &mut usize) {
+fn render_progress_line(line: &str, interactive: bool, last_status_len: &mut usize) {
+    if !interactive {
+        eprintln!("{line}");
+        return;
+    }
     let mut stderr = io::stderr();
     let padded = if line.len() < *last_status_len {
         format!("{line}{}", " ".repeat(*last_status_len - line.len()))
@@ -570,7 +713,10 @@ fn render_progress_line(line: &str, last_status_len: &mut usize) {
     *last_status_len = padded.len();
 }
 
-fn clear_progress_line(last_status_len: &mut usize) {
+fn clear_progress_line(interactive: bool, last_status_len: &mut usize) {
+    if !interactive {
+        return;
+    }
     if *last_status_len == 0 {
         return;
     }
@@ -765,7 +911,10 @@ fn print_job_snapshot(job: &JobSnapshot) {
         "final outcome: {}",
         job.final_outcome.clone().unwrap_or_else(|| "-".to_owned())
     );
-    println!("context: {}", job.context.clone().unwrap_or_else(|| "-".to_owned()));
+    println!(
+        "context: {}",
+        job.context.clone().unwrap_or_else(|| "-".to_owned())
+    );
 
     println!();
     println!("batches ({}):", job.batch_ids.len());
@@ -836,7 +985,10 @@ fn print_job_snapshot(job: &JobSnapshot) {
         );
         println!(
             "  last error: {}",
-            delivery.last_error.clone().unwrap_or_else(|| "-".to_owned())
+            delivery
+                .last_error
+                .clone()
+                .unwrap_or_else(|| "-".to_owned())
         );
     }
     if job.deliveries.is_empty() {
@@ -889,7 +1041,10 @@ fn print_service_snapshot(snapshot: &ServiceSnapshot) {
     );
     println!(
         "last error: {}",
-        snapshot.last_error.clone().unwrap_or_else(|| "-".to_owned())
+        snapshot
+            .last_error
+            .clone()
+            .unwrap_or_else(|| "-".to_owned())
     );
 
     print_named_ids("pending jobs", &snapshot.pending_jobs);
@@ -902,7 +1057,10 @@ fn print_service_snapshot(snapshot: &ServiceSnapshot) {
     print_named_ids("last dispatched jobs", &snapshot.dispatched_jobs);
     print_named_ids("last generated reports", &snapshot.generated_reports);
     print_named_ids("queued deliveries", &snapshot.queued_deliveries);
-    print_named_ids("last delivered notifications", &snapshot.delivered_notifications);
+    print_named_ids(
+        "last delivered notifications",
+        &snapshot.delivered_notifications,
+    );
 }
 
 fn print_named_ids(label: &str, ids: &[String]) {

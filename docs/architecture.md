@@ -1,6 +1,6 @@
 # CodeClaw Architecture
 
-This document describes the current implemented architecture in release `0.10.0`.
+This document describes the current implemented architecture in release `0.11.0`.
 
 For the next-stage system direction, see:
 
@@ -8,10 +8,11 @@ For the next-stage system direction, see:
 - [System Architecture vNext](system-architecture-v2.md)
 - [Technical Roadmap](technical-roadmap.md)
 - [Project Plan](project-plan.md)
+- [Gateway Protocol](gateway-protocol.md)
 
 ## 0. Implementation Status
 
-As of March 12, 2026, release `0.10.0` implements a working control-plane prototype, not just a design stub.
+As of March 13, 2026, release `0.11.0` implements a working control-plane prototype, not just a design stub.
 
 Implemented now:
 
@@ -29,6 +30,9 @@ Implemented now:
 - explicit worker lifecycle states covering spawn request, bootstrap, blocker, and handoff phases
 - CLI inspection commands backed by the same persisted session and batch supervision data
 - session recovery using `thread/resume`
+- durable jobs, reports, subscriptions, and delivery outbox state
+- a gateway-backed delivery path with `console` and `mock_file` channels
+- a normalized IM/webhook compatibility contract for markdown, links, media, typing, and raw `type/event/hook`
 
 Not implemented yet:
 
@@ -152,15 +156,20 @@ Rust is the best fit because it gives:
    - acts as the shared memory between master and workers
    - now also persists session timeline history and orchestration batch metadata
 
-6. `merge controller`
+6. `gateway layer`
+   - normalizes outbound reports into a channel-neutral envelope
+   - preserves compatibility for text, markdown, links, media, typing, and raw event metadata
+   - currently supports `console` and `mock_file`
+
+7. `merge controller`
    - checks overlap and mergeability
    - gates integration into the shared branch
    - opens PRs or local merge queues later
 
 Current implementation note:
 
-- items 1 through 5 exist in prototype form
-- item 6 is still planned
+- items 1 through 6 exist in prototype form
+- item 7 is still planned
 
 ## 5.2 High-Level Flow
 
@@ -171,7 +180,7 @@ user
           -> codex app-server
               -> master thread decides task split
                   -> worker runtime starts worker sessions
-                      -> status, logs, and timeline updates flow through .codeclaw/ and in-memory session views
+                      -> status, logs, timeline updates, and queued gateway deliveries flow through .codeclaw/ and in-memory session views
                           -> planned worktree isolation and merge control land in later phases
 ```
 

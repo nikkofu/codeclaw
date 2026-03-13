@@ -6,7 +6,7 @@ It combines task routing, session management, shared coordination files, and Git
 
 ## Release Information
 
-- Version: `0.10.0`
+- Version: `0.11.0`
 - Repository: `https://github.com/nikkofu/codeclaw`
 - Delivery and planning package:
   - [Release Notes](RELEASE.md)
@@ -14,6 +14,7 @@ It combines task routing, session management, shared coordination files, and Git
   - [User Guide](docs/user-guide.md)
   - [Operations Guide](docs/operations-guide.md)
   - [Acceptance Use Cases](docs/acceptance-use-cases.md)
+  - [Gateway Protocol](docs/gateway-protocol.md)
   - [Product Strategy](docs/product-strategy.md)
   - [System Architecture vNext](docs/system-architecture-v2.md)
   - [Technical Roadmap](docs/technical-roadmap.md)
@@ -39,6 +40,8 @@ This repository now includes a working Rust control-plane prototype with:
 - a durable `Job` model above batches and workers, with CLI create/list/inspect flows
 - persisted job report history for accepted, progress, blocker, completion, failure, and digest events
 - a channel-neutral report delivery outbox with per-job subscriptions and delivery records
+- a normalized gateway compatibility layer for text, markdown, links, image, audio, video, file, typing, and raw `type/event/hook` semantics
+- a first delivery-safe `mock_file` gateway channel for IM adapter development and integration testing
 - persisted session timeline and orchestration batch history across process restarts
 - persisted rolling live-output tail, including in-flight assistant text, across process restarts
 - a dedicated batch inspection view in the TUI for replaying one orchestration chain across multiple sessions
@@ -66,6 +69,9 @@ cargo run -- inspect --service
 cargo run -- jobs
 cargo run -- job create --title "Payment API refactor"
 cargo run -- job inspect JOB-001
+cargo run -- gateway schema
+cargo run -- gateway capabilities --channel mock-file
+cargo run -- gateway subscribe --job JOB-001 --channel mock-file
 cargo run -- list
 ```
 
@@ -144,6 +150,8 @@ The CLI can now inspect the same supervision data without opening the TUI:
 
 The `spawn` command now also shows terminal-side progress feedback while it waits for worker bootstrap, including a spinner, state updates, and fresh worker log lines.
 
+When the current terminal does not expose an interactive TTY, CodeClaw now falls back to newline-based spawn progress updates so status changes are still visible in wrapped terminals, task runners, or IM-triggered command logs.
+
 Jobs now provide a top-level operating object above batches and workers:
 
 - `codeclaw job create` creates a durable pending job with orchestration policy metadata
@@ -158,6 +166,13 @@ The new `serve` command is the first service-mode skeleton for long-running orch
 - due running/blocked jobs now emit persisted digest reports on the service loop cadence
 - queued report deliveries now flow through a channel-neutral outbox and are emitted through a first `console/stdout` delivery path
 - the latest service heartbeat is persisted to `.codeclaw/service.json` so CLI inspection and future gateways can observe background state
+
+Gateway compatibility is now explicitly defined for future IM integrations:
+
+- `codeclaw gateway schema` prints the canonical inbound/outbound JSON contract
+- `codeclaw gateway capabilities --channel ...` prints per-channel support for markdown, media, typing, and raw `type/event/hook`
+- `codeclaw gateway subscribe --job ... --channel mock-file` adds a durable report subscription for integration testing or external delivery relays
+- [docs/gateway-protocol.md](docs/gateway-protocol.md) defines the compatibility contract that future Slack, Telegram, WeCom, Feishu, Discord, or webhook adapters should follow
 
 ## Requirements
 
@@ -175,6 +190,7 @@ The new `serve` command is the first service-mode skeleton for long-running orch
 - persisted job reports currently live in `.codeclaw/state.json` under `reports`
 - persisted report delivery subscriptions and outbox records currently live in `.codeclaw/state.json` under `report_subscriptions` and `report_deliveries`
 - persisted service heartbeat currently lives in `.codeclaw/service.json`
+- default mock gateway outbox lives in `.codeclaw/gateway/mock-outbox.jsonl`
 
 ## Known Gaps
 
@@ -198,4 +214,5 @@ The new `serve` command is the first service-mode skeleton for long-running orch
 - User guide: [docs/user-guide.md](docs/user-guide.md)
 - Operations guide: [docs/operations-guide.md](docs/operations-guide.md)
 - Acceptance use cases: [docs/acceptance-use-cases.md](docs/acceptance-use-cases.md)
+- Gateway protocol: [docs/gateway-protocol.md](docs/gateway-protocol.md)
 - Roadmap: [docs/roadmap.md](docs/roadmap.md)
