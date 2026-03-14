@@ -1,6 +1,6 @@
 [package]
 name = "codeclaw"
-version = "0.13.0"
+version = "0.13.1"
 edition = "2021"
 description = "Terminal-first control plane for Codex sessions across large codebases"
 repository = "https://github.com/nikkofu/codeclaw"

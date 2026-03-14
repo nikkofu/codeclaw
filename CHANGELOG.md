@@ -4,6 +4,12 @@
 
 - no entries yet
 
+## 0.13.1 - 2026-03-14
+
+- finalized the `0.13.x` delivery package so the tagged release now includes the release announcement and operator upgrade notes
+- synchronized repository version metadata, README delivery links, and release-maintainer materials to `0.13.1`
+- no runtime behavior change from `0.13.0`; this patch release freezes the complete release package into a clean tagged snapshot
+
 ## 0.13.0 - 2026-03-14
 
 - added a local codex-monitor snapshot plus onboard `Codex Sessions` visibility so runtime/session answers come from CodeClaw state instead of a model guess

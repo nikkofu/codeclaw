@@ -1,6 +1,6 @@
 # CodeClaw Architecture
 
-This document describes the current implemented architecture in release `0.13.0`.
+This document describes the current implemented architecture in release `0.13.1`.
 
 For the next-stage system direction, see:
 
@@ -12,7 +12,7 @@ For the next-stage system direction, see:
 
 ## 0. Implementation Status
 
-As of March 14, 2026, release `0.13.0` implements a working control-plane prototype, not just a design stub.
+As of March 14, 2026, release `0.13.1` implements a working control-plane prototype, not just a design stub.
 
 Implemented now:
 

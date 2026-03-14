@@ -5,7 +5,7 @@
 | Item | Value |
 | --- | --- |
 | Product | CodeClaw |
-| Version | `0.13.0` |
+| Version | `0.13.1` |
 | Delivery date | `2026-03-14` |
 | Repository | `https://github.com/nikkofu/codeclaw` |
 | Primary package | `codeclaw` |
@@ -16,7 +16,9 @@
 
 This delivery provides a terminal-first control plane for supervising one master Codex session and multiple worker sessions in a shared repository. The current release is suitable for controlled pilot delivery and operator-guided use in a real repository.
 
-Delivered scope in `0.13.0`:
+Release note: `0.13.1` is a patch-level delivery freeze on top of the `0.13.0` monitor-and-automation control-plane scope. It synchronizes version metadata and ensures the tagged snapshot also contains the release announcement and upgrade notes used during handoff.
+
+Delivered scope in `0.13.1`:
 
 - master and worker orchestration over `codex app-server`
 - CLI commands for initialization, health checks, worker creation, prompt dispatch, and inspection
@@ -47,7 +49,7 @@ Delivered scope in `0.13.0`:
 
 ## Strategic Planning Addendum
 
-The repository also includes a next-phase planning package derived from the `0.13.0` baseline. These documents describe the intended evolution path and do not imply that the capabilities are already delivered in the current release.
+The repository also includes a next-phase planning package derived from the `0.13.1` baseline. These documents describe the intended evolution path and do not imply that the capabilities are already delivered in the current release.
 
 - [docs/product-strategy.md](product-strategy.md)
 - [docs/system-architecture-v2.md](system-architecture-v2.md)

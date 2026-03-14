@@ -2,7 +2,7 @@
 
 ## Overview
 
-CodeClaw is a terminal-first control plane for coordinating one master Codex session and multiple worker sessions. This guide covers day-to-day operator usage for release `0.13.0`.
+CodeClaw is a terminal-first control plane for coordinating one master Codex session and multiple worker sessions. This guide covers day-to-day operator usage for release `0.13.1`.
 
 Repository: `https://github.com/nikkofu/codeclaw`
 

@@ -2,7 +2,7 @@
 
 ## Purpose
 
-This guide describes installation, deployment, backup, upgrade, and troubleshooting practices for CodeClaw `0.13.0`.
+This guide describes installation, deployment, backup, upgrade, and troubleshooting practices for CodeClaw `0.13.1`.
 
 Repository: `https://github.com/nikkofu/codeclaw`
 
@@ -291,4 +291,4 @@ This release does not yet provide:
 - full PTY replay for worker terminals
 - hard path-lease enforcement
 
-These items should be treated as planned follow-up work, not as operational defects in `0.13.0`.
+These items should be treated as planned follow-up work, not as operational defects in `0.13.1`.

@@ -2,7 +2,7 @@
 
 ## Scope
 
-This document defines recommended acceptance scenarios for release `0.13.0`.
+This document defines recommended acceptance scenarios for release `0.13.1`.
 
 Repository: `https://github.com/nikkofu/codeclaw`
 

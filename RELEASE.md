@@ -1,42 +1,34 @@
-# CodeClaw Release `v0.13.0`
+# CodeClaw Release `v0.13.1`
 
 Repository: `https://github.com/nikkofu/codeclaw`  
 Release date: `2026-03-14`
 
 ## Suggested Git Tag
 
-`v0.13.0`
+`v0.13.1`
 
 ## Suggested GitHub Release Title
 
-`CodeClaw v0.13.0`
+`CodeClaw v0.13.1`
 
 ## GitHub Release Body
 
 ```md
-CodeClaw `v0.13.0` focuses on transparent multi-session supervision.
+CodeClaw `v0.13.1` finalizes the `0.13.x` release package.
 
-This release builds on the `0.12.0` supervision baseline with local runtime monitoring, bounded session automations, a more operator-capable command bar, and a stronger onboard control surface. The goal is still the same: operators should be able to understand what the system is doing, why it stopped, and how to keep it running safely without silent failures, but now with less model indirection and lower operator friction.
+This patch release does not introduce a new runtime feature set beyond `v0.13.0`. Its purpose is to freeze the complete delivery package into a clean tagged snapshot, including the release announcement, upgrade notes, and synchronized repository metadata for the monitor-and-automation control-plane release line.
 
 ## Highlights
 
-- added a local codex-monitor snapshot plus onboard `Codex Sessions` visibility so runtime/session answers come from CodeClaw state instead of a model guess
-- added session-targeted automations with `automation create|list|pause|resume|cancel`, plus an onboard `Automations` panel
-- changed `codeclaw up` into an active foreground scheduler driver, so delegated loops and automations can keep progressing while the TUI is open
-- added local slash-command control for `/monitor ...` and `/automation ...`, with completion, editing, and history improvements in the command bar
-- persisted live runtime heartbeat into `.codeclaw/runtime.json` and expanded `inspect --service` with runtime pid/mode/turn visibility
-- refreshed README, user guide, operations guide, project delivery notes, acceptance cases, and architecture references for `0.13.0`
+- finalized the `0.13.x` delivery package so the tagged release includes the release announcement and operator upgrade notes
+- synchronized repository version metadata, README delivery links, and release-maintainer materials to `0.13.1`
+- preserves the `v0.13.0` runtime scope: local codex-monitor visibility, session automations, foreground scheduler ticks in `up`, improved slash-command UX, and expanded `inspect --service`
 
 ## Included In This Release
 
-- terminal-first `codeclaw` CLI and TUI control plane
-- master/worker orchestration over `codex app-server`
-- onboard supervision board for 7x24 oversight
-- authoritative local runtime/session monitoring without routing monitor questions through Codex
-- bounded delegated continuation through the scheduler driver in `codeclaw up` or `codeclaw serve`
-- bounded repeated session automations targeting `master` or a specific worker
-- channel-neutral gateway protocol and report delivery
-- daily archived runtime and session logs
+- the full `v0.13.0` monitor-and-automation control-plane scope
+- release announcement and upgrade notes frozen into the tagged repository snapshot
+- synchronized delivery documentation and release-maintainer assets
 
 ## Delivery Documentation
 
@@ -56,7 +48,6 @@ cargo run -- up
 cargo run -- serve
 cargo run -- inspect --service
 cargo run -- job create --title "Nightly backlog sweep" --delegate-master-loop --continue-for-secs 3600 --continue-max-iterations 10
-cargo run -- job create --title "Auto recovery" --delegate-master-loop --continue-for-secs 3600 --continue-max-iterations 10 --auto-approve
 cargo run -- automation create --to master --every-secs 300 --max-runs 10 --for-secs 3600 "Review blocked jobs"
 cargo run -- automation list
 cargo run -- gateway schema
@@ -64,7 +55,7 @@ cargo run -- gateway schema
 
 ## Upgrade Notes
 
-- package version is now `0.13.0` in `Cargo.toml` and `Cargo.lock`
+- package version is now `0.13.1` in `Cargo.toml` and `Cargo.lock`
 - preserve `.codeclaw/` before upgrading if supervision history, queued deliveries, or archived logs must be retained
 - validate the environment with `cargo run -- doctor` after pulling the release
 - review `[logging]` in `codeclaw.toml` to confirm retention and notification buffer settings
@@ -91,7 +82,7 @@ This release does not yet include:
 
 ## Release Maintainer Checklist
 
-1. Confirm `Cargo.toml` and `Cargo.lock` both show `0.13.0`.
+1. Confirm `Cargo.toml` and `Cargo.lock` both show `0.13.1`.
 2. Confirm `CHANGELOG.md`, `README.md`, `docs/user-guide.md`, and `docs/operations-guide.md` match the release scope.
 3. Run:
 
@@ -103,16 +94,16 @@ This release does not yet include:
 4. Create the tag:
 
    ```bash
-   git tag v0.13.0
+   git tag v0.13.1
    ```
 
 5. Push the tag:
 
    ```bash
-   git push origin v0.13.0
+   git push origin v0.13.1
    ```
 
-6. Create a GitHub Release with title `CodeClaw v0.13.0`.
+6. Create a GitHub Release with title `CodeClaw v0.13.1`.
 7. Paste the `GitHub Release Body` block above into the release description.
 
 ## Related Files
