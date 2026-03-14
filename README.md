@@ -14,6 +14,8 @@ It combines task routing, session management, shared coordination files, and Git
   - [Upgrade Notes v0.13.1](docs/upgrade-notes-v0.13.1.md)
   - [Community Post Kit v0.13.1](docs/community-post-kit-v0.13.1.md)
   - [Quickstart Card v0.13.1](docs/quickstart-card-v0.13.1.md)
+  - [FAQ](docs/faq.md)
+  - [IM Gateway Rollout Checklist](docs/im-gateway-rollout-checklist.md)
   - [Project Delivery](docs/project-delivery.md)
   - [User Guide](docs/user-guide.md)
   - [Operations Guide](docs/operations-guide.md)
