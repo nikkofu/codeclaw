@@ -10,6 +10,8 @@ It combines task routing, session management, shared coordination files, and Git
 - Repository: `https://github.com/nikkofu/codeclaw`
 - Delivery and planning package:
   - [Release Notes](RELEASE.md)
+  - [Release Announcement v0.13.0](docs/release-announcement-v0.13.0.md)
+  - [Upgrade Notes v0.13.0](docs/upgrade-notes-v0.13.0.md)
   - [Project Delivery](docs/project-delivery.md)
   - [User Guide](docs/user-guide.md)
   - [Operations Guide](docs/operations-guide.md)
