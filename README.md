@@ -18,6 +18,8 @@ It combines task routing, session management, shared coordination files, and Git
   - [IM Gateway Rollout Checklist](docs/im-gateway-rollout-checklist.md)
   - [Operator Runbook](docs/operator-runbook.md)
   - [Customer Handover Checklist](docs/customer-handover-checklist.md)
+  - [Incident Response Playbook](docs/incident-response-playbook.md)
+  - [Templates](templates)
   - [Project Delivery](docs/project-delivery.md)
   - [User Guide](docs/user-guide.md)
   - [Operations Guide](docs/operations-guide.md)
