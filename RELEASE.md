@@ -1,39 +1,40 @@
-# CodeClaw Release `v0.12.0`
+# CodeClaw Release `v0.13.0`
 
 Repository: `https://github.com/nikkofu/codeclaw`  
-Release date: `2026-03-13`
+Release date: `2026-03-14`
 
 ## Suggested Git Tag
 
-`v0.12.0`
+`v0.13.0`
 
 ## Suggested GitHub Release Title
 
-`CodeClaw v0.12.0`
+`CodeClaw v0.13.0`
 
 ## GitHub Release Body
 
 ```md
-CodeClaw `v0.12.0` focuses on stable long-running supervision.
+CodeClaw `v0.13.0` focuses on transparent multi-session supervision.
 
-This release adds a default `onboard` supervisor session, bounded 7x24 continuation controls, daily archived logging, and a non-fatal recovery path for app-server notification lag. The goal is simple: operators should be able to understand what the system is doing, why it stopped, and how to keep it running safely without silent failures.
+This release builds on the `0.12.0` supervision baseline with local runtime monitoring, bounded session automations, a more operator-capable command bar, and a stronger onboard control surface. The goal is still the same: operators should be able to understand what the system is doing, why it stopped, and how to keep it running safely without silent failures, but now with less model indirection and lower operator friction.
 
 ## Highlights
 
-- added a default virtual `onboard` supervision session with a kanban-like board for pending, running, blocked, completed, and failed jobs
-- added bounded master-loop delegation controls with `delegate-master-loop`, `continue-for-secs`, `continue-max-iterations`, and visible `auto-approve` markers
-- changed `app-server notification channel error: channel lagged by N` from a fatal turn error into a logged warning with continued processing
-- increased app-server notification buffer capacity and made it configurable through `[logging].notification_channel_capacity`
-- added daily archived JSONL logs under `.codeclaw/logs/archive/YYYY-MM-DD/` with configurable retention, defaulting to 30 days
-- added runtime log coverage for controller-side lag warnings, app-server stderr, parse failures, and stdout-closed conditions
-- refreshed README, user guide, operations guide, acceptance cases, and release metadata for `0.12.0`
+- added a local codex-monitor snapshot plus onboard `Codex Sessions` visibility so runtime/session answers come from CodeClaw state instead of a model guess
+- added session-targeted automations with `automation create|list|pause|resume|cancel`, plus an onboard `Automations` panel
+- changed `codeclaw up` into an active foreground scheduler driver, so delegated loops and automations can keep progressing while the TUI is open
+- added local slash-command control for `/monitor ...` and `/automation ...`, with completion, editing, and history improvements in the command bar
+- persisted live runtime heartbeat into `.codeclaw/runtime.json` and expanded `inspect --service` with runtime pid/mode/turn visibility
+- refreshed README, user guide, operations guide, project delivery notes, acceptance cases, and architecture references for `0.13.0`
 
 ## Included In This Release
 
 - terminal-first `codeclaw` CLI and TUI control plane
 - master/worker orchestration over `codex app-server`
 - onboard supervision board for 7x24 oversight
-- bounded delegated continuation through `codeclaw serve`
+- authoritative local runtime/session monitoring without routing monitor questions through Codex
+- bounded delegated continuation through the scheduler driver in `codeclaw up` or `codeclaw serve`
+- bounded repeated session automations targeting `master` or a specific worker
 - channel-neutral gateway protocol and report delivery
 - daily archived runtime and session logs
 
@@ -56,12 +57,14 @@ cargo run -- serve
 cargo run -- inspect --service
 cargo run -- job create --title "Nightly backlog sweep" --delegate-master-loop --continue-for-secs 3600 --continue-max-iterations 10
 cargo run -- job create --title "Auto recovery" --delegate-master-loop --continue-for-secs 3600 --continue-max-iterations 10 --auto-approve
+cargo run -- automation create --to master --every-secs 300 --max-runs 10 --for-secs 3600 "Review blocked jobs"
+cargo run -- automation list
 cargo run -- gateway schema
 ```
 
 ## Upgrade Notes
 
-- package version is now `0.12.0` in `Cargo.toml` and `Cargo.lock`
+- package version is now `0.13.0` in `Cargo.toml` and `Cargo.lock`
 - preserve `.codeclaw/` before upgrading if supervision history, queued deliveries, or archived logs must be retained
 - validate the environment with `cargo run -- doctor` after pulling the release
 - review `[logging]` in `codeclaw.toml` to confirm retention and notification buffer settings
@@ -88,7 +91,7 @@ This release does not yet include:
 
 ## Release Maintainer Checklist
 
-1. Confirm `Cargo.toml` and `Cargo.lock` both show `0.12.0`.
+1. Confirm `Cargo.toml` and `Cargo.lock` both show `0.13.0`.
 2. Confirm `CHANGELOG.md`, `README.md`, `docs/user-guide.md`, and `docs/operations-guide.md` match the release scope.
 3. Run:
 
@@ -100,16 +103,16 @@ This release does not yet include:
 4. Create the tag:
 
    ```bash
-   git tag v0.12.0
+   git tag v0.13.0
    ```
 
 5. Push the tag:
 
    ```bash
-   git push origin v0.12.0
+   git push origin v0.13.0
    ```
 
-6. Create a GitHub Release with title `CodeClaw v0.12.0`.
+6. Create a GitHub Release with title `CodeClaw v0.13.0`.
 7. Paste the `GitHub Release Body` block above into the release description.
 
 ## Related Files

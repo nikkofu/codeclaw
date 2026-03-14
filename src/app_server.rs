@@ -6,7 +6,7 @@ use std::{
     collections::HashMap,
     path::PathBuf,
     sync::{
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         Arc,
     },
 };
@@ -24,12 +24,20 @@ pub struct Notification {
 
 type PendingMap = Arc<Mutex<HashMap<u64, oneshot::Sender<Result<Value>>>>>;
 
+#[derive(Debug, Clone, Copy)]
+pub struct AppServerRuntimeSnapshot {
+    pub pid: Option<u32>,
+    pub connected: bool,
+}
+
 pub struct AppServerClient {
     child: Arc<Mutex<Child>>,
     stdin: Arc<Mutex<ChildStdin>>,
     pending: PendingMap,
     notifications: broadcast::Sender<Notification>,
     next_id: AtomicU64,
+    pid: Option<u32>,
+    connected: Arc<AtomicBool>,
 }
 
 impl AppServerClient {
@@ -66,14 +74,17 @@ impl AppServerClient {
             .stderr
             .take()
             .context("failed to capture app-server stderr")?;
+        let pid = child.id();
 
         let pending: PendingMap = Arc::new(Mutex::new(HashMap::new()));
         let (notifications, _) = broadcast::channel(notification_channel_capacity);
+        let connected = Arc::new(AtomicBool::new(true));
 
         spawn_stdout_reader(
             stdout,
             Arc::clone(&pending),
             notifications.clone(),
+            Arc::clone(&connected),
             log_dir.clone(),
             log_retention_days,
         );
@@ -85,6 +96,8 @@ impl AppServerClient {
             pending,
             notifications,
             next_id: AtomicU64::new(1),
+            pid,
+            connected,
         };
 
         let _: Value = client
@@ -108,6 +121,13 @@ impl AppServerClient {
 
     pub fn subscribe(&self) -> broadcast::Receiver<Notification> {
         self.notifications.subscribe()
+    }
+
+    pub fn runtime_snapshot(&self) -> AppServerRuntimeSnapshot {
+        AppServerRuntimeSnapshot {
+            pid: self.pid,
+            connected: self.connected.load(Ordering::Relaxed),
+        }
     }
 
     pub async fn request<T>(&self, method: &str, params: Value) -> Result<T>
@@ -159,6 +179,7 @@ fn spawn_stdout_reader(
     stdout: tokio::process::ChildStdout,
     pending: PendingMap,
     notifications: broadcast::Sender<Notification>,
+    connected: Arc<AtomicBool>,
     log_dir: PathBuf,
     log_retention_days: u64,
 ) {
@@ -236,6 +257,7 @@ fn spawn_stdout_reader(
         for (_, sender) in pending.drain() {
             let _ = sender.send(Err(anyhow!("app-server stdout closed")));
         }
+        connected.store(false, Ordering::Relaxed);
         let _ = append_runtime_log(
             &log_dir,
             log_retention_days,

@@ -27,6 +27,8 @@ pub struct AppState {
     pub next_report_subscription_number: u64,
     #[serde(default = "default_next_report_delivery_number")]
     pub next_report_delivery_number: u64,
+    #[serde(default = "default_next_session_automation_number")]
+    pub next_session_automation_number: u64,
     pub next_task_number: u64,
     #[serde(default)]
     pub jobs: BTreeMap<String, JobRecord>,
@@ -46,6 +48,8 @@ pub struct AppState {
     pub session_live_buffers: BTreeMap<String, String>,
     #[serde(default)]
     pub batches: BTreeMap<u64, OrchestrationBatchRecord>,
+    #[serde(default)]
+    pub session_automations: BTreeMap<String, SessionAutomationRecord>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -225,6 +229,43 @@ pub struct WorkerRecord {
     pub last_message: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionAutomationRecord {
+    pub id: String,
+    pub target_session_id: String,
+    pub prompt: String,
+    pub interval_secs: u64,
+    #[serde(default)]
+    pub max_runs: Option<u32>,
+    #[serde(default)]
+    pub run_for_secs: Option<u64>,
+    pub status: SessionAutomationStatus,
+    pub created_at: u64,
+    pub updated_at: u64,
+    #[serde(default)]
+    pub started_at: Option<u64>,
+    #[serde(default)]
+    pub next_run_at: Option<u64>,
+    #[serde(default)]
+    pub last_run_at: Option<u64>,
+    #[serde(default)]
+    pub run_count: u32,
+    #[serde(default)]
+    pub last_error: Option<String>,
+    #[serde(default)]
+    pub last_batch_id: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionAutomationStatus {
+    Armed,
+    Paused,
+    Completed,
+    Cancelled,
+    Failed,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum WorkerStatus {
@@ -267,6 +308,7 @@ impl Default for AppState {
             next_report_number: default_next_report_number(),
             next_report_subscription_number: default_next_report_subscription_number(),
             next_report_delivery_number: default_next_report_delivery_number(),
+            next_session_automation_number: default_next_session_automation_number(),
             next_task_number: 1,
             jobs: BTreeMap::new(),
             reports: BTreeMap::new(),
@@ -277,6 +319,7 @@ impl Default for AppState {
             session_output: BTreeMap::new(),
             session_live_buffers: BTreeMap::new(),
             batches: BTreeMap::new(),
+            session_automations: BTreeMap::new(),
         }
     }
 }
@@ -427,6 +470,19 @@ impl fmt::Display for WorkerStatus {
     }
 }
 
+impl fmt::Display for SessionAutomationStatus {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let value = match self {
+            Self::Armed => "armed",
+            Self::Paused => "paused",
+            Self::Completed => "completed",
+            Self::Cancelled => "cancelled",
+            Self::Failed => "failed",
+        };
+        f.write_str(value)
+    }
+}
+
 pub fn now_unix_ts() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -454,6 +510,10 @@ fn default_next_report_delivery_number() -> u64 {
     1
 }
 
+fn default_next_session_automation_number() -> u64 {
+    1
+}
+
 fn default_job_priority() -> String {
     "normal".to_owned()
 }
@@ -467,7 +527,7 @@ mod tests {
     use super::{
         AppState, BatchStatus, JobPolicy, JobRecord, JobReportKind, JobReportRecord, JobStatus,
         OrchestrationBatchRecord, ReportChannel, ReportDeliveryRecord, ReportDeliveryStatus,
-        ReportSubscriptionRecord, WorkerStatus,
+        ReportSubscriptionRecord, SessionAutomationRecord, SessionAutomationStatus, WorkerStatus,
     };
     use crate::session::{SessionEvent, SessionEventKind};
 
@@ -479,6 +539,7 @@ mod tests {
         state.next_report_number = 4;
         state.next_report_subscription_number = 2;
         state.next_report_delivery_number = 3;
+        state.next_session_automation_number = 2;
         state.jobs.insert(
             "JOB-001".to_owned(),
             JobRecord {
@@ -603,6 +664,26 @@ mod tests {
                 last_event: Some("worker done".to_owned()),
             },
         );
+        state.session_automations.insert(
+            "AUTO-001".to_owned(),
+            SessionAutomationRecord {
+                id: "AUTO-001".to_owned(),
+                target_session_id: "master".to_owned(),
+                prompt: "Review blocked jobs and continue".to_owned(),
+                interval_secs: 300,
+                max_runs: Some(10),
+                run_for_secs: Some(3600),
+                status: SessionAutomationStatus::Armed,
+                created_at: 126,
+                updated_at: 126,
+                started_at: Some(126),
+                next_run_at: Some(126),
+                last_run_at: Some(126),
+                run_count: 1,
+                last_error: None,
+                last_batch_id: Some(7),
+            },
+        );
 
         let raw = serde_json::to_string(&state).expect("state should encode");
         let decoded: AppState = serde_json::from_str(&raw).expect("state should decode");
@@ -612,6 +693,7 @@ mod tests {
         assert_eq!(decoded.next_report_number, 4);
         assert_eq!(decoded.next_report_subscription_number, 2);
         assert_eq!(decoded.next_report_delivery_number, 3);
+        assert_eq!(decoded.next_session_automation_number, 2);
         assert_eq!(decoded.jobs["JOB-001"].status, JobStatus::Running);
         assert_eq!(
             decoded.jobs["JOB-001"].policy.pattern,
@@ -643,6 +725,14 @@ mod tests {
         assert_eq!(decoded.session_live_buffers["master"], "partial reply");
         assert_eq!(decoded.batches[&6].job_id.as_deref(), Some("JOB-001"));
         assert_eq!(decoded.batches[&6].status, BatchStatus::Completed);
+        assert_eq!(
+            decoded.session_automations["AUTO-001"].status,
+            SessionAutomationStatus::Armed
+        );
+        assert_eq!(
+            decoded.session_automations["AUTO-001"].target_session_id,
+            "master"
+        );
     }
 
     #[test]
@@ -675,6 +765,24 @@ mod tests {
         for status in statuses {
             let raw = serde_json::to_string(&status).expect("status should encode");
             let decoded: JobStatus = serde_json::from_str(&raw).expect("status should decode");
+            assert_eq!(decoded, status);
+        }
+    }
+
+    #[test]
+    fn session_automation_status_round_trips_lifecycle_states() {
+        let statuses = [
+            SessionAutomationStatus::Armed,
+            SessionAutomationStatus::Paused,
+            SessionAutomationStatus::Completed,
+            SessionAutomationStatus::Cancelled,
+            SessionAutomationStatus::Failed,
+        ];
+
+        for status in statuses {
+            let raw = serde_json::to_string(&status).expect("status should encode");
+            let decoded: SessionAutomationStatus =
+                serde_json::from_str(&raw).expect("status should decode");
             assert_eq!(decoded, status);
         }
     }

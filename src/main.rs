@@ -11,15 +11,19 @@ mod ui;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use controller::{BatchSnapshot, Controller, CreateJobRequest, JobSnapshot, PromptTarget};
+use controller::{
+    job_intake_prompt, BatchSnapshot, Controller, CreateJobRequest, CreateSessionAutomationRequest,
+    JobSnapshot, PromptTarget, SessionAutomationSnapshot,
+};
 use gateway::{capabilities_for_channel, sample_inbound_event, sample_outbound_envelope};
 use serde_json::to_string_pretty;
-use service::{ServiceLifecycle, ServiceSnapshot};
+use service::{RuntimeSnapshot, ServiceLifecycle, ServiceSnapshot};
 use session::{SessionEventKind, SessionKind, SessionSnapshot};
-use state::ReportChannel;
+use state::{JobRecord, ReportChannel};
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     env,
+    future::Future,
     io::{self, IsTerminal, Write},
     path::PathBuf,
     time::Duration,
@@ -80,6 +84,10 @@ enum Command {
         #[command(subcommand)]
         command: JobCommand,
     },
+    Automation {
+        #[command(subcommand)]
+        command: AutomationCommand,
+    },
     Gateway {
         #[command(subcommand)]
         command: GatewayCommand,
@@ -113,9 +121,42 @@ enum JobCommand {
         continue_max_iterations: Option<u32>,
         #[arg(long)]
         context: Option<String>,
+        #[arg(long, default_value_t = false)]
+        defer: bool,
+        #[arg(long, default_value_t = false)]
+        follow: bool,
+        #[arg(long, conflicts_with = "start_group")]
+        start_session: Option<String>,
+        #[arg(long, conflicts_with = "start_session")]
+        start_group: Option<String>,
     },
     Inspect {
         job_id: String,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum AutomationCommand {
+    Create {
+        #[arg(long)]
+        to: String,
+        #[arg(long)]
+        every_secs: u64,
+        #[arg(long)]
+        max_runs: Option<u32>,
+        #[arg(long)]
+        for_secs: Option<u64>,
+        prompt: String,
+    },
+    List,
+    Pause {
+        automation_id: String,
+    },
+    Resume {
+        automation_id: String,
+    },
+    Cancel {
+        automation_id: String,
     },
 }
 
@@ -134,6 +175,13 @@ enum GatewayCommand {
         #[arg(long)]
         target: Option<String>,
     },
+}
+
+#[derive(Debug, Clone)]
+enum JobStartTarget {
+    Master,
+    ExistingSession(String),
+    NewWorkerGroup(String),
 }
 
 #[tokio::main]
@@ -173,6 +221,7 @@ async fn run() -> Result<()> {
         Command::List => run_list(workspace_root).await,
         Command::Jobs => run_jobs(workspace_root).await,
         Command::Job { command } => run_job(workspace_root, command).await,
+        Command::Automation { command } => run_automation(workspace_root, command).await,
         Command::Gateway { command } => run_gateway(workspace_root, command).await,
     }
 }
@@ -204,7 +253,13 @@ async fn run_doctor(workspace_root: PathBuf) -> Result<()> {
 async fn run_up(workspace_root: PathBuf) -> Result<()> {
     let controller = Controller::start(workspace_root).await?;
     controller.init_workspace()?;
-    ui::run(controller).await
+    with_runtime_session(
+        controller.clone(),
+        "up",
+        "cargo run -- up".to_owned(),
+        ui::run(controller),
+    )
+    .await
 }
 
 async fn run_serve(
@@ -215,72 +270,83 @@ async fn run_serve(
 ) -> Result<()> {
     let controller = Controller::start(workspace_root).await?;
     controller.init_workspace()?;
-
-    let started_at = state::now_unix_ts();
-    let interval = Duration::from_millis(interval_ms);
-    let mut tick = 0u64;
-
-    println!(
-        "service starting | interval_ms={} stall_after_secs={}",
-        interval_ms, stall_after_secs
-    );
-    controller.write_service_lifecycle(
-        ServiceLifecycle::Starting,
-        started_at,
-        tick,
-        Vec::new(),
-        None,
-    )?;
-
-    loop {
-        tick += 1;
-        match controller
-            .service_tick(started_at, tick, stall_after_secs)
-            .await
-        {
-            Ok(snapshot) => {
-                print_service_tick(&snapshot);
-            }
-            Err(error) => {
-                controller.write_service_lifecycle(
-                    ServiceLifecycle::Failed,
-                    started_at,
-                    tick,
-                    Vec::new(),
-                    Some(error.to_string()),
-                )?;
-                return Err(error);
-            }
-        }
-
+    with_runtime_session(
+        controller.clone(),
+        "serve",
         if once {
+            "cargo run -- serve --once".to_owned()
+        } else {
+            "cargo run -- serve".to_owned()
+        },
+        async move {
+            let started_at = state::now_unix_ts();
+            let interval = Duration::from_millis(interval_ms);
+            let mut tick = 0u64;
+
+            println!(
+                "service starting | interval_ms={} stall_after_secs={}",
+                interval_ms, stall_after_secs
+            );
             controller.write_service_lifecycle(
-                ServiceLifecycle::Stopped,
+                ServiceLifecycle::Starting,
                 started_at,
                 tick,
                 Vec::new(),
                 None,
             )?;
-            println!("service stopped | mode=once");
-            return Ok(());
-        }
 
-        tokio::select! {
-            _ = tokio::time::sleep(interval) => {}
-            signal = tokio::signal::ctrl_c() => {
-                signal.context("failed to listen for ctrl-c")?;
-                controller.write_service_lifecycle(
-                    ServiceLifecycle::Stopped,
-                    started_at,
-                    tick,
-                    Vec::new(),
-                    None,
-                )?;
-                println!("service stopped | reason=ctrl-c");
-                return Ok(());
+            loop {
+                tick += 1;
+                match controller
+                    .service_tick(started_at, tick, stall_after_secs)
+                    .await
+                {
+                    Ok(snapshot) => {
+                        print_service_tick(&snapshot);
+                    }
+                    Err(error) => {
+                        controller.write_service_lifecycle(
+                            ServiceLifecycle::Failed,
+                            started_at,
+                            tick,
+                            Vec::new(),
+                            Some(error.to_string()),
+                        )?;
+                        return Err(error);
+                    }
+                }
+
+                if once {
+                    controller.write_service_lifecycle(
+                        ServiceLifecycle::Stopped,
+                        started_at,
+                        tick,
+                        Vec::new(),
+                        None,
+                    )?;
+                    println!("service stopped | mode=once");
+                    return Ok(());
+                }
+
+                tokio::select! {
+                    _ = tokio::time::sleep(interval) => {}
+                    signal = tokio::signal::ctrl_c() => {
+                        signal.context("failed to listen for ctrl-c")?;
+                        controller.write_service_lifecycle(
+                            ServiceLifecycle::Stopped,
+                            started_at,
+                            tick,
+                            Vec::new(),
+                            None,
+                        )?;
+                        println!("service stopped | reason=ctrl-c");
+                        return Ok(());
+                    }
+                }
             }
-        }
-    }
+        },
+    )
+    .await
 }
 
 async fn run_spawn(
@@ -291,39 +357,47 @@ async fn run_spawn(
 ) -> Result<()> {
     let controller = Controller::start(workspace_root).await?;
     controller.init_workspace()?;
-    let existing_workers = controller
-        .list_workers()
-        .into_iter()
-        .map(|worker| worker.id)
-        .collect::<BTreeSet<_>>();
-    eprintln!("spawning worker [{group}] {task}");
-    let (stop_tx, stop_rx) = watch::channel(false);
-    let progress = tokio::spawn(monitor_spawn_progress(
+    with_runtime_session(
         controller.clone(),
-        existing_workers,
-        group.to_owned(),
-        task.to_owned(),
-        stop_rx,
-    ));
-    let result = if let Some(job_id) = job_id {
-        controller
-            .spawn_worker_and_wait_for_job(group, task, Some(job_id))
-            .await
-    } else {
-        controller.spawn_worker_and_wait(group, task).await
-    };
-    let _ = stop_tx.send(true);
-    let _ = progress.await;
-    let worker = result?;
-    println!("worker: {}", worker.id);
-    println!(
-        "job: {}",
-        worker.job_id.clone().unwrap_or_else(|| "-".to_owned())
-    );
-    println!("thread: {}", worker.thread_id);
-    println!("task file: {}", worker.task_file);
-    println!("status: {}", worker.status);
-    Ok(())
+        "spawn",
+        format!("cargo run -- spawn --group {group} --task {task}"),
+        async move {
+            let existing_workers = controller
+                .list_workers()
+                .into_iter()
+                .map(|worker| worker.id)
+                .collect::<BTreeSet<_>>();
+            eprintln!("spawning worker [{group}] {task}");
+            let (stop_tx, stop_rx) = watch::channel(false);
+            let progress = tokio::spawn(monitor_spawn_progress(
+                controller.clone(),
+                existing_workers,
+                group.to_owned(),
+                task.to_owned(),
+                stop_rx,
+            ));
+            let result = if let Some(job_id) = job_id {
+                controller
+                    .spawn_worker_and_wait_for_job(group, task, Some(job_id))
+                    .await
+            } else {
+                controller.spawn_worker_and_wait(group, task).await
+            };
+            let _ = stop_tx.send(true);
+            let _ = progress.await;
+            let worker = result?;
+            println!("worker: {}", worker.id);
+            println!(
+                "job: {}",
+                worker.job_id.clone().unwrap_or_else(|| "-".to_owned())
+            );
+            println!("thread: {}", worker.thread_id);
+            println!("task file: {}", worker.task_file);
+            println!("status: {}", worker.status);
+            Ok(())
+        },
+    )
+    .await
 }
 
 async fn run_send(
@@ -334,20 +408,28 @@ async fn run_send(
 ) -> Result<()> {
     let controller = Controller::start(workspace_root).await?;
     controller.init_workspace()?;
-    let target = if to == "master" {
-        PromptTarget::Master
-    } else {
-        PromptTarget::Worker(to.to_owned())
-    };
-    if let Some(job_id) = job_id {
-        controller
-            .submit_prompt_and_wait_for_job(target, prompt, Some(job_id))
-            .await?;
-    } else {
-        controller.submit_prompt_and_wait(target, prompt).await?;
-    }
-    println!("submitted");
-    Ok(())
+    with_runtime_session(
+        controller.clone(),
+        "send",
+        format!("cargo run -- send --to {to}"),
+        async move {
+            let target = if to == "master" {
+                PromptTarget::Master
+            } else {
+                PromptTarget::Worker(to.to_owned())
+            };
+            if let Some(job_id) = job_id {
+                controller
+                    .submit_prompt_and_wait_for_job(target, prompt, Some(job_id))
+                    .await?;
+            } else {
+                controller.submit_prompt_and_wait(target, prompt).await?;
+            }
+            println!("submitted");
+            Ok(())
+        },
+    )
+    .await
 }
 
 async fn run_list(workspace_root: PathBuf) -> Result<()> {
@@ -414,64 +496,120 @@ async fn run_job(workspace_root: PathBuf, command: JobCommand) -> Result<()> {
             continue_for_secs,
             continue_max_iterations,
             context,
+            defer,
+            follow,
+            start_session,
+            start_group,
         } => {
             controller.init_workspace()?;
-            let objective = objective.unwrap_or_else(|| title.clone());
-            let job = controller.create_job(CreateJobRequest {
-                title,
-                objective,
-                source_channel: channel,
-                requester,
-                priority,
-                pattern,
-                approval_required,
-                auto_approve,
-                delegate_to_master_loop: delegate_master_loop,
-                continue_for_secs,
-                continue_max_iterations,
-                context,
-            })?;
-            println!("job: {}", job.id);
-            println!("status: {}", job.status);
-            println!("title: {}", job.title);
-            println!("objective: {}", job.objective);
-            println!("pattern: {}", job.policy.pattern);
-            println!(
-                "approval required: {}",
-                if job.policy.approval_required {
-                    "yes"
-                } else {
-                    "no"
-                }
-            );
-            println!(
-                "auto approve: {}",
-                if job.policy.auto_approve { "yes" } else { "no" }
-            );
-            println!(
-                "delegate master loop: {}",
-                if job.policy.delegate_to_master_loop {
-                    "yes"
-                } else {
-                    "no"
-                }
-            );
-            println!(
-                "continue budget secs: {}",
-                job.policy
-                    .continue_for_secs
-                    .map(|value| value.to_string())
-                    .unwrap_or_else(|| "-".to_owned())
-            );
-            println!(
-                "continue max iterations: {}",
-                job.policy
-                    .continue_max_iterations
-                    .map(|value| value.to_string())
-                    .unwrap_or_else(|| "-".to_owned())
-            );
-            println!("next step: use --job {} with `send` or `spawn`", job.id);
-            Ok(())
+            with_runtime_session(
+                controller.clone(),
+                "job_create",
+                format!("cargo run -- job create --title {}", title),
+                async move {
+                    let objective = objective.unwrap_or_else(|| title.clone());
+                    let job = controller.create_job(CreateJobRequest {
+                        title,
+                        objective,
+                        source_channel: channel,
+                        requester,
+                        priority,
+                        pattern,
+                        approval_required,
+                        auto_approve,
+                        delegate_to_master_loop: delegate_master_loop,
+                        continue_for_secs,
+                        continue_max_iterations,
+                        context,
+                    })?;
+                    let start_target = resolve_job_start_target(
+                        &controller,
+                        start_session.as_deref(),
+                        start_group.as_deref(),
+                    )?;
+
+                    println!("job: {}", job.id);
+                    println!("received: yes");
+                    println!("start target: {}", job_start_target_label(&start_target));
+                    println!("policy: {}", job_policy_summary(&job));
+                    if defer {
+                        println!("start now: no");
+                        println!("status: queued");
+                        if job.policy.delegate_to_master_loop {
+                            println!(
+                                "next step: run `cargo run -- serve` to intake and continue delegated jobs"
+                            );
+                        } else {
+                            println!("next step: use --job {} with `send` or `spawn`", job.id);
+                        }
+                        return Ok(());
+                    }
+
+                    let service_running = controller
+                        .service_snapshot()?
+                        .map(|snapshot| {
+                            matches!(
+                                snapshot.status,
+                                ServiceLifecycle::Running | ServiceLifecycle::Starting
+                            )
+                        })
+                        .unwrap_or(false);
+
+                    match start_target {
+                        JobStartTarget::Master => {
+                            println!("status: starting");
+                            let batch_id = start_job_on_existing_session(
+                                &controller,
+                                &job,
+                                PromptTarget::Master,
+                                follow,
+                            )
+                            .await?;
+                            let snapshot = controller
+                                .job_snapshot(&job.id)
+                                .with_context(|| format!("unknown job `{}` after intake", job.id))?;
+                            print_job_start_result(&snapshot, Some(batch_id), None, service_running);
+                        }
+                        JobStartTarget::ExistingSession(session_id) => {
+                            println!("status: starting");
+                            let batch_id = start_job_on_existing_session(
+                                &controller,
+                                &job,
+                                PromptTarget::Worker(session_id.clone()),
+                                follow,
+                            )
+                            .await?;
+                            let snapshot = controller
+                                .job_snapshot(&job.id)
+                                .with_context(|| format!("unknown job `{}` after dispatch", job.id))?;
+                            print_job_start_result(
+                                &snapshot,
+                                Some(batch_id),
+                                Some(session_id),
+                                service_running,
+                            );
+                        }
+                        JobStartTarget::NewWorkerGroup(group) => {
+                            println!("status: starting");
+                            let worker =
+                                start_job_in_new_worker_group(&controller, &job, &group, follow)
+                                    .await?;
+                            let snapshot = controller.job_snapshot(&job.id).with_context(|| {
+                                format!("unknown job `{}` after worker bootstrap", job.id)
+                            })?;
+                            print_job_start_result(
+                                &snapshot,
+                                worker.latest_batch_id,
+                                Some(worker.id),
+                                service_running,
+                            );
+                        }
+                    }
+
+                    Ok(())
+                },
+            )
+            .await
         }
         JobCommand::Inspect { job_id } => {
             let job = controller
@@ -481,6 +619,91 @@ async fn run_job(workspace_root: PathBuf, command: JobCommand) -> Result<()> {
             Ok(())
         }
     }
+}
+
+async fn run_automation(workspace_root: PathBuf, command: AutomationCommand) -> Result<()> {
+    let controller = Controller::start(workspace_root).await?;
+    controller.init_workspace()?;
+
+    match command {
+        AutomationCommand::Create {
+            to,
+            every_secs,
+            max_runs,
+            for_secs,
+            prompt,
+        } => {
+            let automation =
+                controller.create_session_automation(CreateSessionAutomationRequest {
+                    target_session_id: to,
+                    prompt,
+                    interval_secs: every_secs,
+                    max_runs,
+                    run_for_secs: for_secs,
+                })?;
+            println!("automation: {}", automation.id);
+            println!("target: {}", automation.target_session_id);
+            println!("interval secs: {}", automation.interval_secs);
+            println!(
+                "max runs: {}",
+                automation
+                    .max_runs
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "-".to_owned())
+            );
+            println!(
+                "run for secs: {}",
+                automation
+                    .run_for_secs
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "-".to_owned())
+            );
+            println!("status: {}", automation.status);
+            let scheduler_running = controller
+                .service_snapshot()?
+                .map(|snapshot| matches!(snapshot.status, ServiceLifecycle::Running))
+                .unwrap_or(false);
+            if scheduler_running {
+                println!("scheduler: running");
+            } else {
+                println!("scheduler: idle");
+                println!("next step: keep `cargo run -- up` open or run `cargo run -- serve`");
+            }
+        }
+        AutomationCommand::List => {
+            let automations = controller.list_session_automations();
+            if automations.is_empty() {
+                println!("no automations registered");
+            } else {
+                for automation in &automations {
+                    print_session_automation_snapshot(automation);
+                }
+            }
+        }
+        AutomationCommand::Pause { automation_id } => {
+            let automation = controller.pause_session_automation(&automation_id)?;
+            println!(
+                "paused: {} -> {}",
+                automation.id, automation.target_session_id
+            );
+        }
+        AutomationCommand::Resume { automation_id } => {
+            let automation = controller.resume_session_automation(&automation_id)?;
+            println!(
+                "resumed: {} -> {}",
+                automation.id, automation.target_session_id
+            );
+        }
+        AutomationCommand::Cancel { automation_id } => {
+            let automation = controller.cancel_session_automation(&automation_id)?;
+            println!(
+                "cancelled: {} -> {}",
+                automation.id, automation.target_session_id
+            );
+        }
+    }
+
+    Ok(())
 }
 
 async fn run_gateway(workspace_root: PathBuf, command: GatewayCommand) -> Result<()> {
@@ -586,10 +809,23 @@ async fn run_inspect(
     let controller = Controller::start(workspace_root).await?;
 
     if inspect_service {
-        let snapshot = controller
-            .service_snapshot()?
-            .context("service snapshot not found")?;
-        print_service_snapshot(&snapshot);
+        let service = controller.service_snapshot()?;
+        let runtime = controller.runtime_snapshot()?;
+        if service.is_none() && runtime.is_none() {
+            anyhow::bail!("service and runtime snapshots not found");
+        }
+        if let Some(snapshot) = service {
+            print_service_snapshot(&snapshot);
+        } else {
+            println!("scheduler snapshot: not found");
+        }
+        if let Some(snapshot) = runtime {
+            println!();
+            print_runtime_snapshot(&snapshot);
+        } else {
+            println!();
+            println!("runtime snapshot: not found");
+        }
         return Ok(());
     }
 
@@ -607,6 +843,26 @@ async fn run_inspect(
         .with_context(|| format!("unknown session `{session_id}`"))?;
     print_session_snapshot(&session, events, output);
     Ok(())
+}
+
+async fn with_runtime_session<T, Fut>(
+    controller: Controller,
+    mode: &str,
+    command_label: String,
+    future: Fut,
+) -> Result<T>
+where
+    Fut: Future<Output = Result<T>>,
+{
+    controller.begin_runtime_session(mode, command_label)?;
+    let result = future.await;
+    match &result {
+        Ok(_) => controller.finish_runtime_session(ServiceLifecycle::Stopped, None)?,
+        Err(error) => {
+            controller.finish_runtime_session(ServiceLifecycle::Failed, Some(error.to_string()))?
+        }
+    }
+    result
 }
 
 fn ok(value: bool) -> &'static str {
@@ -627,6 +883,199 @@ fn yes_no(value: bool) -> &'static str {
 
 fn parse_report_channel(value: &str) -> Result<ReportChannel> {
     value.parse::<ReportChannel>().map_err(anyhow::Error::msg)
+}
+
+fn resolve_job_start_target(
+    controller: &Controller,
+    start_session: Option<&str>,
+    start_group: Option<&str>,
+) -> Result<JobStartTarget> {
+    if let Some(group) = start_group.map(str::trim).filter(|value| !value.is_empty()) {
+        return Ok(JobStartTarget::NewWorkerGroup(group.to_owned()));
+    }
+
+    let Some(session_id) = start_session
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok(JobStartTarget::Master);
+    };
+
+    if session_id == "master" {
+        return Ok(JobStartTarget::Master);
+    }
+    if session_id == "onboard" {
+        anyhow::bail!("`onboard` is a virtual supervisor session and cannot execute a job turn");
+    }
+
+    let session = controller
+        .session_snapshot(session_id)
+        .with_context(|| format!("unknown session `{session_id}`"))?;
+    match session.kind {
+        SessionKind::Worker { .. } => Ok(JobStartTarget::ExistingSession(session_id.to_owned())),
+        SessionKind::Master => Ok(JobStartTarget::Master),
+        SessionKind::Onboard => {
+            anyhow::bail!("`onboard` is a virtual supervisor session and cannot execute a job turn")
+        }
+    }
+}
+
+fn job_start_target_label(target: &JobStartTarget) -> String {
+    match target {
+        JobStartTarget::Master => "master".to_owned(),
+        JobStartTarget::ExistingSession(session_id) => format!("session:{session_id}"),
+        JobStartTarget::NewWorkerGroup(group) => format!("new-worker:{group}"),
+    }
+}
+
+fn job_policy_summary(job: &JobRecord) -> String {
+    let mut fields = Vec::new();
+    if job.policy.delegate_to_master_loop {
+        fields.push("delegate-master-loop".to_owned());
+    }
+    if job.policy.auto_approve {
+        fields.push("auto-approve".to_owned());
+    }
+    if let Some(value) = job.policy.continue_for_secs {
+        fields.push(format!("continue-for-secs={value}"));
+    }
+    if let Some(value) = job.policy.continue_max_iterations {
+        fields.push(format!("continue-max-iterations={value}"));
+    }
+    if fields.is_empty() {
+        "manual".to_owned()
+    } else {
+        fields.join(", ")
+    }
+}
+
+fn job_execution_prompt(job: &JobRecord, target: &PromptTarget) -> String {
+    match target {
+        PromptTarget::Master => job_intake_prompt(job),
+        PromptTarget::Worker(worker_id) => {
+            let context = job.context.clone().unwrap_or_else(|| "none".to_owned());
+            format!(
+                "Job execution request for an existing CodeClaw session.\n\nJob id: {}\nWorker session: {}\nTitle: {}\nObjective: {}\nPriority: {}\nApproval required: {}\nContext: {}\n\nExecute the job from this session if it fits your current role and workspace. Keep the summary concise, report blockers clearly, and hand work back when a different session should continue.",
+                job.id,
+                worker_id,
+                job.title,
+                job.objective,
+                job.priority,
+                if job.policy.approval_required { "yes" } else { "no" },
+                context
+            )
+        }
+    }
+}
+
+async fn start_job_on_existing_session(
+    controller: &Controller,
+    job: &JobRecord,
+    target: PromptTarget,
+    follow: bool,
+) -> Result<u64> {
+    let existing_log_lines = if follow {
+        controller
+            .sessions_snapshot()
+            .into_iter()
+            .map(|session| (session.id, session.log_lines.len()))
+            .collect::<BTreeMap<_, _>>()
+    } else {
+        BTreeMap::new()
+    };
+    let prompt = job_execution_prompt(job, &target);
+    let batch_id = controller
+        .submit_prompt_for_job_with_batch(target, &prompt, Some(&job.id))
+        .await?;
+    if follow {
+        let (stop_tx, stop_rx) = watch::channel(false);
+        let progress = tokio::spawn(monitor_job_progress(
+            controller.clone(),
+            job.id.clone(),
+            batch_id,
+            existing_log_lines,
+            stop_rx,
+        ));
+        let result = controller.wait_for_batch_completion(batch_id).await;
+        let _ = stop_tx.send(true);
+        let _ = progress.await;
+        result?;
+    } else {
+        controller.wait_for_batch_completion(batch_id).await?;
+    }
+    Ok(batch_id)
+}
+
+async fn start_job_in_new_worker_group(
+    controller: &Controller,
+    job: &JobRecord,
+    group: &str,
+    follow: bool,
+) -> Result<SessionSnapshot> {
+    let existing_workers = if follow {
+        controller
+            .list_workers()
+            .into_iter()
+            .map(|worker| worker.id)
+            .collect::<BTreeSet<_>>()
+    } else {
+        BTreeSet::new()
+    };
+    let monitor = if follow {
+        let (stop_tx, stop_rx) = watch::channel(false);
+        let progress = tokio::spawn(monitor_spawn_progress(
+            controller.clone(),
+            existing_workers,
+            group.to_owned(),
+            job.title.clone(),
+            stop_rx,
+        ));
+        Some((stop_tx, progress))
+    } else {
+        None
+    };
+    let (_, worker) = controller
+        .spawn_worker_and_wait_for_job_with_batch(group, &job.title, Some(&job.id))
+        .await?;
+    if let Some((stop_tx, progress)) = monitor {
+        let _ = stop_tx.send(true);
+        let _ = progress.await;
+    }
+    controller
+        .session_snapshot(&worker.id)
+        .with_context(|| format!("missing worker session `{}` after bootstrap", worker.id))
+}
+
+fn print_job_start_result(
+    snapshot: &JobSnapshot,
+    batch_id: Option<u64>,
+    session_id: Option<String>,
+    service_running: bool,
+) {
+    println!("start now: yes");
+    if let Some(batch_id) = batch_id {
+        println!("batch: b{batch_id:03}");
+    }
+    if let Some(session_id) = session_id {
+        println!("session: {session_id}");
+    }
+    println!("status: {}", snapshot.status);
+    if let Some(summary) = snapshot
+        .latest_summary
+        .as_deref()
+        .filter(|value| !value.is_empty())
+    {
+        println!("summary: {summary}");
+    }
+    if snapshot.delegate_to_master_loop {
+        if service_running {
+            println!("automation: delegated loop armed; service running");
+        } else {
+            println!(
+                "automation: delegated loop armed; run `cargo run -- serve` to keep it continuing"
+            );
+        }
+    }
 }
 
 async fn monitor_spawn_progress(
@@ -665,43 +1114,116 @@ async fn monitor_spawn_progress(
             {
                 worker_id = Some(worker.id.clone());
                 printed_log_lines = 0;
-                eprintln!("\nworker created: {}", worker.id);
-                eprintln!("task file: {}", worker.task_file);
+                progress_log_line(interactive, &format!("\nworker created: {}", worker.id));
+                progress_log_line(interactive, &format!("task file: {}", worker.task_file));
             }
         }
 
-        let status_line = if let Some(worker_id) = worker_id.as_deref() {
+        let status_body = if let Some(worker_id) = worker_id.as_deref() {
             if let Some(session) = controller.session_snapshot(worker_id) {
                 if session.log_lines.len() > printed_log_lines {
                     clear_progress_line(interactive, &mut last_status_len);
                     for line in session.log_lines.iter().skip(printed_log_lines) {
-                        eprintln!("  {line}");
+                        progress_log_line(interactive, &format!("  {line}"));
                     }
                     printed_log_lines = session.log_lines.len();
                 }
 
                 let detail = cli_status_detail(&session);
-                format!(
-                    "{} {} [{}] {}",
-                    cli_spinner_frame(tick),
-                    worker_id,
-                    session.status,
-                    detail
-                )
+                format!("{} [{}] {}", worker_id, session.status, detail)
             } else {
-                format!(
-                    "{} {} [waiting] refreshing session state",
-                    cli_spinner_frame(tick),
-                    worker_id
-                )
+                format!("{} [waiting] refreshing session state", worker_id)
             }
         } else {
+            format!("creating worker record for [{}] {}", group, task)
+        };
+        let status_line = if interactive {
+            format!("{} {status_body}", cli_spinner_frame(tick))
+        } else {
+            status_body
+        };
+
+        if status_line != last_status_line {
+            render_progress_line(&status_line, interactive, &mut last_status_len);
+            last_status_line = status_line;
+        }
+        tick = tick.wrapping_add(1);
+
+        tokio::select! {
+            _ = tokio::time::sleep(Duration::from_millis(120)) => {}
+            changed = stop_rx.changed() => {
+                if changed.is_err() || *stop_rx.borrow() {
+                    break;
+                }
+            }
+        }
+    }
+
+    clear_progress_line(interactive, &mut last_status_len);
+}
+
+async fn monitor_job_progress(
+    controller: Controller,
+    job_id: String,
+    batch_id: u64,
+    mut printed_log_lines: BTreeMap<String, usize>,
+    mut stop_rx: watch::Receiver<bool>,
+) {
+    let interactive = io::stderr().is_terminal();
+    let mut tick = 0usize;
+    let mut last_status_line = String::new();
+    let mut last_status_len = 0usize;
+
+    loop {
+        if *stop_rx.borrow() {
+            break;
+        }
+
+        let batch = controller.batch_snapshot(batch_id);
+        let job = controller.job_snapshot(&job_id);
+
+        if let Some(batch) = &batch {
+            for session in &batch.sessions {
+                if let Some(snapshot) = controller.session_snapshot(&session.id) {
+                    let printed = printed_log_lines
+                        .entry(session.id.clone())
+                        .or_insert(0usize);
+                    if snapshot.log_lines.len() > *printed {
+                        clear_progress_line(interactive, &mut last_status_len);
+                        for line in snapshot.log_lines.iter().skip(*printed) {
+                            progress_log_line(interactive, &format!("  [{}] {line}", snapshot.id));
+                        }
+                        *printed = snapshot.log_lines.len();
+                    }
+                }
+            }
+        }
+
+        let status_body = if let Some(batch) = &batch {
+            let job_status = job
+                .as_ref()
+                .map(|snapshot| snapshot.status.clone())
+                .unwrap_or_else(|| batch.status.clone());
+            let detail = job
+                .as_ref()
+                .and_then(|snapshot| snapshot.latest_summary.clone())
+                .or_else(|| batch.last_event.clone())
+                .unwrap_or_else(|| "waiting for Codex planning".to_owned());
             format!(
-                "{} creating worker record for [{}] {}",
-                cli_spinner_frame(tick),
-                group,
-                task
+                "{} [job={} batch=b{:03} sessions={}] {}",
+                job_id,
+                job_status,
+                batch_id,
+                batch.sessions.len(),
+                truncate_cli(&detail, 72)
             )
+        } else {
+            format!("{} [starting] creating initial master batch", job_id)
+        };
+        let status_line = if interactive {
+            format!("{} {status_body}", cli_spinner_frame(tick))
+        } else {
+            status_body
         };
 
         if status_line != last_status_line {
@@ -742,7 +1264,7 @@ fn cli_status_detail(session: &SessionSnapshot) -> String {
 
 fn render_progress_line(line: &str, interactive: bool, last_status_len: &mut usize) {
     if !interactive {
-        eprintln!("{line}");
+        println!("{line}");
         return;
     }
     let mut stderr = io::stderr();
@@ -767,6 +1289,14 @@ fn clear_progress_line(interactive: bool, last_status_len: &mut usize) {
     let _ = write!(stderr, "\r{}\r", " ".repeat(*last_status_len));
     let _ = stderr.flush();
     *last_status_len = 0;
+}
+
+fn progress_log_line(interactive: bool, line: &str) {
+    if interactive {
+        eprintln!("{line}");
+    } else {
+        println!("{line}");
+    }
 }
 
 fn truncate_cli(text: &str, max_len: usize) -> String {
@@ -1096,6 +1626,52 @@ fn print_job_snapshot(job: &JobSnapshot) {
     }
 }
 
+fn print_session_automation_snapshot(automation: &SessionAutomationSnapshot) {
+    println!(
+        "{} [{}] -> {} | every={}s runs={} next={} last={} batch={}",
+        automation.id,
+        automation.status,
+        automation.target_session_id,
+        automation.interval_secs,
+        automation.run_count,
+        automation
+            .next_run_at
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "-".to_owned()),
+        automation
+            .last_run_at
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "-".to_owned()),
+        automation
+            .last_batch_id
+            .map(|value| format!("b{value}"))
+            .unwrap_or_else(|| "-".to_owned())
+    );
+    println!("  prompt: {}", automation.prompt_preview);
+    println!(
+        "  remaining runs: {} | remaining secs: {} | max runs: {} | window secs: {}",
+        automation
+            .remaining_runs
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "-".to_owned()),
+        automation
+            .remaining_secs
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "-".to_owned()),
+        automation
+            .max_runs
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "-".to_owned()),
+        automation
+            .run_for_secs
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "-".to_owned())
+    );
+    if let Some(error) = &automation.last_error {
+        println!("  last error: {}", error);
+    }
+}
+
 fn print_service_tick(snapshot: &ServiceSnapshot) {
     println!(
         "tick={} status={} pending={} running={} blocked={} completed={} failed={} workers={} dispatched={} continued={} reports={} queued_deliveries={} delivered={} auto_approve={} delegated={} exhausted={}",
@@ -1173,6 +1749,46 @@ fn print_service_snapshot(snapshot: &ServiceSnapshot) {
         "last delivered notifications",
         &snapshot.delivered_notifications,
     );
+}
+
+fn print_runtime_snapshot(snapshot: &RuntimeSnapshot) {
+    println!("runtime status: {}", snapshot.status);
+    println!("mode: {}", snapshot.mode);
+    println!("pid: {}", snapshot.pid);
+    println!(
+        "app-server pid: {}",
+        snapshot
+            .app_server_pid
+            .map(|pid| pid.to_string())
+            .unwrap_or_else(|| "-".to_owned())
+    );
+    println!(
+        "app-server connected: {}",
+        yes_no(snapshot.app_server_connected)
+    );
+    println!("started: {}", snapshot.started_at);
+    println!("updated: {}", snapshot.updated_at);
+    println!("command: {}", snapshot.command_label);
+    println!(
+        "master thread: {}",
+        snapshot
+            .master_thread_id
+            .clone()
+            .unwrap_or_else(|| "-".to_owned())
+    );
+    println!("active turns: {}", snapshot.active_turns);
+    println!("queued turns: {}", snapshot.queued_turns);
+    println!(
+        "last error: {}",
+        snapshot
+            .last_error
+            .clone()
+            .unwrap_or_else(|| "-".to_owned())
+    );
+
+    print_named_ids("active sessions", &snapshot.active_sessions);
+    print_named_ids("queued sessions", &snapshot.queued_sessions);
+    print_named_ids("running workers", &snapshot.running_workers);
 }
 
 fn print_named_ids(label: &str, ids: &[String]) {

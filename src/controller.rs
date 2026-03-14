@@ -5,15 +5,16 @@ use crate::{
     orchestration::{
         parse_master_response, visible_stream_text, MasterAction, ParsedMasterResponse,
     },
-    service::{ServiceLifecycle, ServiceSnapshot},
+    service::{RuntimeSnapshot, ServiceLifecycle, ServiceSnapshot},
     session::{
-        SessionEvent, SessionEventKind, SessionSnapshot, SessionView, MAX_LOG_LINES,
-        MAX_TIMELINE_EVENTS,
+        SessionEvent, SessionEventKind, SessionOverviewSnapshot, SessionSnapshot, SessionView,
+        MAX_LOG_LINES, MAX_TIMELINE_EVENTS,
     },
     state::{
         now_unix_ts, AppState, BatchStatus, JobPolicy, JobRecord, JobReportKind, JobReportRecord,
         JobStatus, OrchestrationBatchRecord, ReportChannel, ReportDeliveryRecord,
-        ReportDeliveryStatus, ReportSubscriptionRecord, SessionStatus, WorkerRecord, WorkerStatus,
+        ReportDeliveryStatus, ReportSubscriptionRecord, SessionAutomationRecord,
+        SessionAutomationStatus, SessionStatus, WorkerRecord, WorkerStatus,
     },
 };
 use anyhow::{anyhow, Context, Result};
@@ -24,7 +25,7 @@ use std::{
     fs,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
-    time::Duration,
+    time::{Duration, SystemTime},
 };
 use tokio::sync::{broadcast, oneshot};
 
@@ -35,16 +36,31 @@ const DEFAULT_AUTOMATION_CONTINUE_INTERVAL_SECS: u64 = 300;
 const MAX_JOB_REPORTS_PER_JOB: usize = 32;
 const MAX_JOB_DELIVERIES_PER_JOB: usize = 64;
 
+#[derive(Debug, Clone)]
+struct RuntimeContext {
+    mode: String,
+    command_label: String,
+    started_at: u64,
+}
+
 #[derive(Clone)]
 pub struct Controller {
     workspace_root: PathBuf,
     pub config: Config,
     pub paths: CoordinationPaths,
     state: Arc<Mutex<AppState>>,
+    state_file_fingerprint: Arc<Mutex<Option<FileFingerprint>>>,
     sessions: Arc<Mutex<BTreeMap<String, SessionView>>>,
     pending_turns: Arc<Mutex<BTreeMap<String, VecDeque<QueuedTurn>>>>,
     active_turn_batches: Arc<Mutex<BTreeMap<String, u64>>>,
+    runtime_context: Arc<Mutex<Option<RuntimeContext>>>,
     client: Arc<AppServerClient>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FileFingerprint {
+    len: u64,
+    modified: Option<SystemTime>,
 }
 
 #[derive(Debug, Clone)]
@@ -98,6 +114,15 @@ pub struct CreateJobRequest {
     pub continue_for_secs: Option<u64>,
     pub continue_max_iterations: Option<u32>,
     pub context: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct CreateSessionAutomationRequest {
+    pub target_session_id: String,
+    pub prompt: String,
+    pub interval_secs: u64,
+    pub max_runs: Option<u32>,
+    pub run_for_secs: Option<u64>,
 }
 
 #[derive(Debug, Clone)]
@@ -195,6 +220,7 @@ pub struct OnboardLaneItem {
     pub job_id: String,
     pub title: String,
     pub status: String,
+    pub operator_state: String,
     pub summary: String,
     pub workers: usize,
     pub automation: JobAutomationSnapshot,
@@ -206,17 +232,79 @@ pub struct OnboardSnapshot {
     pub summary: String,
     pub service_status: Option<String>,
     pub service_tick: Option<u64>,
+    pub runtime_connected: bool,
+    pub runtime_pid: Option<u32>,
+    pub runtime_mode: Option<String>,
+    pub runtime_command_label: Option<String>,
+    pub active_turns: usize,
+    pub queued_turns: usize,
     pub running_workers: usize,
     pub queued_deliveries: usize,
     pub delegated_jobs: usize,
     pub auto_approve_jobs: usize,
     pub budget_exhausted_jobs: usize,
     pub continued_jobs: Vec<String>,
+    pub armed_automations: usize,
+    pub paused_automations: usize,
+    pub due_automations: usize,
+    pub automations: Vec<SessionAutomationSnapshot>,
     pub pending: Vec<OnboardLaneItem>,
     pub running: Vec<OnboardLaneItem>,
     pub blocked: Vec<OnboardLaneItem>,
     pub completed: Vec<OnboardLaneItem>,
     pub failed: Vec<OnboardLaneItem>,
+}
+
+#[derive(Debug, Clone)]
+pub struct SessionAutomationSnapshot {
+    pub id: String,
+    pub target_session_id: String,
+    pub status: String,
+    pub prompt_preview: String,
+    pub interval_secs: u64,
+    pub run_count: u32,
+    pub max_runs: Option<u32>,
+    pub run_for_secs: Option<u64>,
+    pub remaining_runs: Option<u32>,
+    pub remaining_secs: Option<u64>,
+    pub next_run_at: Option<u64>,
+    pub last_run_at: Option<u64>,
+    pub last_batch_id: Option<u64>,
+    pub last_error: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct MonitorSessionSnapshot {
+    pub id: String,
+    pub title: String,
+    pub role: String,
+    pub group: Option<String>,
+    pub task: Option<String>,
+    pub job_id: Option<String>,
+    pub status: String,
+    pub work_state: String,
+    pub pending_turns: usize,
+    pub latest_batch_id: Option<u64>,
+    pub latest_user_prompt: Option<String>,
+    pub latest_response: Option<String>,
+    pub summary: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct MonitorSnapshot {
+    pub runtime_connected: bool,
+    pub runtime_pid: Option<u32>,
+    pub runtime_mode: Option<String>,
+    pub runtime_command_label: Option<String>,
+    pub total_codex_sessions: usize,
+    pub active_codex_sessions: usize,
+    pub queued_codex_sessions: usize,
+    pub blocked_codex_sessions: usize,
+    pub sessions: Vec<MonitorSessionSnapshot>,
+}
+
+pub fn job_intake_prompt(job: &JobRecord) -> String {
+    service_job_intake_prompt(job)
 }
 
 #[derive(Debug, Deserialize)]
@@ -429,6 +517,7 @@ impl Controller {
         let config = Config::load(&workspace_root)?;
         let paths = config.coordination_paths(&workspace_root);
         let state = AppState::load(&paths.state_file)?;
+        let state_file_fingerprint = file_fingerprint(&paths.state_file);
         let sessions = build_sessions(&state, &workspace_root);
         let client = Arc::new(
             AppServerClient::spawn(
@@ -447,9 +536,11 @@ impl Controller {
             config,
             paths,
             state: Arc::new(Mutex::new(state)),
+            state_file_fingerprint: Arc::new(Mutex::new(state_file_fingerprint)),
             sessions: Arc::new(Mutex::new(sessions)),
             pending_turns: Arc::new(Mutex::new(BTreeMap::new())),
             active_turn_batches: Arc::new(Mutex::new(BTreeMap::new())),
+            runtime_context: Arc::new(Mutex::new(None)),
             client,
         })
     }
@@ -508,7 +599,26 @@ impl Controller {
         self.config.groups.clone()
     }
 
+    pub fn sessions_overview_snapshot(&self) -> Vec<SessionOverviewSnapshot> {
+        self.try_sync_state_from_disk();
+        let sessions = self.sessions.lock().expect("sessions lock poisoned");
+        let mut snapshots = sessions
+            .values()
+            .map(SessionView::overview)
+            .collect::<Vec<_>>();
+        drop(sessions);
+        snapshots = self.annotate_session_overviews(snapshots);
+        snapshots.push(self.onboard_session_overview());
+        snapshots.sort_by(|left, right| {
+            session_sort_key(&left.id)
+                .cmp(&session_sort_key(&right.id))
+                .then_with(|| left.title.cmp(&right.title))
+        });
+        snapshots
+    }
+
     pub fn sessions_snapshot(&self) -> Vec<SessionSnapshot> {
+        self.try_sync_state_from_disk();
         let sessions = self.sessions.lock().expect("sessions lock poisoned");
         let mut snapshots = sessions
             .values()
@@ -526,6 +636,7 @@ impl Controller {
     }
 
     pub fn session_snapshot(&self, session_id: &str) -> Option<SessionSnapshot> {
+        self.try_sync_state_from_disk();
         if session_id == ONBOARD_SESSION_ID {
             return Some(self.onboard_session_snapshot());
         }
@@ -535,9 +646,151 @@ impl Controller {
         Some(self.annotate_session_snapshot(snapshot))
     }
 
+    pub fn monitor_snapshot(&self) -> MonitorSnapshot {
+        self.try_sync_state_from_disk();
+        let onboard = self.onboard_snapshot();
+        let active_sessions = self
+            .active_turn_batches
+            .lock()
+            .expect("active turn lock poisoned")
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
+        let queued_turns = self
+            .pending_turns
+            .lock()
+            .expect("pending lock poisoned")
+            .iter()
+            .map(|(session_id, queue)| (session_id.clone(), queue.len()))
+            .collect::<BTreeMap<_, _>>();
+
+        let sessions = self
+            .sessions_snapshot()
+            .into_iter()
+            .filter(|session| session.id != ONBOARD_SESSION_ID)
+            .map(|session| {
+                let session_id = session.id.clone();
+                build_monitor_session_snapshot(
+                    session,
+                    active_sessions.iter().any(|active| active == &session_id),
+                    queued_turns.get(&session_id).copied().unwrap_or(0),
+                )
+            })
+            .collect::<Vec<_>>();
+
+        MonitorSnapshot {
+            runtime_connected: onboard.runtime_connected,
+            runtime_pid: onboard.runtime_pid,
+            runtime_mode: onboard.runtime_mode,
+            runtime_command_label: onboard.runtime_command_label,
+            total_codex_sessions: sessions.len(),
+            active_codex_sessions: sessions
+                .iter()
+                .filter(|session| matches!(session.work_state.as_str(), "active" | "active+queued"))
+                .count(),
+            queued_codex_sessions: sessions
+                .iter()
+                .filter(|session| matches!(session.work_state.as_str(), "queued" | "active+queued"))
+                .count(),
+            blocked_codex_sessions: sessions
+                .iter()
+                .filter(|session| matches!(session.status.as_str(), "blocked" | "failed"))
+                .count(),
+            sessions,
+        }
+    }
+
+    pub fn monitor_session_snapshot(&self, session_id: &str) -> Option<MonitorSessionSnapshot> {
+        if session_id == ONBOARD_SESSION_ID {
+            return None;
+        }
+
+        self.monitor_snapshot()
+            .sessions
+            .into_iter()
+            .find(|session| session.id == session_id)
+    }
+
+    pub fn session_batch_ids(&self, session_id: &str) -> Vec<u64> {
+        self.try_sync_state_from_disk();
+        if session_id == ONBOARD_SESSION_ID {
+            return Vec::new();
+        }
+        let state = self.state.lock().expect("state lock poisoned");
+        let mut batch_ids = state
+            .batches
+            .values()
+            .filter(|batch| {
+                batch.root_session_id == session_id
+                    || batch
+                        .sessions
+                        .iter()
+                        .any(|candidate| candidate == session_id)
+            })
+            .map(|batch| batch.id)
+            .collect::<Vec<_>>();
+        batch_ids.sort_unstable();
+        batch_ids.dedup();
+        batch_ids
+    }
+
     pub fn onboard_snapshot(&self) -> OnboardSnapshot {
+        self.try_sync_state_from_disk();
         let now = now_unix_ts();
         let service = self.service_snapshot().ok().flatten();
+        let persisted_runtime = self.runtime_snapshot().ok().flatten();
+        let active_runtime = {
+            let runtime = self.runtime_context.lock().expect("runtime lock poisoned");
+            runtime.clone()
+        };
+        let (
+            runtime_connected,
+            runtime_pid,
+            runtime_mode,
+            runtime_command_label,
+            active_turns,
+            queued_turns,
+            runtime_running_workers,
+        ) = if let Some(context) = active_runtime {
+            let runtime = self.client.runtime_snapshot();
+            let active_turns = self
+                .active_turn_batches
+                .lock()
+                .expect("active turn lock poisoned")
+                .len();
+            let queued_turns = self
+                .pending_turns
+                .lock()
+                .expect("pending lock poisoned")
+                .values()
+                .map(VecDeque::len)
+                .sum();
+            (
+                runtime.connected,
+                runtime.pid,
+                Some(context.mode),
+                Some(context.command_label),
+                active_turns,
+                queued_turns,
+                None,
+            )
+        } else if let Some(snapshot) = persisted_runtime {
+            (
+                snapshot.app_server_connected
+                    && matches!(
+                        snapshot.status,
+                        ServiceLifecycle::Starting | ServiceLifecycle::Running
+                    ),
+                snapshot.app_server_pid,
+                Some(snapshot.mode),
+                Some(snapshot.command_label),
+                snapshot.active_turns,
+                snapshot.queued_turns,
+                Some(snapshot.running_workers.len()),
+            )
+        } else {
+            (false, None, None, None, 0, 0, None)
+        };
         let state = self.state.lock().expect("state lock poisoned");
 
         let mut pending = Vec::new();
@@ -548,6 +801,33 @@ impl Controller {
         let mut delegated_jobs = 0usize;
         let mut auto_approve_jobs = 0usize;
         let mut budget_exhausted_jobs = 0usize;
+        let mut automations = state
+            .session_automations
+            .values()
+            .map(|automation| session_automation_snapshot(automation, now))
+            .collect::<Vec<_>>();
+        automations.sort_by(|left, right| {
+            session_automation_sort_key(left)
+                .cmp(&session_automation_sort_key(right))
+                .then_with(|| left.id.cmp(&right.id))
+        });
+        let armed_automations = automations
+            .iter()
+            .filter(|automation| automation.status == "armed")
+            .count();
+        let paused_automations = automations
+            .iter()
+            .filter(|automation| automation.status == "paused")
+            .count();
+        let due_automations = automations
+            .iter()
+            .filter(|automation| automation.status == "armed")
+            .filter(|automation| {
+                automation
+                    .next_run_at
+                    .is_some_and(|next_run_at| next_run_at <= now)
+            })
+            .count();
 
         for job in state.jobs.values() {
             let automation = job_automation_snapshot(job, now);
@@ -568,6 +848,7 @@ impl Controller {
                 job_id: job.id.clone(),
                 title: job.title.clone(),
                 status: job.status.to_string(),
+                operator_state: operator_state_for_job(job, &automation),
                 summary: job
                     .latest_summary
                     .clone()
@@ -621,9 +902,16 @@ impl Controller {
             summary,
             service_status: service.as_ref().map(|snapshot| snapshot.status.to_string()),
             service_tick: service.as_ref().map(|snapshot| snapshot.tick),
+            runtime_connected,
+            runtime_pid,
+            runtime_mode,
+            runtime_command_label,
+            active_turns,
+            queued_turns,
             running_workers: service
                 .as_ref()
                 .map(|snapshot| snapshot.running_workers.len())
+                .or(runtime_running_workers)
                 .unwrap_or_else(|| {
                     state
                         .workers
@@ -654,6 +942,10 @@ impl Controller {
             continued_jobs: service
                 .map(|snapshot| snapshot.continued_jobs)
                 .unwrap_or_default(),
+            armed_automations,
+            paused_automations,
+            due_automations,
+            automations,
             pending,
             running,
             blocked,
@@ -680,6 +972,61 @@ impl Controller {
             onboard.continued_jobs.len()
         )));
         session.snapshot()
+    }
+
+    fn onboard_session_overview(&self) -> SessionOverviewSnapshot {
+        let onboard = self.onboard_snapshot();
+        let mut session = SessionView::onboard(
+            self.workspace_root.display().to_string(),
+            Some(onboard.summary.clone()),
+            Some(format!(
+                "delegated={} auto={} exhausted={}",
+                onboard.delegated_jobs, onboard.auto_approve_jobs, onboard.budget_exhausted_jobs
+            )),
+        );
+        session.set_status(onboard.status.clone());
+        session.set_lifecycle_note(Some(format!(
+            "workers={} | queued deliveries={} | continued this tick={}",
+            onboard.running_workers,
+            onboard.queued_deliveries,
+            onboard.continued_jobs.len()
+        )));
+        session.overview()
+    }
+
+    fn annotate_session_overviews(
+        &self,
+        snapshots: Vec<SessionOverviewSnapshot>,
+    ) -> Vec<SessionOverviewSnapshot> {
+        snapshots
+            .into_iter()
+            .map(|snapshot| self.annotate_session_overview(snapshot))
+            .collect()
+    }
+
+    fn annotate_session_overview(
+        &self,
+        mut snapshot: SessionOverviewSnapshot,
+    ) -> SessionOverviewSnapshot {
+        let Some(job_id) = snapshot.job_id.as_deref() else {
+            return snapshot;
+        };
+        let state = self.state.lock().expect("state lock poisoned");
+        let Some(job) = state.jobs.get(job_id) else {
+            return snapshot;
+        };
+        let automation = job_automation_snapshot(job, now_unix_ts());
+        let mut badges = Vec::new();
+        if job.policy.delegate_to_master_loop {
+            badges.push(format!("loop:{}", automation.state));
+        }
+        if job.policy.auto_approve {
+            badges.push("auto-approve".to_owned());
+        }
+        if !badges.is_empty() {
+            snapshot.subtitle = format!("{} | {}", badges.join(" | "), snapshot.subtitle);
+        }
+        snapshot
     }
 
     fn annotate_session_snapshots(&self, snapshots: Vec<SessionSnapshot>) -> Vec<SessionSnapshot> {
@@ -716,11 +1063,13 @@ impl Controller {
     }
 
     pub fn list_workers(&self) -> Vec<WorkerRecord> {
+        self.try_sync_state_from_disk();
         let state = self.state.lock().expect("state lock poisoned");
         state.workers.values().cloned().collect()
     }
 
     pub fn list_jobs(&self) -> Vec<JobRecord> {
+        self.try_sync_state_from_disk();
         let state = self.state.lock().expect("state lock poisoned");
         let mut jobs = state.jobs.values().cloned().collect::<Vec<_>>();
         jobs.sort_by(|left, right| {
@@ -732,6 +1081,7 @@ impl Controller {
     }
 
     pub fn job_snapshot(&self, job_id: &str) -> Option<JobSnapshot> {
+        self.try_sync_state_from_disk();
         let state = self.state.lock().expect("state lock poisoned");
         let job = state.jobs.get(job_id).cloned()?;
         let automation = job_automation_snapshot(&job, now_unix_ts());
@@ -843,6 +1193,174 @@ impl Controller {
             subscriptions,
             deliveries,
         })
+    }
+
+    pub fn list_session_automations(&self) -> Vec<SessionAutomationSnapshot> {
+        self.try_sync_state_from_disk();
+        let now = now_unix_ts();
+        let state = self.state.lock().expect("state lock poisoned");
+        let mut automations = state
+            .session_automations
+            .values()
+            .map(|automation| session_automation_snapshot(automation, now))
+            .collect::<Vec<_>>();
+        automations.sort_by(|left, right| {
+            session_automation_sort_key(left)
+                .cmp(&session_automation_sort_key(right))
+                .then_with(|| left.id.cmp(&right.id))
+        });
+        automations
+    }
+
+    pub fn session_automation_snapshot(
+        &self,
+        automation_id: &str,
+    ) -> Option<SessionAutomationSnapshot> {
+        self.try_sync_state_from_disk();
+        let now = now_unix_ts();
+        let state = self.state.lock().expect("state lock poisoned");
+        state
+            .session_automations
+            .get(automation_id)
+            .map(|automation| session_automation_snapshot(automation, now))
+    }
+
+    pub fn create_session_automation(
+        &self,
+        request: CreateSessionAutomationRequest,
+    ) -> Result<SessionAutomationRecord> {
+        let target_session_id = request.target_session_id.trim();
+        if target_session_id.is_empty() {
+            anyhow::bail!("automation target must not be empty");
+        }
+        if target_session_id == ONBOARD_SESSION_ID {
+            anyhow::bail!("`onboard` is a virtual supervisor session and cannot be automated");
+        }
+
+        let prompt = request.prompt.trim();
+        if prompt.is_empty() {
+            anyhow::bail!("automation prompt must not be empty");
+        }
+        if request.interval_secs == 0 {
+            anyhow::bail!("automation interval must be at least 1 second");
+        }
+        if request.max_runs == Some(0) {
+            anyhow::bail!("automation max runs must be greater than zero");
+        }
+        if request.run_for_secs == Some(0) {
+            anyhow::bail!("automation run-for-secs must be greater than zero");
+        }
+
+        self.ensure_session_automation_target(target_session_id)?;
+
+        let now = now_unix_ts();
+        let automation = {
+            let mut state = self.state.lock().expect("state lock poisoned");
+            let automation_number = state.next_session_automation_number;
+            state.next_session_automation_number += 1;
+            let automation = SessionAutomationRecord {
+                id: format!("AUTO-{automation_number:03}"),
+                target_session_id: target_session_id.to_owned(),
+                prompt: prompt.to_owned(),
+                interval_secs: request.interval_secs,
+                max_runs: request.max_runs,
+                run_for_secs: request.run_for_secs,
+                status: SessionAutomationStatus::Armed,
+                created_at: now,
+                updated_at: now,
+                started_at: Some(now),
+                next_run_at: Some(now),
+                last_run_at: None,
+                run_count: 0,
+                last_error: None,
+                last_batch_id: None,
+            };
+            state
+                .session_automations
+                .insert(automation.id.clone(), automation.clone());
+            automation
+        };
+        self.save_state()?;
+        Ok(automation)
+    }
+
+    pub fn pause_session_automation(&self, automation_id: &str) -> Result<SessionAutomationRecord> {
+        self.update_session_automation_status(automation_id, SessionAutomationStatus::Paused)
+    }
+
+    pub fn resume_session_automation(
+        &self,
+        automation_id: &str,
+    ) -> Result<SessionAutomationRecord> {
+        let target_session_id = {
+            let state = self.state.lock().expect("state lock poisoned");
+            state
+                .session_automations
+                .get(automation_id)
+                .with_context(|| format!("unknown automation `{automation_id}`"))?
+                .target_session_id
+                .clone()
+        };
+        self.ensure_session_automation_target(&target_session_id)?;
+        let automation = {
+            let now = now_unix_ts();
+            let mut state = self.state.lock().expect("state lock poisoned");
+            let automation = state
+                .session_automations
+                .get_mut(automation_id)
+                .with_context(|| format!("unknown automation `{automation_id}`"))?;
+            automation.status = SessionAutomationStatus::Armed;
+            automation.updated_at = now;
+            automation.next_run_at = Some(now);
+            automation.last_error = None;
+            automation.clone()
+        };
+        self.save_state()?;
+        Ok(automation)
+    }
+
+    pub fn cancel_session_automation(
+        &self,
+        automation_id: &str,
+    ) -> Result<SessionAutomationRecord> {
+        self.update_session_automation_status(automation_id, SessionAutomationStatus::Cancelled)
+    }
+
+    fn ensure_session_automation_target(&self, session_id: &str) -> Result<()> {
+        if session_id == MASTER_SESSION_ID {
+            return Ok(());
+        }
+        if session_id == ONBOARD_SESSION_ID {
+            anyhow::bail!("`onboard` cannot receive automated prompts");
+        }
+
+        let sessions = self.sessions_overview_snapshot();
+        if sessions.iter().any(|session| session.id == session_id) {
+            Ok(())
+        } else {
+            anyhow::bail!("unknown session `{session_id}`")
+        }
+    }
+
+    fn update_session_automation_status(
+        &self,
+        automation_id: &str,
+        status: SessionAutomationStatus,
+    ) -> Result<SessionAutomationRecord> {
+        let automation = {
+            let now = now_unix_ts();
+            let mut state = self.state.lock().expect("state lock poisoned");
+            let automation = state
+                .session_automations
+                .get_mut(automation_id)
+                .with_context(|| format!("unknown automation `{automation_id}`"))?;
+            automation.status = status;
+            automation.updated_at = now;
+            automation.next_run_at = None;
+            automation.clone()
+        };
+        self.save_state()?;
+        Ok(automation)
     }
 
     pub fn create_job(&self, request: CreateJobRequest) -> Result<JobRecord> {
@@ -965,6 +1483,48 @@ impl Controller {
         ServiceSnapshot::load(&self.service_file())
     }
 
+    pub fn runtime_snapshot(&self) -> Result<Option<RuntimeSnapshot>> {
+        RuntimeSnapshot::load(&self.runtime_file())
+    }
+
+    pub fn begin_runtime_session(
+        &self,
+        mode: impl Into<String>,
+        command_label: impl Into<String>,
+    ) -> Result<()> {
+        let context = RuntimeContext {
+            mode: mode.into(),
+            command_label: command_label.into(),
+            started_at: now_unix_ts(),
+        };
+        {
+            let mut runtime = self.runtime_context.lock().expect("runtime lock poisoned");
+            *runtime = Some(context);
+        }
+        self.refresh_runtime_snapshot()
+    }
+
+    pub fn finish_runtime_session(
+        &self,
+        lifecycle: ServiceLifecycle,
+        last_error: Option<String>,
+    ) -> Result<()> {
+        let context = {
+            let runtime = self.runtime_context.lock().expect("runtime lock poisoned");
+            runtime.clone()
+        };
+        let Some(context) = context else {
+            return Ok(());
+        };
+
+        let snapshot = self.build_runtime_snapshot(&context, lifecycle, last_error);
+        snapshot.write(&self.runtime_file())?;
+
+        let mut runtime = self.runtime_context.lock().expect("runtime lock poisoned");
+        *runtime = None;
+        Ok(())
+    }
+
     pub fn write_service_lifecycle(
         &self,
         lifecycle: ServiceLifecycle,
@@ -1016,6 +1576,7 @@ impl Controller {
 
         self.reconcile_jobs()?;
         let continued_jobs = self.continue_automated_jobs().await?;
+        let _continued_session_automations = self.continue_session_automations().await?;
         let generated_reports = self.emit_due_job_reports()?;
         let delivered_notifications = self.deliver_queued_reports()?;
         let snapshot = self.build_service_snapshot(
@@ -1034,6 +1595,7 @@ impl Controller {
     }
 
     pub fn batch_snapshot(&self, batch_id: u64) -> Option<BatchSnapshot> {
+        self.try_sync_state_from_disk();
         let (record, events) = {
             let state = self.state.lock().expect("state lock poisoned");
             let record = state.batches.get(&batch_id).cloned()?;
@@ -1169,6 +1731,17 @@ impl Controller {
         prompt: &str,
         job_id: Option<&str>,
     ) -> Result<()> {
+        self.submit_prompt_for_job_with_batch(target, prompt, job_id)
+            .await
+            .map(|_| ())
+    }
+
+    pub async fn submit_prompt_for_job_with_batch(
+        &self,
+        target: PromptTarget,
+        prompt: &str,
+        job_id: Option<&str>,
+    ) -> Result<u64> {
         let (session_id, thread_id, log_label, role) = self.resolve_prompt_target(target).await?;
         let batch_id = self.allocate_batch_id()?;
         self.register_batch(&session_id, batch_id, prompt, job_id)?;
@@ -1181,7 +1754,8 @@ impl Controller {
             prompt,
             false,
             TurnSource::User,
-        )
+        )?;
+        Ok(batch_id)
     }
 
     pub async fn submit_prompt_and_wait(&self, target: PromptTarget, prompt: &str) -> Result<()> {
@@ -1209,6 +1783,10 @@ impl Controller {
             TurnSource::User,
         )
         .await?;
+        self.wait_for_batch_quiescence(batch_id).await
+    }
+
+    pub async fn wait_for_batch_completion(&self, batch_id: u64) -> Result<()> {
         self.wait_for_batch_quiescence(batch_id).await
     }
 
@@ -1404,6 +1982,18 @@ impl Controller {
         task: &str,
         job_id: Option<&str>,
     ) -> Result<WorkerRecord> {
+        let (_, worker) = self
+            .spawn_worker_and_wait_for_job_with_batch(group, task, job_id)
+            .await?;
+        Ok(worker)
+    }
+
+    pub async fn spawn_worker_and_wait_for_job_with_batch(
+        &self,
+        group: &str,
+        task: &str,
+        job_id: Option<&str>,
+    ) -> Result<(u64, WorkerRecord)> {
         let batch_id = self.allocate_batch_id()?;
         self.register_batch(
             MASTER_SESSION_ID,
@@ -1411,8 +2001,10 @@ impl Controller {
             &format!("spawn worker [{group}] {task}"),
             job_id,
         )?;
-        self.spawn_worker_with_options(group, task, None, None, true, batch_id)
-            .await
+        let worker = self
+            .spawn_worker_with_options(group, task, None, None, true, batch_id)
+            .await?;
+        Ok((batch_id, worker))
     }
 
     pub async fn update_worker_summary(&self, worker_id: &str, summary: &str) -> Result<()> {
@@ -2223,32 +2815,38 @@ impl Controller {
     }
 
     fn set_session_pending_turns(&self, session_id: &str, pending_turns: usize) -> Result<()> {
-        let mut sessions = self.sessions.lock().expect("sessions lock poisoned");
-        if let Some(session) = sessions.get_mut(session_id) {
-            session.set_pending_turns(pending_turns);
+        {
+            let mut sessions = self.sessions.lock().expect("sessions lock poisoned");
+            if let Some(session) = sessions.get_mut(session_id) {
+                session.set_pending_turns(pending_turns);
+            }
         }
-        Ok(())
+        self.refresh_runtime_snapshot()
     }
 
     fn set_active_turn_batch(&self, session_id: &str, batch_id: u64) -> Result<()> {
-        let mut active = self
-            .active_turn_batches
-            .lock()
-            .expect("active turn lock poisoned");
-        active.insert(session_id.to_owned(), batch_id);
-        drop(active);
-        self.touch_batch(batch_id, session_id, None)
+        {
+            let mut active = self
+                .active_turn_batches
+                .lock()
+                .expect("active turn lock poisoned");
+            active.insert(session_id.to_owned(), batch_id);
+        }
+        self.touch_batch(batch_id, session_id, None)?;
+        self.refresh_runtime_snapshot()
     }
 
     fn clear_active_turn_batch(&self, session_id: &str, batch_id: u64) -> Result<()> {
-        let mut active = self
-            .active_turn_batches
-            .lock()
-            .expect("active turn lock poisoned");
-        if active.get(session_id).copied() == Some(batch_id) {
-            active.remove(session_id);
+        {
+            let mut active = self
+                .active_turn_batches
+                .lock()
+                .expect("active turn lock poisoned");
+            if active.get(session_id).copied() == Some(batch_id) {
+                active.remove(session_id);
+            }
         }
-        Ok(())
+        self.refresh_runtime_snapshot()
     }
 
     fn current_active_batch_id(&self, session_id: &str) -> Option<u64> {
@@ -2575,12 +3173,78 @@ impl Controller {
     }
 
     fn save_state(&self) -> Result<()> {
-        let state = self.state.lock().expect("state lock poisoned");
-        state.save(&self.paths.state_file)
+        {
+            let state = self.state.lock().expect("state lock poisoned");
+            state.save(&self.paths.state_file)?;
+        }
+        let mut fingerprint = self
+            .state_file_fingerprint
+            .lock()
+            .expect("state fingerprint lock poisoned");
+        *fingerprint = file_fingerprint(&self.paths.state_file);
+        Ok(())
+    }
+
+    fn try_sync_state_from_disk(&self) {
+        let next_fingerprint = file_fingerprint(&self.paths.state_file);
+        {
+            let current = self
+                .state_file_fingerprint
+                .lock()
+                .expect("state fingerprint lock poisoned");
+            if *current == next_fingerprint {
+                return;
+            }
+        }
+        let Ok(state) = AppState::load(&self.paths.state_file) else {
+            return;
+        };
+        let mut sessions = build_sessions(&state, &self.workspace_root);
+        let pending_turns = {
+            let pending = self.pending_turns.lock().expect("pending lock poisoned");
+            pending
+                .iter()
+                .map(|(session_id, queue)| (session_id.clone(), queue.len()))
+                .collect::<Vec<_>>()
+        };
+        for (session_id, pending_turns) in pending_turns {
+            if let Some(session) = sessions.get_mut(&session_id) {
+                session.set_pending_turns(pending_turns);
+            }
+        }
+
+        {
+            let mut current_state = self.state.lock().expect("state lock poisoned");
+            *current_state = state;
+        }
+        let mut current_sessions = self.sessions.lock().expect("sessions lock poisoned");
+        *current_sessions = sessions;
+        let mut current_fingerprint = self
+            .state_file_fingerprint
+            .lock()
+            .expect("state fingerprint lock poisoned");
+        *current_fingerprint = next_fingerprint;
     }
 
     fn service_file(&self) -> PathBuf {
         self.paths.root.join("service.json")
+    }
+
+    fn runtime_file(&self) -> PathBuf {
+        self.paths.root.join("runtime.json")
+    }
+
+    fn refresh_runtime_snapshot(&self) -> Result<()> {
+        let context = {
+            let runtime = self.runtime_context.lock().expect("runtime lock poisoned");
+            runtime.clone()
+        };
+        let Some(context) = context else {
+            return Ok(());
+        };
+
+        let snapshot = self.build_runtime_snapshot(&context, ServiceLifecycle::Running, None);
+        snapshot.write(&self.runtime_file())
     }
 
     fn maintain_logs(&self) -> Result<()> {
@@ -2711,8 +3375,13 @@ impl Controller {
                 )
             };
 
-            let next_status = derive_job_status_from_state(&state, &batch_ids, &worker_ids);
             let next_summary = latest_summary.or(existing_summary);
+            let next_status = derive_job_status_from_state(
+                &state,
+                &batch_ids,
+                &worker_ids,
+                next_summary.as_deref(),
+            );
             let changed = previous_status != next_status
                 || next_summary.as_deref().map(str::trim)
                     != job_record.latest_summary.as_deref().map(str::trim);
@@ -2830,6 +3499,60 @@ impl Controller {
         Ok(vec![job.id])
     }
 
+    async fn continue_session_automations(&self) -> Result<Vec<String>> {
+        let now = now_unix_ts();
+        let candidates = {
+            let state = self.state.lock().expect("state lock poisoned");
+            let mut automations = state
+                .session_automations
+                .values()
+                .filter(|automation| session_automation_is_due(automation, now))
+                .cloned()
+                .collect::<Vec<_>>();
+            automations.sort_by(|left, right| {
+                left.next_run_at
+                    .unwrap_or(0)
+                    .cmp(&right.next_run_at.unwrap_or(0))
+                    .then_with(|| left.id.cmp(&right.id))
+            });
+            automations
+        };
+
+        let mut dispatched = Vec::new();
+        for automation in candidates {
+            if session_automation_is_exhausted(&automation, now) {
+                self.complete_session_automation(&automation.id)?;
+                continue;
+            }
+
+            if let Err(error) = self.ensure_session_automation_target(&automation.target_session_id)
+            {
+                self.fail_session_automation(&automation.id, error.to_string())?;
+                continue;
+            }
+
+            if self.session_is_busy(&automation.target_session_id) {
+                continue;
+            }
+
+            let target = automation_prompt_target(&automation.target_session_id);
+            match self
+                .submit_prompt_for_job_with_batch(target, &automation.prompt, None)
+                .await
+            {
+                Ok(batch_id) => {
+                    self.mark_session_automation_dispatch(&automation.id, batch_id)?;
+                    dispatched.push(automation.id);
+                }
+                Err(error) => {
+                    self.fail_session_automation(&automation.id, error.to_string())?;
+                }
+            }
+        }
+
+        Ok(dispatched)
+    }
+
     fn mark_job_continue_dispatch(&self, job_id: &str) -> Result<()> {
         let now = now_unix_ts();
         {
@@ -2848,6 +3571,61 @@ impl Controller {
                 "onboard delegated master loop pass {}",
                 job.continue_iterations
             ));
+        }
+        self.save_state()
+    }
+
+    fn mark_session_automation_dispatch(&self, automation_id: &str, batch_id: u64) -> Result<()> {
+        let now = now_unix_ts();
+        {
+            let mut state = self.state.lock().expect("state lock poisoned");
+            let automation = state
+                .session_automations
+                .get_mut(automation_id)
+                .with_context(|| format!("unknown automation `{automation_id}`"))?;
+            automation.updated_at = now;
+            automation.last_run_at = Some(now);
+            automation.last_batch_id = Some(batch_id);
+            automation.last_error = None;
+            automation.run_count += 1;
+            if session_automation_is_exhausted(automation, now) {
+                automation.status = SessionAutomationStatus::Completed;
+                automation.next_run_at = None;
+            } else {
+                automation.status = SessionAutomationStatus::Armed;
+                automation.next_run_at = Some(now.saturating_add(automation.interval_secs));
+            }
+        }
+        self.save_state()
+    }
+
+    fn complete_session_automation(&self, automation_id: &str) -> Result<()> {
+        let now = now_unix_ts();
+        {
+            let mut state = self.state.lock().expect("state lock poisoned");
+            let automation = state
+                .session_automations
+                .get_mut(automation_id)
+                .with_context(|| format!("unknown automation `{automation_id}`"))?;
+            automation.status = SessionAutomationStatus::Completed;
+            automation.updated_at = now;
+            automation.next_run_at = None;
+        }
+        self.save_state()
+    }
+
+    fn fail_session_automation(&self, automation_id: &str, error: String) -> Result<()> {
+        let now = now_unix_ts();
+        {
+            let mut state = self.state.lock().expect("state lock poisoned");
+            let automation = state
+                .session_automations
+                .get_mut(automation_id)
+                .with_context(|| format!("unknown automation `{automation_id}`"))?;
+            automation.status = SessionAutomationStatus::Failed;
+            automation.updated_at = now;
+            automation.next_run_at = None;
+            automation.last_error = Some(error);
         }
         self.save_state()
     }
@@ -3203,6 +3981,75 @@ impl Controller {
         }
     }
 
+    fn build_runtime_snapshot(
+        &self,
+        context: &RuntimeContext,
+        lifecycle: ServiceLifecycle,
+        last_error: Option<String>,
+    ) -> RuntimeSnapshot {
+        let now = now_unix_ts();
+        let state = self.state.lock().expect("state lock poisoned");
+        let runtime = self.client.runtime_snapshot();
+
+        let mut active_sessions = self
+            .active_turn_batches
+            .lock()
+            .expect("active turn lock poisoned")
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
+        let (mut queued_sessions, queued_turns) = {
+            let pending = self.pending_turns.lock().expect("pending lock poisoned");
+            let queued_sessions = pending
+                .iter()
+                .filter_map(|(session_id, queue)| {
+                    if queue.is_empty() {
+                        None
+                    } else {
+                        Some(session_id.clone())
+                    }
+                })
+                .collect::<Vec<_>>();
+            let queued_turns = pending.values().map(VecDeque::len).sum();
+            (queued_sessions, queued_turns)
+        };
+        let mut running_workers = state
+            .workers
+            .values()
+            .filter(|worker| {
+                matches!(
+                    worker.status,
+                    WorkerStatus::SpawnRequested
+                        | WorkerStatus::Bootstrapping
+                        | WorkerStatus::Running
+                )
+            })
+            .map(|worker| worker.id.clone())
+            .collect::<Vec<_>>();
+
+        active_sessions.sort();
+        queued_sessions.sort();
+        running_workers.sort();
+
+        RuntimeSnapshot {
+            status: lifecycle,
+            mode: context.mode.clone(),
+            pid: std::process::id(),
+            app_server_pid: runtime.pid,
+            app_server_connected: runtime.connected,
+            started_at: context.started_at,
+            updated_at: now,
+            command_label: context.command_label.clone(),
+            master_thread_id: state.master_thread_id.clone(),
+            active_turns: active_sessions.len(),
+            queued_turns,
+            active_sessions,
+            queued_sessions,
+            running_workers,
+            last_error,
+        }
+    }
+
     fn log_notification(&self, log_label: &str, notification: &Notification) -> Result<()> {
         let entry = json!({
             "ts": now_unix_ts(),
@@ -3381,7 +4228,7 @@ impl Controller {
 
     fn master_instructions(&self) -> String {
         format!(
-            "You are the master controller for CodeClaw in {}. Coordinate work across workers, keep plans concise, and prefer actionable task splits.\n\nYou may receive direct human prompts and internal runtime updates about worker lifecycle changes. Treat runtime updates as scheduler inputs: absorb the worker result, update summaries when useful, and dispatch follow-up actions only when they are actually needed.\n\nImportant lifecycle meanings:\n- bootstrapped: the worker completed its initial bootstrap turn\n- handed_back: the worker completed a later turn and returned control\n- blocked: the worker reported a blocker and likely needs intervention\n- failed: the worker turn failed unexpectedly\n\nWhen you respond, append exactly one machine-readable block at the end using this format:\n<codeclaw-actions>\n{{\"summary\":\"short orchestration summary\",\"actions\":[...]}}\n</codeclaw-actions>\n\nAllowed actions:\n- {{\"type\":\"spawn_worker\",\"group\":\"backend|frontend|infra\",\"task\":\"short task title\",\"summary\":\"optional short sidebar summary\",\"prompt\":\"optional initial worker prompt\"}}\n- {{\"type\":\"send_worker_prompt\",\"worker_id\":\"existing-worker-id\",\"prompt\":\"follow-up instructions\"}}\n- {{\"type\":\"update_worker_summary\",\"worker_id\":\"existing-worker-id\",\"summary\":\"new short summary\"}}\n\nRules:\n- Always include the block, even when no actions are needed.\n- Keep `summary` short enough to fit a sidebar.\n- Use worker ids exactly as shown in the UI when referencing existing workers.",
+            "You are the master controller for CodeClaw in {}. Coordinate work across workers, keep plans concise, and prefer actionable task splits.\n\nYou may receive direct human prompts and internal runtime updates about worker lifecycle changes. Treat runtime updates as scheduler inputs: absorb the worker result, update summaries when useful, and dispatch follow-up actions only when they are actually needed.\n\nExecution policy:\n- Prefer to start real work, not only meta-planning, when a safe next step is obvious.\n- Make reasonable assumptions and move forward unless missing information genuinely blocks useful progress.\n- Ask for clarification only when safety, approvals, or objective ambiguity makes the next step too risky.\n\nImportant lifecycle meanings:\n- bootstrapped: the worker completed its initial bootstrap turn\n- handed_back: the worker completed a later turn and returned control\n- blocked: the worker reported a blocker and likely needs intervention\n- failed: the worker turn failed unexpectedly\n\nWhen you respond, append exactly one machine-readable block at the end using this format:\n<codeclaw-actions>\n{{\"summary\":\"short orchestration summary\",\"actions\":[...]}}\n</codeclaw-actions>\n\nAllowed actions:\n- {{\"type\":\"spawn_worker\",\"group\":\"backend|frontend|infra\",\"task\":\"short task title\",\"summary\":\"optional short sidebar summary\",\"prompt\":\"optional initial worker prompt\"}}\n- {{\"type\":\"send_worker_prompt\",\"worker_id\":\"existing-worker-id\",\"prompt\":\"follow-up instructions\"}}\n- {{\"type\":\"update_worker_summary\",\"worker_id\":\"existing-worker-id\",\"summary\":\"new short summary\"}}\n\nRules:\n- Always include the block, even when no actions are needed.\n- Keep `summary` short enough to fit a sidebar.\n- Use worker ids exactly as shown in the UI when referencing existing workers.",
             self.workspace_root.display()
         )
     }
@@ -3629,6 +4476,14 @@ fn build_sessions(state: &AppState, workspace_root: &Path) -> BTreeMap<String, S
     sessions
 }
 
+fn file_fingerprint(path: &Path) -> Option<FileFingerprint> {
+    let metadata = fs::metadata(path).ok()?;
+    Some(FileFingerprint {
+        len: metadata.len(),
+        modified: metadata.modified().ok(),
+    })
+}
+
 fn session_sort_key(id: &str) -> (u8, &str) {
     if id == ONBOARD_SESSION_ID {
         (0, id)
@@ -3637,6 +4492,135 @@ fn session_sort_key(id: &str) -> (u8, &str) {
     } else {
         (2, id)
     }
+}
+
+fn build_monitor_session_snapshot(
+    session: SessionSnapshot,
+    active: bool,
+    queued_turns: usize,
+) -> MonitorSessionSnapshot {
+    let latest_user_prompt = session.latest_user_prompt();
+    let latest_response = session.latest_assistant_output();
+    let (role, group, task) = match &session.kind {
+        crate::session::SessionKind::Onboard => ("onboard".to_owned(), None, None),
+        crate::session::SessionKind::Master => (
+            "master".to_owned(),
+            None,
+            Some("global coordination".to_owned()),
+        ),
+        crate::session::SessionKind::Worker { group, task, .. } => (
+            format!("worker:{group}"),
+            Some(group.clone()),
+            Some(task.clone()),
+        ),
+    };
+
+    MonitorSessionSnapshot {
+        id: session.id,
+        title: session.title,
+        role,
+        group,
+        task,
+        job_id: session.job_id,
+        status: session.status,
+        work_state: session_work_state(active, queued_turns),
+        pending_turns: session.pending_turns,
+        latest_batch_id: session.latest_batch_id,
+        latest_user_prompt,
+        latest_response,
+        summary: session
+            .summary
+            .or(session.lifecycle_note)
+            .or(session.last_message),
+    }
+}
+
+fn session_work_state(active: bool, queued_turns: usize) -> String {
+    match (active, queued_turns > 0) {
+        (true, true) => "active+queued".to_owned(),
+        (true, false) => "active".to_owned(),
+        (false, true) => "queued".to_owned(),
+        (false, false) => "idle".to_owned(),
+    }
+}
+
+fn automation_prompt_target(session_id: &str) -> PromptTarget {
+    if session_id == MASTER_SESSION_ID {
+        PromptTarget::Master
+    } else {
+        PromptTarget::Worker(session_id.to_owned())
+    }
+}
+
+fn session_automation_snapshot(
+    automation: &SessionAutomationRecord,
+    now: u64,
+) -> SessionAutomationSnapshot {
+    SessionAutomationSnapshot {
+        id: automation.id.clone(),
+        target_session_id: automation.target_session_id.clone(),
+        status: automation.status.to_string(),
+        prompt_preview: compact_message(&automation.prompt),
+        interval_secs: automation.interval_secs,
+        run_count: automation.run_count,
+        max_runs: automation.max_runs,
+        run_for_secs: automation.run_for_secs,
+        remaining_runs: session_automation_remaining_runs(automation),
+        remaining_secs: session_automation_remaining_secs(automation, now),
+        next_run_at: automation.next_run_at,
+        last_run_at: automation.last_run_at,
+        last_batch_id: automation.last_batch_id,
+        last_error: automation.last_error.clone(),
+    }
+}
+
+fn session_automation_sort_key(automation: &SessionAutomationSnapshot) -> (u8, u64, &str) {
+    (
+        session_automation_status_rank(&automation.status),
+        automation.next_run_at.unwrap_or(u64::MAX),
+        automation.id.as_str(),
+    )
+}
+
+fn session_automation_status_rank(status: &str) -> u8 {
+    match status {
+        "armed" => 0,
+        "paused" => 1,
+        "failed" => 2,
+        "completed" => 3,
+        "cancelled" => 4,
+        _ => 5,
+    }
+}
+
+fn session_automation_remaining_runs(automation: &SessionAutomationRecord) -> Option<u32> {
+    automation
+        .max_runs
+        .map(|max_runs| max_runs.saturating_sub(automation.run_count))
+}
+
+fn session_automation_remaining_secs(
+    automation: &SessionAutomationRecord,
+    now: u64,
+) -> Option<u64> {
+    match (automation.started_at, automation.run_for_secs) {
+        (Some(started_at), Some(limit)) => {
+            Some(limit.saturating_sub(now.saturating_sub(started_at)))
+        }
+        _ => None,
+    }
+}
+
+fn session_automation_is_due(automation: &SessionAutomationRecord, now: u64) -> bool {
+    matches!(automation.status, SessionAutomationStatus::Armed)
+        && automation
+            .next_run_at
+            .is_some_and(|next_run_at| next_run_at <= now)
+}
+
+fn session_automation_is_exhausted(automation: &SessionAutomationRecord, now: u64) -> bool {
+    session_automation_remaining_runs(automation) == Some(0)
+        || session_automation_remaining_secs(automation, now) == Some(0)
 }
 
 fn thread_state_text(value: &Value) -> String {
@@ -3767,6 +4751,7 @@ fn derive_job_status_from_state(
     state: &AppState,
     batch_ids: &[u64],
     worker_ids: &[String],
+    latest_summary: Option<&str>,
 ) -> JobStatus {
     let has_failed_batch = batch_ids.iter().any(|batch_id| {
         state
@@ -3810,8 +4795,82 @@ fn derive_job_status_from_state(
 
     if batch_ids.is_empty() {
         JobStatus::Pending
+    } else if latest_summary.is_some_and(job_summary_indicates_blocker) {
+        JobStatus::Blocked
     } else {
         JobStatus::Completed
+    }
+}
+
+fn job_summary_indicates_blocker(summary: &str) -> bool {
+    job_summary_indicates_approval_wait(summary)
+        || job_summary_indicates_input_wait(summary)
+        || job_summary_indicates_clarification_wait(summary)
+        || summary.to_ascii_lowercase().contains("blocked")
+}
+
+fn job_summary_indicates_approval_wait(summary: &str) -> bool {
+    let normalized = summary.to_ascii_lowercase();
+    ["need approval", "awaiting approval", "waiting on approval"]
+        .iter()
+        .any(|needle| normalized.contains(needle))
+}
+
+fn job_summary_indicates_input_wait(summary: &str) -> bool {
+    let normalized = summary.to_ascii_lowercase();
+    [
+        "need input",
+        "need guidance",
+        "awaiting input",
+        "waiting on",
+        "cannot continue",
+        "can't continue",
+        "unable to continue",
+    ]
+    .iter()
+    .any(|needle| normalized.contains(needle))
+}
+
+fn job_summary_indicates_clarification_wait(summary: &str) -> bool {
+    let normalized = summary.to_ascii_lowercase();
+    [
+        "requested clarification",
+        "request clarification",
+        "need clarification",
+        "needs clarification",
+        "awaiting clarification",
+        "scope clarification",
+    ]
+    .iter()
+    .any(|needle| normalized.contains(needle))
+}
+
+fn operator_state_for_job(job: &JobRecord, automation: &JobAutomationSnapshot) -> String {
+    match job.status {
+        JobStatus::Blocked => {
+            let summary = job.latest_summary.as_deref().unwrap_or_default();
+            if job.policy.approval_required && !job.policy.auto_approve
+                || job_summary_indicates_approval_wait(summary)
+            {
+                "awaiting approval".to_owned()
+            } else if job_summary_indicates_clarification_wait(summary) {
+                "awaiting clarification".to_owned()
+            } else if job_summary_indicates_input_wait(summary) {
+                "awaiting input".to_owned()
+            } else {
+                "blocked".to_owned()
+            }
+        }
+        JobStatus::Running => {
+            if job.policy.delegate_to_master_loop {
+                format!("running ({})", automation_state_label(&automation.state))
+            } else {
+                "running".to_owned()
+            }
+        }
+        JobStatus::Pending => "pending".to_owned(),
+        JobStatus::Completed => "completed".to_owned(),
+        JobStatus::Failed => "failed".to_owned(),
     }
 }
 
@@ -4123,7 +5182,7 @@ fn format_report_delivery_message(report: &JobReportRecord, endpoint: &str) -> S
 fn service_job_intake_prompt(job: &JobRecord) -> String {
     let context = job.context.clone().unwrap_or_else(|| "none".to_owned());
     format!(
-        "New job intake for CodeClaw service mode.\n\nTitle: {}\nObjective: {}\nSource channel: {}\nPriority: {}\nPattern: {}\nApproval required: {}\nContext: {}\n\nPlan the job, keep the coordination summary concise, and dispatch worker actions if the work should start now. Respect the selected orchestration pattern and keep risky work approval-gated when required.",
+        "New job intake for CodeClaw service mode.\n\nTitle: {}\nObjective: {}\nSource channel: {}\nPriority: {}\nPattern: {}\nApproval required: {}\nContext: {}\n\nPlan the job, keep the coordination summary concise, and dispatch worker actions if the work should start now. Prefer to begin concrete execution instead of stopping at a meta-plan when the next safe step is obvious. Make reasonable assumptions and continue unless missing information, approvals, or safety constraints truly block the work. Respect the selected orchestration pattern and keep risky work approval-gated when required.",
         job.title,
         job.objective,
         job.source_channel,
@@ -4310,7 +5369,8 @@ mod tests {
         derive_job_status_from_state, job_automation_snapshot, job_is_eligible_for_master_loop,
         lifecycle_note_for, render_job_report_body, report_kind_for_job_update,
         report_summary_for_job_update, service_job_continue_prompt, service_job_intake_prompt,
-        worker_message_indicates_blocker, worker_status_for, SessionRole, TurnSource,
+        session_work_state, worker_message_indicates_blocker, worker_status_for, SessionRole,
+        TurnSource,
     };
     use crate::state::{
         AppState, BatchStatus, JobPolicy, JobRecord, JobReportKind, JobStatus,
@@ -4333,6 +5393,14 @@ mod tests {
         );
         assert_eq!(worker_status_for("blocked"), WorkerStatus::Blocked);
         assert_eq!(worker_status_for("handed_back"), WorkerStatus::HandedBack);
+    }
+
+    #[test]
+    fn session_work_state_distinguishes_active_and_queue_backlog() {
+        assert_eq!(session_work_state(true, 0), "active");
+        assert_eq!(session_work_state(false, 2), "queued");
+        assert_eq!(session_work_state(true, 3), "active+queued");
+        assert_eq!(session_work_state(false, 0), "idle");
     }
 
     #[test]
@@ -4425,7 +5493,7 @@ mod tests {
         );
 
         assert_eq!(
-            derive_job_status_from_state(&state, &[1], &[]),
+            derive_job_status_from_state(&state, &[1], &[], None),
             JobStatus::Running
         );
 
@@ -4448,7 +5516,7 @@ mod tests {
             },
         );
         assert_eq!(
-            derive_job_status_from_state(&state, &[1], &["backend-001".to_owned()]),
+            derive_job_status_from_state(&state, &[1], &["backend-001".to_owned()], None),
             JobStatus::Blocked
         );
 
@@ -4456,7 +5524,7 @@ mod tests {
             worker.status = WorkerStatus::Failed;
         }
         assert_eq!(
-            derive_job_status_from_state(&state, &[1], &["backend-001".to_owned()]),
+            derive_job_status_from_state(&state, &[1], &["backend-001".to_owned()], None),
             JobStatus::Failed
         );
 
@@ -4465,12 +5533,41 @@ mod tests {
             batch.status = BatchStatus::Completed;
         }
         assert_eq!(
-            derive_job_status_from_state(&state, &[1], &[]),
+            derive_job_status_from_state(&state, &[1], &[], None),
             JobStatus::Completed
         );
         assert_eq!(
-            derive_job_status_from_state(&state, &[], &[]),
+            derive_job_status_from_state(&state, &[], &[], None),
             JobStatus::Pending
+        );
+    }
+
+    #[test]
+    fn completed_batches_with_clarification_summary_are_marked_blocked() {
+        let mut state = AppState::default();
+        state.batches.insert(
+            1,
+            OrchestrationBatchRecord {
+                id: 1,
+                root_session_id: "master".to_owned(),
+                root_prompt: "root".to_owned(),
+                job_id: Some("JOB-013".to_owned()),
+                status: BatchStatus::Completed,
+                created_at: 1,
+                updated_at: 1,
+                sessions: vec!["master".to_owned()],
+                last_event: None,
+            },
+        );
+
+        assert_eq!(
+            derive_job_status_from_state(
+                &state,
+                &[1],
+                &[],
+                Some("Planned JOB-013 and requested scope clarification."),
+            ),
+            JobStatus::Blocked
         );
     }
 
@@ -4512,6 +5609,8 @@ mod tests {
         assert!(prompt.contains("planner_executor_reviewer"));
         assert!(prompt.contains("Approval required: yes"));
         assert!(prompt.contains("Keep rollout low risk"));
+        assert!(prompt.contains("Prefer to begin concrete execution"));
+        assert!(prompt.contains("Make reasonable assumptions"));
 
         assert_eq!(
             report_kind_for_job_update(

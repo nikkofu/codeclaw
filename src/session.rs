@@ -38,6 +38,18 @@ pub struct SessionSnapshot {
     pub log_lines: Vec<String>,
 }
 
+#[derive(Debug, Clone)]
+pub struct SessionOverviewSnapshot {
+    pub id: String,
+    pub job_id: Option<String>,
+    pub title: String,
+    pub subtitle: String,
+    pub pending_turns: usize,
+    pub latest_batch_id: Option<u64>,
+    pub kind: SessionKind,
+    pub status: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SessionEventKind {
@@ -255,13 +267,8 @@ impl SessionView {
             .find_map(|event| event.batch_id)
     }
 
-    pub fn snapshot(&self) -> SessionSnapshot {
-        let mut log_lines = self.lines.iter().cloned().collect::<Vec<_>>();
-        if !self.live_buffer.is_empty() {
-            log_lines.push(format!("assistant> {}", self.live_buffer));
-        }
-
-        let subtitle = match self.status.as_str() {
+    fn subtitle_text(&self) -> String {
+        match self.status.as_str() {
             "bootstrapped" | "blocked" | "handed_back" | "failed" => self
                 .lifecycle_note
                 .clone()
@@ -274,14 +281,34 @@ impl SessionView {
                 .or_else(|| self.lifecycle_note.clone())
                 .or_else(|| self.last_message.clone())
                 .unwrap_or_else(|| self.title.clone()),
-        };
+        }
+    }
+
+    pub fn overview(&self) -> SessionOverviewSnapshot {
+        SessionOverviewSnapshot {
+            id: self.id.clone(),
+            job_id: self.job_id.clone(),
+            title: self.title.clone(),
+            subtitle: self.subtitle_text(),
+            pending_turns: self.pending_turns,
+            latest_batch_id: self.latest_batch_id(),
+            kind: self.kind.clone(),
+            status: self.status.clone(),
+        }
+    }
+
+    pub fn snapshot(&self) -> SessionSnapshot {
+        let mut log_lines = self.lines.iter().cloned().collect::<Vec<_>>();
+        if !self.live_buffer.is_empty() {
+            log_lines.push(format!("assistant> {}", self.live_buffer));
+        }
 
         SessionSnapshot {
             id: self.id.clone(),
             job_id: self.job_id.clone(),
             thread_id: self.thread_id.clone(),
             title: self.title.clone(),
-            subtitle,
+            subtitle: self.subtitle_text(),
             pending_turns: self.pending_turns,
             latest_batch_id: self.latest_batch_id(),
             summary: self.summary.clone(),
@@ -294,6 +321,36 @@ impl SessionView {
             timeline_events: self.timeline_events.iter().cloned().collect(),
             log_lines,
         }
+    }
+}
+
+impl SessionSnapshot {
+    pub fn latest_user_prompt(&self) -> Option<String> {
+        self.latest_log_message("user> ")
+            .or_else(|| self.latest_event_text(|kind| matches!(kind, SessionEventKind::User)))
+    }
+
+    pub fn latest_assistant_output(&self) -> Option<String> {
+        self.latest_log_message("assistant> ")
+            .or_else(|| self.last_message.clone())
+    }
+
+    fn latest_log_message(&self, prefix: &str) -> Option<String> {
+        self.log_lines.iter().rev().find_map(|line| {
+            line.strip_prefix(prefix)
+                .map(str::trim)
+                .filter(|message| !message.is_empty())
+                .map(str::to_owned)
+        })
+    }
+
+    fn latest_event_text(&self, predicate: impl Fn(&SessionEventKind) -> bool) -> Option<String> {
+        self.timeline_events
+            .iter()
+            .rev()
+            .find(|event| predicate(&event.kind))
+            .map(|event| event.text.trim().to_owned())
+            .filter(|text| !text.is_empty())
     }
 }
 
@@ -388,5 +445,62 @@ mod tests {
             Some("waiting on schema approval")
         );
         assert_eq!(snapshot.subtitle, "waiting on schema approval");
+    }
+
+    #[test]
+    fn snapshot_extracts_latest_user_and_assistant_messages() {
+        let mut session = SessionView::master("thread-1".to_owned(), "/tmp".to_owned(), None, None);
+        session.push_line("user> Design the CRM workflow");
+        session.push_line("assistant> Drafted the first plan");
+
+        let snapshot = session.snapshot();
+
+        assert_eq!(
+            snapshot.latest_user_prompt().as_deref(),
+            Some("Design the CRM workflow")
+        );
+        assert_eq!(
+            snapshot.latest_assistant_output().as_deref(),
+            Some("Drafted the first plan")
+        );
+    }
+
+    #[test]
+    fn snapshot_uses_timeline_and_last_message_fallbacks() {
+        let mut session = SessionView::master("thread-1".to_owned(), "/tmp".to_owned(), None, None);
+        session.push_timeline_event(SessionEvent::new(
+            SessionEventKind::User,
+            "started prompt: queue a follow-up",
+            Some(7),
+        ));
+        session.set_last_message(Some("Most recent visible response".to_owned()));
+
+        let snapshot = session.snapshot();
+
+        assert_eq!(
+            snapshot.latest_user_prompt().as_deref(),
+            Some("started prompt: queue a follow-up")
+        );
+        assert_eq!(
+            snapshot.latest_assistant_output().as_deref(),
+            Some("Most recent visible response")
+        );
+    }
+
+    #[test]
+    fn overview_matches_snapshot_identity_fields() {
+        let mut session = SessionView::master("thread-1".to_owned(), "/tmp".to_owned(), None, None);
+        session.set_summary(Some("steady summary".to_owned()));
+        session.set_last_turn_id(Some("turn-9".to_owned()));
+        session.push_timeline_event(SessionEvent::new(SessionEventKind::User, "batch", Some(42)));
+
+        let overview = session.overview();
+        let snapshot = session.snapshot();
+
+        assert_eq!(overview.id, snapshot.id);
+        assert_eq!(overview.title, snapshot.title);
+        assert_eq!(overview.subtitle, snapshot.subtitle);
+        assert_eq!(overview.latest_batch_id, snapshot.latest_batch_id);
+        assert!(matches!(overview.kind, SessionKind::Master));
     }
 }

@@ -1,6 +1,6 @@
 # CodeClaw Architecture
 
-This document describes the current implemented architecture in release `0.12.0`.
+This document describes the current implemented architecture in release `0.13.0`.
 
 For the next-stage system direction, see:
 
@@ -12,7 +12,7 @@ For the next-stage system direction, see:
 
 ## 0. Implementation Status
 
-As of March 13, 2026, release `0.12.0` implements a working control-plane prototype, not just a design stub.
+As of March 14, 2026, release `0.13.0` implements a working control-plane prototype, not just a design stub.
 
 Implemented now:
 
@@ -34,7 +34,11 @@ Implemented now:
 - a gateway-backed delivery path with `console` and `mock_file` channels
 - a normalized IM/webhook compatibility contract for markdown, links, media, typing, and raw `type/event/hook`
 - a virtual `onboard` supervision session for kanban-style control-plane oversight
+- a local codex-monitor snapshot and local `/monitor ...` answers for runtime/session visibility
 - bounded delegated continuation with time and iteration safeguards
+- bounded session automations targeting `master` or a specific worker, with pause/resume/cancel control
+- foreground scheduler ticks while `codeclaw up` is open, plus background ticks through `codeclaw serve`
+- persisted runtime and scheduler heartbeats in `.codeclaw/runtime.json` and `.codeclaw/service.json`
 - daily archived runtime and session logs with configurable retention
 
 Not implemented yet:
@@ -136,7 +140,8 @@ Rust is the best fit because it gives:
 1. `codeclaw tui`
    - renders the left session list and right active view
    - can switch the right pane between session supervision and orchestration-batch supervision
-   - handles keyboard shortcuts, filtering, session focus, and attach/detach
+   - handles keyboard shortcuts, filtering, session focus, slash commands, and attach/detach
+   - drives scheduler ticks directly while `codeclaw up` is open
 
 2. `master adapter`
    - starts `codex app-server`
@@ -157,7 +162,7 @@ Rust is the best fit because it gives:
 5. `coordination store`
    - stores plan, task, lock, and status files under `.codeclaw/`
    - acts as the shared memory between master and workers
-   - now also persists session timeline history and orchestration batch metadata
+   - now also persists session timeline history, orchestration batch metadata, session automations, and runtime/service heartbeats
 
 6. `gateway layer`
    - normalizes outbound reports into a channel-neutral envelope

@@ -6,7 +6,7 @@ It combines task routing, session management, shared coordination files, and Git
 
 ## Release Information
 
-- Version: `0.12.0`
+- Version: `0.13.0`
 - Repository: `https://github.com/nikkofu/codeclaw`
 - Delivery and planning package:
   - [Release Notes](RELEASE.md)
@@ -46,11 +46,14 @@ This repository now includes a working Rust control-plane prototype with:
 - persisted rolling live-output tail, including in-flight assistant text, across process restarts
 - a dedicated batch inspection view in the TUI for replaying one orchestration chain across multiple sessions
 - a default virtual `onboard` supervision session with a kanban-like job board for pending, running, blocked, completed, and failed work
+- a local codex-monitor snapshot that powers onboard session visibility without routing monitor questions through the master model
 - color-coded and animated status cues across the sidebar, panels, status bar, and terminal title
 - right-pane focus filters and colorized log rendering for summary, command, and error inspection
 - explicit worker lifecycle supervision for spawn request, bootstrap, blocker, and handoff states
 - bounded master-loop delegation for 7x24 service mode, with time-based and iteration-based continue guards
+- bounded session automations that can target `master` or a specific worker on a fixed interval, with max-run and duration guards
 - explicit auto-approve and delegated-loop markers across jobs, sessions, and service inspection
+- foreground scheduler ticks while `up` is open, so supervision and continued execution can share one operator console
 - daily archived JSONL logs under `.codeclaw/logs/archive/YYYY-MM-DD/` with configurable retention, defaulting to 30 days
 - runtime log coverage for app-server stderr, parse failures, stdout-closed conditions, and lag warnings
 - persisted lifecycle notes for blocker and handoff context across restarts
@@ -73,9 +76,18 @@ cargo run -- inspect --batch 3 --events 12
 cargo run -- inspect --service
 cargo run -- jobs
 cargo run -- job create --title "Payment API refactor"
+cargo run -- job create --title "Design CRM blueprint" --start-session backend-001-design-crm
+cargo run -- job create --title "Design CRM blueprint" --start-group backend
 cargo run -- job create --title "Nightly refactor" --delegate-master-loop --continue-for-secs 3600 --continue-max-iterations 10
 cargo run -- job create --title "Auto recovery" --delegate-master-loop --continue-for-secs 3600 --continue-max-iterations 10 --auto-approve
+cargo run -- job create --title "Backlog intake" --defer
+cargo run -- job create --title "Visible intake" --follow
 cargo run -- job inspect JOB-001
+cargo run -- automation create --to master --every-secs 300 --max-runs 10 --for-secs 3600 "Review blocked jobs and continue"
+cargo run -- automation list
+cargo run -- automation pause AUTO-001
+cargo run -- automation resume AUTO-001
+cargo run -- automation cancel AUTO-001
 cargo run -- gateway schema
 cargo run -- gateway capabilities --channel mock-file
 cargo run -- gateway subscribe --job JOB-001 --channel mock-file
@@ -94,6 +106,8 @@ Current TUI keybindings:
 
 ```text
 ↑ / ↓   switch sessions
+/       open slash command mode
+Enter   open slash command mode from the bottom command bar
 o       focus onboard
 i       send a prompt to master
 e       send a prompt to the selected worker
@@ -105,13 +119,65 @@ g       focus master
 q       quit
 ```
 
+The TUI now also supports onboard-friendly slash commands from the bottom input bar. Press `/` and use commands such as:
+
+```text
+/help
+/job create "Design an agentic CRM system blueprint"
+/job create "Nightly backlog sweep" --delegate-master-loop --continue-for-secs 3600 --continue-max-iterations 10
+/job create "CRM blueprint" --start-group backend
+/job create "CRM blueprint" --start-session backend-001-inspect-api-health-check
+/automation create --to master --every-secs 300 --max-runs 10 --for-secs 3600 "Review blocked jobs and continue"
+/automation list
+/automation pause AUTO-001
+/automation resume AUTO-001
+/automation cancel AUTO-001
+/monitor sessions
+/monitor runtime
+/monitor session master
+/send master "Plan the next safe step"
+/focus onboard
+```
+
+Slash commands are non-blocking inside `codeclaw up`: the command is queued immediately, the TUI stays responsive, and `onboard` continues to reflect job/session changes in the same screen.
+
+`/monitor ...` is handled locally by CodeClaw itself, so session counts, runtime connectivity, latest user prompts, and recent assistant responses are shown from real control-plane state instead of being inferred by Codex.
+
+`/automation ...` is also handled locally by CodeClaw. Automation definitions are created, paused, resumed, and cancelled directly against persisted control-plane state instead of being delegated to the model.
+
+While `codeclaw up` is open, it also drives scheduler ticks in the foreground. That means deferred job intake, delegated job continuation, and session automations can keep progressing without a second `serve` process. Use `codeclaw serve` when you want the same scheduler behavior without the interactive TUI.
+
+The `onboard` header now separates scheduler state from the live Codex runtime, so `scheduler=stopped` no longer implies the Codex app-server is down while `up` is actively driving turns.
+
+Inside slash mode and spawn mode:
+
+- `Tab` completes commands, flags, groups, and session ids from the current context
+- matching suggestions render as a selectable list in the input bar, with the current item highlighted
+- `Shift+Tab` or `Alt+Up` / `Alt+Down` cycles the active suggestion before accepting it
+- `Ctrl+P` / `Ctrl+N` recalls earlier or newer command history
+- slash mode now behaves more like a compact command palette instead of a plain footer hint
+
+The input bar now behaves like a real editor instead of append-only input:
+
+- `Left` / `Right` / `Up` / `Down` move the cursor while composing
+- `Home` / `End` jump within the current visual line
+- `Backspace` and `Delete` edit in place
+- `Alt+Enter` or `Ctrl+J` inserts a newline
+- `Ctrl+P` / `Ctrl+N` recalls prompt history for the current input mode
+- the input box stays single-line until content actually wraps or you insert a newline, then auto-grows while keeping the cursor visible
+- from the default bottom `Command` bar, `Enter` or any non-shortcut printable key now opens slash command entry instead of doing nothing
+
 The sidebar now also reflects per-session queue depth with `qN` prefixes when a session has pending turns.
 
-The first session is now a virtual `onboard` supervisor board. It aggregates job state, service status, running workers, queued deliveries, delegated loop counts, auto-approve counts, and budget exhaustion signals so one operator can supervise long-running work without drilling into every worker first.
+The first session is now a virtual `onboard` supervisor board. It aggregates job state, service status, running workers, queued deliveries, delegated loop counts, auto-approve counts, budget exhaustion signals, a dedicated `Codex Sessions` panel, and an `Automations` panel so one operator can supervise long-running work without drilling into every worker first.
+
+`onboard` lane cards now also surface a more operator-friendly state reason such as `awaiting clarification` or `awaiting approval`, instead of collapsing everything into a generic done/blocked label.
+
+The `Automations` panel shows the latest session-targeted repeated prompts with status, target session, interval, remaining budget, last dispatch, and last error, plus top-line armed/paused/due-now counts in the onboard header.
 
 The right pane now separates supervision metadata from execution noise:
 
-- `Selected Session` shows title, queue depth, summary, lifecycle note, last message, thread id, and task file/workspace
+- `Selected Session` shows title, queue depth, summary, lifecycle note, latest user prompt, last message, thread id, and task file/workspace
 - `Timeline` shows recent structured events such as user prompts, orchestrator dispatches, runtime acknowledgements, status changes, and command completions
 - timeline entries carry `bNNN` batch markers so the same orchestration chain can be traced after `codeclaw send` or `codeclaw up` restarts
 - `Live Output` remains the rolling text stream for assistant output and command/output lines
@@ -155,7 +221,7 @@ The CLI can now inspect the same supervision data without opening the TUI:
 
 - `codeclaw inspect --session master` prints one session's status, summary, lifecycle note, recent timeline slice, and recent output slice
 - `codeclaw inspect --batch 3` prints one batch's root prompt, participating sessions, and recent aggregated events
-- `codeclaw inspect --service` prints the latest persisted service heartbeat, including pending/running/blocked job buckets
+- `codeclaw inspect --service` prints both the persisted scheduler heartbeat and the latest persisted runtime snapshot, including app-server pid, command mode, active turns, and queued turns
 - `--events` and `--output` tune how much recent history is printed
 
 The `spawn` command now also shows terminal-side progress feedback while it waits for worker bootstrap, including a spinner, state updates, and fresh worker log lines.
@@ -164,22 +230,38 @@ When the current terminal does not expose an interactive TTY, CodeClaw now falls
 
 Jobs now provide a top-level operating object above batches and workers:
 
-- `codeclaw job create` creates a durable pending job with orchestration policy metadata
-- `codeclaw job create --delegate-master-loop --continue-for-secs 3600 --continue-max-iterations 10` arms a job for bounded 7x24 master-loop continuation
-- `codeclaw job create --auto-approve` marks that automation-visible approvals can proceed without waiting for a manual operator checkpoint
+- `codeclaw job create` creates a durable job and immediately starts the first intake turn in concise mode
+- `codeclaw job create --follow` streams current-batch progress when an operator wants live details
+- `codeclaw job create --start-session <worker-id>` routes the first turn to an existing worker session instead of the master
+- `codeclaw job create --start-group <group>` opens a new worker session in that group and starts the job there
+- `codeclaw job create --delegate-master-loop --continue-for-secs 3600 --continue-max-iterations 10` starts the job immediately and arms it for bounded 7x24 master-loop continuation
+- `codeclaw job create --auto-approve` marks that automation-visible approvals can proceed without waiting for a manual operator checkpoint; it does not by itself enable looping
+- `codeclaw job create --defer` preserves the old queue-only behavior when an operator wants to stage work without starting Codex yet
 - `codeclaw jobs` lists known jobs with status, batch count, worker count, and pattern
 - `codeclaw job inspect JOB-001` shows the current job summary, automation state, remaining loop budget, linked batches/workers, recent reports, subscriptions, and delivery history
 - `codeclaw send --job ...` and `codeclaw spawn --job ...` attach new work to an existing job
 
+Session automations now provide a second low-cost control-plane primitive for repeated supervision or nudging work forward:
+
+- `codeclaw automation create --to master --every-secs 300 --max-runs 10 --for-secs 3600 "Review blocked jobs and continue"` schedules repeated prompts into the master session
+- `codeclaw automation create --to backend-001-inspect-api-health-check --every-secs 600 "Continue from the last blocker"` targets an existing worker directly
+- `codeclaw automation list` prints armed, paused, completed, and failed automation state from persisted local data
+- `codeclaw automation pause|resume|cancel AUTO-001` lets operators stop or change long-running repeated prompts without editing state files manually
+- the same lifecycle is available from `up` through `/automation ...`, with live visibility in onboard
+
 The new `serve` command is the first service-mode skeleton for long-running orchestration:
 
 - `codeclaw serve` runs scheduler ticks without opening the TUI
-- pending jobs with no batches are automatically submitted to the master session for planning
+- `codeclaw up` now runs the same scheduler ticks in the foreground while the operator console is open
+- pending jobs created with `--defer` and no batches are automatically submitted to the master session for planning on the next scheduler tick
+- delegated jobs and session automations continue whenever either `codeclaw up` or `codeclaw serve` is actively driving the scheduler
 - delegated jobs can now be continued through the master session automatically when cooldown and budget guards allow it
+- session automations can repeatedly prompt `master` or a specific worker when their interval and budget guards allow it
 - blocked jobs that still require manual approval are intentionally not auto-continued unless the job is marked `auto_approve`
 - due running/blocked jobs now emit persisted digest reports on the service loop cadence
 - queued report deliveries now flow through a channel-neutral outbox and are emitted through a first `console/stdout` delivery path
 - the latest service heartbeat is persisted to `.codeclaw/service.json` so CLI inspection and future gateways can observe background state
+- the latest live command/runtime heartbeat is persisted separately to `.codeclaw/runtime.json` so `up`, `job create`, `send`, and `spawn` activity can be inspected across processes
 
 Gateway compatibility is now explicitly defined for future IM integrations:
 

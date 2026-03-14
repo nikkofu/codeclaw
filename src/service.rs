@@ -66,6 +66,32 @@ pub struct ServiceSnapshot {
     pub last_error: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RuntimeSnapshot {
+    pub status: ServiceLifecycle,
+    pub mode: String,
+    pub pid: u32,
+    #[serde(default)]
+    pub app_server_pid: Option<u32>,
+    #[serde(default)]
+    pub app_server_connected: bool,
+    pub started_at: u64,
+    pub updated_at: u64,
+    pub command_label: String,
+    #[serde(default)]
+    pub master_thread_id: Option<String>,
+    #[serde(default)]
+    pub active_sessions: Vec<String>,
+    #[serde(default)]
+    pub queued_sessions: Vec<String>,
+    #[serde(default)]
+    pub running_workers: Vec<String>,
+    pub active_turns: usize,
+    pub queued_turns: usize,
+    #[serde(default)]
+    pub last_error: Option<String>,
+}
+
 impl ServiceSnapshot {
     pub fn load(path: &Path) -> Result<Option<Self>> {
         if !path.exists() {
@@ -92,9 +118,35 @@ impl ServiceSnapshot {
     }
 }
 
+impl RuntimeSnapshot {
+    pub fn load(path: &Path) -> Result<Option<Self>> {
+        if !path.exists() {
+            return Ok(None);
+        }
+
+        let raw = fs::read_to_string(path)
+            .with_context(|| format!("failed to read {}", path.display()))?;
+        let snapshot = serde_json::from_str(&raw)
+            .with_context(|| format!("failed to parse {}", path.display()))?;
+        Ok(Some(snapshot))
+    }
+
+    pub fn write(&self, path: &Path) -> Result<()> {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("failed to create {}", parent.display()))?;
+        }
+
+        let raw =
+            serde_json::to_string_pretty(self).context("failed to encode runtime snapshot")?;
+        fs::write(path, format!("{raw}\n"))
+            .with_context(|| format!("failed to write {}", path.display()))
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{ServiceLifecycle, ServiceSnapshot};
+    use super::{RuntimeSnapshot, ServiceLifecycle, ServiceSnapshot};
 
     #[test]
     fn service_snapshot_round_trips_json() {
@@ -136,5 +188,38 @@ mod tests {
         assert_eq!(decoded.auto_approve_jobs, vec!["JOB-002"]);
         assert_eq!(decoded.budget_exhausted_jobs, vec!["JOB-004"]);
         assert_eq!(decoded.tick, 3);
+    }
+
+    #[test]
+    fn runtime_snapshot_round_trips_json() {
+        let snapshot = RuntimeSnapshot {
+            status: ServiceLifecycle::Running,
+            mode: "up".to_owned(),
+            pid: 2222,
+            app_server_pid: Some(3333),
+            app_server_connected: true,
+            started_at: 10,
+            updated_at: 20,
+            command_label: "cargo run -- up".to_owned(),
+            master_thread_id: Some("thread-1".to_owned()),
+            active_sessions: vec!["master".to_owned()],
+            queued_sessions: vec!["backend-001".to_owned()],
+            running_workers: vec!["backend-001".to_owned()],
+            active_turns: 1,
+            queued_turns: 2,
+            last_error: None,
+        };
+
+        let raw = serde_json::to_string(&snapshot).expect("snapshot should encode");
+        let decoded: RuntimeSnapshot = serde_json::from_str(&raw).expect("snapshot should decode");
+
+        assert_eq!(decoded.status, ServiceLifecycle::Running);
+        assert_eq!(decoded.mode, "up");
+        assert_eq!(decoded.app_server_pid, Some(3333));
+        assert!(decoded.app_server_connected);
+        assert_eq!(decoded.active_sessions, vec!["master"]);
+        assert_eq!(decoded.queued_sessions, vec!["backend-001"]);
+        assert_eq!(decoded.active_turns, 1);
+        assert_eq!(decoded.queued_turns, 2);
     }
 }

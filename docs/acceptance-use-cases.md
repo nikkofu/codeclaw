@@ -2,7 +2,7 @@
 
 ## Scope
 
-This document defines recommended acceptance scenarios for release `0.12.0`.
+This document defines recommended acceptance scenarios for release `0.13.0`.
 
 Repository: `https://github.com/nikkofu/codeclaw`
 
@@ -64,6 +64,7 @@ Start the TUI and confirm the master session is available.
 - master session is selectable
 - UI reacts to navigation keys
 - the default `onboard` session is visible and can be selected
+- onboard shows live runtime visibility distinct from scheduler state
 
 ## UC-04 Master Dispatch Creates Worker
 
@@ -98,7 +99,28 @@ Confirm blocker context is preserved and visible.
 - `lifecycle note` contains a concise blocker explanation
 - master timeline records the worker runtime update
 
-## UC-06 CLI Inspection
+## UC-06 Local Monitor Visibility
+
+**Objective**  
+Confirm onboard and monitor commands report authoritative local control-plane state.
+
+**Steps**
+
+1. Run `cargo run -- up`.
+2. Select `onboard`.
+3. Observe the `Codex Sessions` panel and live runtime header.
+4. Run `/monitor sessions`.
+5. Run `/monitor runtime`.
+6. Optionally run `/monitor session master`.
+
+**Expected results**
+
+- session count matches the actual monitored session set
+- runtime visibility includes app-server connectivity, mode, active turns, and queued turns
+- latest user prompt and latest response preview are visible from local session state
+- monitor answers are produced locally by CodeClaw instead of becoming a model-generated monitor guess
+
+## UC-07 CLI Inspection
 
 **Objective**  
 Validate non-TUI supervision.
@@ -107,13 +129,15 @@ Validate non-TUI supervision.
 
 1. Run `cargo run -- inspect --session master --events 8 --output 6`.
 2. Run `cargo run -- inspect --batch <batch-id> --events 12` using a real batch id.
+3. Run `cargo run -- inspect --service`.
 
 **Expected results**
 
 - session inspection prints status, summary, lifecycle note, timeline, and output
 - batch inspection prints status, root prompt, sessions, and aggregated events
+- service inspection prints scheduler heartbeat plus runtime pid/mode/active-turn visibility
 
-## UC-07 Restart Recovery
+## UC-08 Restart Recovery
 
 **Objective**  
 Confirm supervision state survives process restart.
@@ -130,8 +154,9 @@ Confirm supervision state survives process restart.
 - recent output tail is restored
 - in-flight assistant text is restored if the previous process persisted it
 - lifecycle notes remain visible after restart
+- the latest runtime snapshot can still be reviewed with `cargo run -- inspect --service`
 
-## UC-08 Manual Worker Spawn
+## UC-09 Manual Worker Spawn
 
 **Objective**  
 Confirm CLI worker creation works without the TUI.
@@ -148,7 +173,7 @@ Confirm CLI worker creation works without the TUI.
 - worker appears in `list`
 - worker task file and status file are created
 
-## UC-09 Gateway Compatibility and Delivery
+## UC-10 Gateway Compatibility and Delivery
 
 **Objective**  
 Confirm the gateway contract and delivery path are usable for formal integration work.
@@ -169,7 +194,39 @@ Confirm the gateway contract and delivery path are usable for formal integration
 - the report is delivered to `.codeclaw/gateway/mock-outbox.jsonl`
 - the delivery is visible in `cargo run -- job inspect <job-id>`
 
-## UC-10 Bounded Master-Loop Delegation
+## UC-11 Session Automation Lifecycle
+
+**Objective**  
+Confirm bounded repeated prompts can be created, observed, paused, resumed, and cancelled safely.
+
+**Steps**
+
+1. Create an automation with:
+
+   ```bash
+   cargo run -- automation create \
+     --to master \
+     --every-secs 300 \
+     --max-runs 2 \
+     --for-secs 900 \
+     "Review blocked jobs and continue"
+   ```
+
+2. Keep `cargo run -- up` or `cargo run -- serve` running.
+3. Run `cargo run -- automation list`.
+4. Confirm the automation appears in onboard `Automations`.
+5. Run `cargo run -- automation pause <automation-id>`.
+6. Run `cargo run -- automation resume <automation-id>`.
+7. Run `cargo run -- automation cancel <automation-id>`.
+
+**Expected results**
+
+- automation is created with a stable `AUTO-###` id
+- automation list shows target session, interval, remaining budget, and state
+- onboard `Automations` reflects the same local state as the CLI
+- pause, resume, and cancel change the automation lifecycle without manual state-file editing
+
+## UC-12 Bounded Master-Loop Delegation
 
 **Objective**  
 Confirm long-running automation can continue safely without unbounded looping.
@@ -186,7 +243,7 @@ Confirm long-running automation can continue safely without unbounded looping.
      --continue-max-iterations 3
    ```
 
-2. Start `cargo run -- serve`.
+2. Keep either `cargo run -- up` or `cargo run -- serve` running.
 3. Inspect `onboard` in the TUI or run `cargo run -- inspect --service`.
 4. Verify the job is marked as delegated and the remaining budget decreases over time or iterations.
 5. Repeat with `--auto-approve` for a scenario that would otherwise wait for manual approval.
@@ -199,7 +256,7 @@ Confirm long-running automation can continue safely without unbounded looping.
 - the job stops auto-continuing after the configured time or iteration budget is exhausted
 - blocked jobs remain visible instead of looping forever when approval is still required
 
-## UC-11 Runtime Logging and Retention
+## UC-13 Runtime Logging and Retention
 
 **Objective**  
 Confirm runtime errors and session notifications are archived daily and retained by policy.
@@ -225,8 +282,10 @@ Formal delivery sign-off should record:
 - environment used for acceptance
 - command outputs for `init`, `doctor`, and at least one `inspect`
 - evidence of one worker lifecycle transition
+- evidence of one local monitor snapshot from onboard or `inspect --service`
 - evidence of restart recovery
 - evidence of one gateway delivery
+- evidence of one bounded session automation lifecycle
 - evidence of one bounded delegated-loop run
 - evidence of archived runtime logs for the acceptance day
 - any approved known-gap exceptions for the current release

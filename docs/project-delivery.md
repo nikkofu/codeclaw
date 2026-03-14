@@ -5,8 +5,8 @@
 | Item | Value |
 | --- | --- |
 | Product | CodeClaw |
-| Version | `0.12.0` |
-| Delivery date | `2026-03-13` |
+| Version | `0.13.0` |
+| Delivery date | `2026-03-14` |
 | Repository | `https://github.com/nikkofu/codeclaw` |
 | Primary package | `codeclaw` |
 | Language/runtime | Rust 2021 CLI/TUI application |
@@ -16,7 +16,7 @@
 
 This delivery provides a terminal-first control plane for supervising one master Codex session and multiple worker sessions in a shared repository. The current release is suitable for controlled pilot delivery and operator-guided use in a real repository.
 
-Delivered scope in `0.12.0`:
+Delivered scope in `0.13.0`:
 
 - master and worker orchestration over `codex app-server`
 - CLI commands for initialization, health checks, worker creation, prompt dispatch, and inspection
@@ -28,7 +28,10 @@ Delivered scope in `0.12.0`:
 - a gateway compatibility contract for future IM and webhook adapters
 - a delivery-safe `mock_file` gateway path for integration validation
 - a virtual `onboard` supervisor board for kanban-style 7x24 oversight
+- a local codex-monitor view for authoritative session/runtime visibility without asking Codex to describe itself
 - bounded delegated master-loop automation with time and iteration guards
+- bounded session-targeted automations with interval, run-count, and duration guards
+- foreground scheduler ticks while `cargo run -- up` is open, plus headless scheduler ticks through `cargo run -- serve`
 - daily archived runtime and session logs with configurable retention
 
 ## Included Artifacts
@@ -44,7 +47,7 @@ Delivered scope in `0.12.0`:
 
 ## Strategic Planning Addendum
 
-The repository also includes a next-phase planning package derived from the `0.12.0` baseline. These documents describe the intended evolution path and do not imply that the capabilities are already delivered in the current release.
+The repository also includes a next-phase planning package derived from the `0.13.0` baseline. These documents describe the intended evolution path and do not imply that the capabilities are already delivered in the current release.
 
 - [docs/product-strategy.md](product-strategy.md)
 - [docs/system-architecture-v2.md](system-architecture-v2.md)
@@ -67,17 +70,21 @@ The expected baseline workflow is:
 2. Verify environment readiness with `cargo run -- doctor`.
 3. Launch the supervision UI with `cargo run -- up`.
 4. Dispatch work through the master session or by spawning workers directly.
-5. Review state with `inspect`, `.codeclaw/status/*.json`, and `.codeclaw/state.json`.
+5. Review state with onboard, `inspect`, `.codeclaw/status/*.json`, and `.codeclaw/state.json`.
+6. Keep either `cargo run -- up` or `cargo run -- serve` active when deferred jobs, delegated loops, or session automations should continue running.
 
 ## Primary Deliverables
 
 ### User-facing capabilities
 
 - single-window supervision of master and worker sessions
+- onboard supervision with kanban lanes, `Codex Sessions`, and `Automations` panels
 - lifecycle-aware worker states: `spawn_requested`, `bootstrapping`, `bootstrapped`, `blocked`, `handed_back`, `failed`
 - queue-aware prompt routing for busy sessions
 - restart recovery for recent timeline and output context
 - CLI inspection without launching the TUI
+- local monitor answers for session counts, runtime health, latest prompts, and recent assistant previews
+- bounded repeated prompts into `master` or a specific worker through `automation create|list|pause|resume|cancel`
 - explicit gateway schema visibility and per-channel capability inspection
 - durable report subscription management for remote delivery paths
 
@@ -86,7 +93,10 @@ The expected baseline workflow is:
 - `.codeclaw/state.json` for persisted supervision state
 - `.codeclaw/status/*.json` for per-session status snapshots
 - `.codeclaw/tasks/` for worker task files
-- `.codeclaw/logs/*.jsonl` for event logging
+- `.codeclaw/logs/archive/YYYY-MM-DD/sessions/*.jsonl` for archived session notifications
+- `.codeclaw/logs/archive/YYYY-MM-DD/runtime/*.jsonl` for archived controller and app-server runtime logs
+- `.codeclaw/runtime.json` for the latest persisted live runtime heartbeat
+- `.codeclaw/service.json` for the latest persisted scheduler heartbeat
 - `.codeclaw/gateway/mock-outbox.jsonl` for mock gateway delivery replay
 
 ## Acceptance Summary
@@ -97,9 +107,12 @@ The recommended delivery acceptance set is captured in [docs/acceptance-use-case
 - health checks
 - master prompt dispatch
 - worker spawn and lifecycle transitions
+- local monitor visibility from onboard or `inspect --service`
 - blocker propagation
 - restart recovery of supervision data
 - CLI inspection output
+- bounded delegated-loop continuation
+- bounded session automation lifecycle
 - gateway schema and capability inspection
 - mock gateway delivery emission
 
@@ -117,5 +130,6 @@ This release is intentionally not positioned as a full multi-worktree automation
 - confirm the target environment has `codex` authenticated before final acceptance
 - review `codeclaw.toml` against repository-specific group and lease-path needs
 - retain `.codeclaw/` when operational history must survive restarts
+- keep at least one scheduler driver (`cargo run -- up` or `cargo run -- serve`) active when deferred jobs, delegated loops, or session automations must keep progressing
 - use [docs/operations-guide.md](operations-guide.md) for upgrade, backup, and troubleshooting procedures
 - use [docs/user-guide.md](user-guide.md) for daily operation and [docs/acceptance-use-cases.md](acceptance-use-cases.md) for formal sign-off

@@ -4,6 +4,16 @@
 
 - no entries yet
 
+## 0.13.0 - 2026-03-14
+
+- added a local codex-monitor snapshot plus onboard `Codex Sessions` visibility so runtime/session answers come from CodeClaw state instead of a model guess
+- added bounded session automations with `automation create|list|pause|resume|cancel` targeting `master` or an existing worker session
+- made `codeclaw up` an active foreground scheduler driver and extended `codeclaw serve` so delegated jobs and session automations continue under cooldown, time-budget, and iteration-budget protections
+- expanded onboard with dedicated `Codex Sessions` and `Automations` panels plus clearer runtime-versus-scheduler visibility
+- added local slash-command control for `/monitor ...` and `/automation ...`, with richer command-bar completion, cursor movement, multiline editing, and history recall
+- persisted live runtime heartbeat into `.codeclaw/runtime.json` and extended `inspect --service` with app-server pid, mode, active turns, and queued turns
+- refreshed release notes, usage documentation, operations guidance, project delivery notes, acceptance criteria, and architecture references for the `0.13.0` release
+
 ## 0.12.0 - 2026-03-13
 
 - added a default virtual `onboard` supervision session with a kanban-like board for pending, running, blocked, completed, and failed jobs
