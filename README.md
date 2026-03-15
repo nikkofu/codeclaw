@@ -78,11 +78,15 @@ This repository now includes a working Rust control-plane prototype with:
 Use these local scripts when preparing or handing over a release:
 
 ```bash
+make release-check-fast
+make handover-pack
 bash scripts/release_check.sh
 bash scripts/handover_pack.sh
 ```
 
 They validate release metadata consistency and assemble a repeatable handover document pack under `tmp/handover-pack/`.
+
+For CI-based validation, see [`.github/workflows/ci.yml`](/Users/admin/Documents/WORK/ai/codeclaw/.github/workflows/ci.yml).
 
 ## Commands
 

@@ -1,0 +1,45 @@
+name: ci
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cargo Check
+        run: cargo check
+
+      - name: Cargo Test
+        run: cargo test --quiet
+
+      - name: Release Consistency Check
+        run: bash scripts/release_check.sh --skip-check --skip-test
+
+  handover-pack:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'workflow_dispatch' || github.ref == 'refs/heads/main'
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Generate Handover Pack
+        run: bash scripts/handover_pack.sh tmp/handover-pack/ci
+
+      - name: Upload Handover Pack
+        uses: actions/upload-artifact@v4
+        with:
+          name: codeclaw-handover-pack
+          path: tmp/handover-pack/ci

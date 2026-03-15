@@ -49,6 +49,8 @@ Delivered scope in `0.13.1`:
 - gateway protocol contract in [docs/gateway-protocol.md](gateway-protocol.md)
 - reusable templates under [templates/](../templates)
 - release helper scripts under `scripts/`
+- local developer entrypoints in `Makefile`
+- CI validation workflow in `.github/workflows/ci.yml`
 - sample configuration in [codeclaw.example.toml](../codeclaw.example.toml)
 
 ## Strategic Planning Addendum
