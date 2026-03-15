@@ -157,6 +157,7 @@ Confirm the receiving party has been given:
 Optional but recommended:
 
 - [operator-runbook.md](operator-runbook.md)
+- [incident-response-playbook.md](incident-response-playbook.md)
 - [im-gateway-rollout-checklist.md](im-gateway-rollout-checklist.md)
 
 ## 10. Explicit Limitation Review

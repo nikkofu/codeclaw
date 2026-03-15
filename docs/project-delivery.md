@@ -43,8 +43,12 @@ Delivered scope in `0.13.1`:
 - architecture reference in [docs/architecture.md](architecture.md)
 - operator instructions in [docs/user-guide.md](user-guide.md)
 - deployment and support instructions in [docs/operations-guide.md](operations-guide.md)
+- operator runbook in [docs/operator-runbook.md](operator-runbook.md)
+- incident playbook in [docs/incident-response-playbook.md](incident-response-playbook.md)
 - acceptance scenarios in [docs/acceptance-use-cases.md](acceptance-use-cases.md)
 - gateway protocol contract in [docs/gateway-protocol.md](gateway-protocol.md)
+- reusable templates under [templates/](../templates)
+- release helper scripts under `scripts/`
 - sample configuration in [codeclaw.example.toml](../codeclaw.example.toml)
 
 ## Strategic Planning Addendum
@@ -133,5 +137,7 @@ This release is intentionally not positioned as a full multi-worktree automation
 - review `codeclaw.toml` against repository-specific group and lease-path needs
 - retain `.codeclaw/` when operational history must survive restarts
 - keep at least one scheduler driver (`cargo run -- up` or `cargo run -- serve`) active when deferred jobs, delegated loops, or session automations must keep progressing
+- run `bash scripts/release_check.sh` before final release validation when a formal release handoff is being prepared
+- use `bash scripts/handover_pack.sh` to assemble a repeatable document pack for delivery
 - use [docs/operations-guide.md](operations-guide.md) for upgrade, backup, and troubleshooting procedures
 - use [docs/user-guide.md](user-guide.md) for daily operation and [docs/acceptance-use-cases.md](acceptance-use-cases.md) for formal sign-off

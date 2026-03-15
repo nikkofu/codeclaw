@@ -302,4 +302,5 @@ Escalate before continuing when:
 - [user-guide.md](user-guide.md)
 - [operations-guide.md](operations-guide.md)
 - [faq.md](faq.md)
+- [incident-response-playbook.md](incident-response-playbook.md)
 - [im-gateway-rollout-checklist.md](im-gateway-rollout-checklist.md)

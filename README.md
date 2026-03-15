@@ -19,7 +19,10 @@ It combines task routing, session management, shared coordination files, and Git
   - [Operator Runbook](docs/operator-runbook.md)
   - [Customer Handover Checklist](docs/customer-handover-checklist.md)
   - [Incident Response Playbook](docs/incident-response-playbook.md)
-  - [Templates](templates)
+  - [Ops Dashboard Spec](docs/ops-dashboard-spec.md)
+  - [Customer Handover Template](templates/customer-handover-template.md)
+  - [IM Gateway Rollout Template](templates/im-gateway-rollout-template.md)
+  - [Incident Report Template](templates/incident-report-template.md)
   - [Project Delivery](docs/project-delivery.md)
   - [User Guide](docs/user-guide.md)
   - [Operations Guide](docs/operations-guide.md)
@@ -69,6 +72,17 @@ This repository now includes a working Rust control-plane prototype with:
 - persisted lifecycle notes for blocker and handoff context across restarts
 - persisted master summary and last-message status across restarts
 - a `serve` mode skeleton with background scheduler ticks and persisted service heartbeat in `.codeclaw/service.json`
+
+## Release Helpers
+
+Use these local scripts when preparing or handing over a release:
+
+```bash
+bash scripts/release_check.sh
+bash scripts/handover_pack.sh
+```
+
+They validate release metadata consistency and assemble a repeatable handover document pack under `tmp/handover-pack/`.
 
 ## Commands
 
